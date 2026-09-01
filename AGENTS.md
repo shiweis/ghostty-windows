@@ -85,5 +85,9 @@ A file for [guiding coding agents](https://agents.md/).
 
 ## Issue and PR Guidelines
 
-- Do not create GitHub issues or pull requests. Leave changes in the working
-  tree for maintainer review.
+- GitHub issues and pull requests are welcome.
+- Before opening an issue, search existing issues to avoid duplicates and
+  include clear reproduction steps, expected behavior, and relevant system
+  details.
+- Keep pull requests focused, explain the user-visible impact, and include
+  tests for behavioral changes when practical.
