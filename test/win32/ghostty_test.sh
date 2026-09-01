@@ -318,6 +318,10 @@ test_resize() {
 
 test_multiple_windows() {
     echo "▶ test_multiple_windows"
+    # This test identifies both windows by PID. Do not let ps() inject the
+    # HWND left behind by the preceding test after that window is destroyed.
+    GHOSTTY_HWND=0
+
     # Launch first window
     local output1
     output1="$(ps -Action launch -ExePath "$GHOSTTY_EXE" -WaitMs 5000)"
