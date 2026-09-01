@@ -3,6 +3,47 @@
 All notable changes to the Ghostty Windows fork. Each release line includes
 the underlying upstream commit when known.
 
+## win-v1.3.0 — 2026-09-01
+
+Upstream sync (1,248 commits from `ghostty-org/ghostty` main, through
+`20abdb50a`) plus new Win32 actions and a stability pass focused on GPU,
+thread, and sleep/resume failure modes.
+
+### Added
+- Files copied in Explorer can be pasted into the terminal as space-separated,
+  quoted paths. File drops and clipboard paste share the same hardened path
+  conversion.
+- Win32 support for editing the configuration, exporting terminal I/O, setting
+  surface/tab/window title overrides, moving tabs, and moving live tab trees
+  into new windows.
+- Automatic WGL context recovery after a GPU driver reset, driver update, or
+  context loss during sleep/resume. Terminal and background images are
+  re-uploaded from CPU-side state after recovery.
+- Windows virtual-memory discard support for upstream scrollback compression,
+  allowing inactive pages to release physical memory.
+
+### Changed
+- The shared core now follows upstream through `20abdb50a` and requires Zig
+  0.16.0 for development and release builds.
+- Clipboard completion uses the upstream MIME-aware API, including support for
+  the new clipboard and terminal snapshot modes.
+- Portable packaging now fails fast on missing resources, stages files within
+  the repository, and verifies the bundled resource sentinel.
+
+### Fixed
+- Renderer, terminal I/O, and search mailbox writes are bounded so a wedged GPU
+  call cannot freeze every Ghostty window. Closing a wedged surface also uses
+  bounded joins and preserves state still reachable by detached threads.
+- Windows read threads exit cleanly on broken pipes and other ConPTY shutdown
+  errors instead of reaching undefined behavior in release builds.
+- Surfaces repaint after system resume, and renderer occlusion updates are
+  deduplicated so resize activity cannot fill the renderer mailbox.
+- Toggling from transparent to opaque repaints immediately instead of waiting
+  for a later focus or expose event.
+- The Win32 integration harness only cleans up its dedicated `ghostty-test`
+  executable and validates owned window handles, preventing tests from closing
+  a developer's running Ghostty session.
+
 ## win-v1.2.0 — 2026-07-02
 
 Upstream sync (264 commits from `ghostty-org/ghostty` main, through
