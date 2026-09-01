@@ -722,7 +722,7 @@ test "SlidingWindow empty needle has no matches" {
     var s = try Screen.init(io, alloc, .{
         .cols = 80,
         .rows = 24,
-        .max_scrollback = 0,
+        .max_scrollback_bytes = 0,
     });
     defer s.deinit();
     try s.testWriteString("hello");
@@ -739,7 +739,7 @@ test "SlidingWindow single append" {
     var w: SlidingWindow = try .init(alloc, .forward, "boo!");
     defer w.deinit();
 
-    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 0 });
     defer s.deinit();
     try s.testWriteString("hello. boo! hello. boo!");
 
@@ -785,7 +785,7 @@ test "SlidingWindow single append case insensitive ASCII" {
     var w: SlidingWindow = try .init(alloc, .forward, "Boo!");
     defer w.deinit();
 
-    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 0 });
     defer s.deinit();
     try s.testWriteString("hello. boo! hello. boo!");
 
@@ -831,7 +831,7 @@ test "SlidingWindow single append single char" {
     var w: SlidingWindow = try .init(alloc, .forward, "b");
     defer w.deinit();
 
-    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 0 });
     defer s.deinit();
     try s.testWriteString("hello. boo! hello. boo!");
 
@@ -877,7 +877,7 @@ test "SlidingWindow single append no match" {
     var w: SlidingWindow = try .init(alloc, .forward, "nope!");
     defer w.deinit();
 
-    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 0 });
     defer s.deinit();
     try s.testWriteString("hello. boo! hello. boo!");
 
@@ -902,7 +902,7 @@ test "SlidingWindow two pages" {
     var w: SlidingWindow = try .init(alloc, .forward, "boo!");
     defer w.deinit();
 
-    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 1000 });
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 1000 });
     defer s.deinit();
 
     // Fill up the first page. The final bytes in the first page
@@ -958,7 +958,7 @@ test "SlidingWindow two pages single char" {
     var w: SlidingWindow = try .init(alloc, .forward, "b");
     defer w.deinit();
 
-    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 1000 });
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 1000 });
     defer s.deinit();
 
     // Fill up the first page. The final bytes in the first page
@@ -1014,7 +1014,7 @@ test "SlidingWindow two pages match across boundary" {
     var w: SlidingWindow = try .init(alloc, .forward, "hello, world");
     defer w.deinit();
 
-    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 1000 });
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 1000 });
     defer s.deinit();
 
     // Fill up the first page. The final bytes in the first page
@@ -1060,7 +1060,7 @@ test "SlidingWindow two pages no match across boundary with newline" {
     var w: SlidingWindow = try .init(alloc, .forward, "hello, world");
     defer w.deinit();
 
-    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 1000 });
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 1000 });
     defer s.deinit();
 
     // Fill up the first page. The final bytes in the first page
@@ -1094,7 +1094,7 @@ test "SlidingWindow two pages no match across boundary with newline reverse" {
     var w: SlidingWindow = try .init(alloc, .reverse, "hello, world");
     defer w.deinit();
 
-    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 1000 });
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 1000 });
     defer s.deinit();
 
     // Fill up the first page. The final bytes in the first page
@@ -1125,7 +1125,7 @@ test "SlidingWindow two pages no match prunes first page" {
     var w: SlidingWindow = try .init(alloc, .forward, "nope!");
     defer w.deinit();
 
-    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 1000 });
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 1000 });
     defer s.deinit();
 
     // Fill up the first page. The final bytes in the first page
@@ -1158,7 +1158,7 @@ test "SlidingWindow two pages no match keeps both pages" {
     const alloc = testing.allocator;
     const io = testing.io;
 
-    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 1000 });
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 1000 });
     defer s.deinit();
 
     // Fill up the first page. The final bytes in the first page
@@ -1202,7 +1202,7 @@ test "SlidingWindow single append across circular buffer boundary" {
     var w: SlidingWindow = try .init(alloc, .forward, "abc");
     defer w.deinit();
 
-    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 0 });
     defer s.deinit();
     try s.testWriteString("XXXXXXXXXXXXXXXXXXXboo!XXXXX");
 
@@ -1259,7 +1259,7 @@ test "SlidingWindow single append match on boundary" {
     var w: SlidingWindow = try .init(alloc, .forward, "abcd");
     defer w.deinit();
 
-    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 0 });
     defer s.deinit();
     try s.testWriteString("o!XXXXXXXXXXXXXXXXXXXbo");
 
@@ -1319,7 +1319,7 @@ test "SlidingWindow single append reversed" {
     var w: SlidingWindow = try .init(alloc, .reverse, "boo!");
     defer w.deinit();
 
-    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 0 });
     defer s.deinit();
     try s.testWriteString("hello. boo! hello. boo!");
 
@@ -1365,7 +1365,7 @@ test "SlidingWindow single append no match reversed" {
     var w: SlidingWindow = try .init(alloc, .reverse, "nope!");
     defer w.deinit();
 
-    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 0 });
     defer s.deinit();
     try s.testWriteString("hello. boo! hello. boo!");
 
@@ -1390,7 +1390,7 @@ test "SlidingWindow two pages reversed" {
     var w: SlidingWindow = try .init(alloc, .reverse, "boo!");
     defer w.deinit();
 
-    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 1000 });
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 1000 });
     defer s.deinit();
 
     // Fill up the first page. The final bytes in the first page
@@ -1446,7 +1446,7 @@ test "SlidingWindow two pages match across boundary reversed" {
     var w: SlidingWindow = try .init(alloc, .reverse, "hello, world");
     defer w.deinit();
 
-    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 1000 });
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 1000 });
     defer s.deinit();
 
     // Fill up the first page. The final bytes in the first page
@@ -1502,7 +1502,7 @@ test "SlidingWindow two pages no match prunes first page reversed" {
     var w: SlidingWindow = try .init(alloc, .reverse, "nope!");
     defer w.deinit();
 
-    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 1000 });
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 1000 });
     defer s.deinit();
 
     // Fill up the first page. The final bytes in the first page
@@ -1535,7 +1535,7 @@ test "SlidingWindow two pages no match keeps both pages reversed" {
     const alloc = testing.allocator;
     const io = testing.io;
 
-    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 1000 });
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 1000 });
     defer s.deinit();
 
     // Fill up the first page. The final bytes in the first page
@@ -1579,7 +1579,7 @@ test "SlidingWindow single append across circular buffer boundary reversed" {
     var w: SlidingWindow = try .init(alloc, .reverse, "abc");
     defer w.deinit();
 
-    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 0 });
     defer s.deinit();
     try s.testWriteString("XXXXXXXXXXXXXXXXXXXboo!XXXXX");
 
@@ -1637,7 +1637,7 @@ test "SlidingWindow single append match on boundary reversed" {
     var w: SlidingWindow = try .init(alloc, .reverse, "abcd");
     defer w.deinit();
 
-    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 0 });
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 0 });
     defer s.deinit();
     try s.testWriteString("o!XXXXXXXXXXXXXXXXXXXbo");
 
@@ -1779,7 +1779,7 @@ test "SlidingWindow append whitespace only node" {
     var s = try Screen.init(io, alloc, .{
         .cols = 80,
         .rows = 24,
-        .max_scrollback = 0,
+        .max_scrollback_bytes = 0,
     });
     defer s.deinit();
 

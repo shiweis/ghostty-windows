@@ -1029,7 +1029,7 @@ fn testDragSelection(
         .padding_left = 5,
         .screen_height = 110,
     };
-    var screen = try Screen.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 5, .max_scrollback = 0 });
+    var screen = try Screen.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 5, .max_scrollback_bytes = 0 });
     defer screen.deinit();
 
     const click_pin = screen.pages.pin(.{
@@ -1090,7 +1090,7 @@ fn testDragSelectionIsNull(
         .padding_left = 5,
         .screen_height = 110,
     };
-    var screen = try Screen.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 5, .max_scrollback = 0 });
+    var screen = try Screen.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 5, .max_scrollback_bytes = 0 });
     defer screen.deinit();
 
     const click_pin = screen.pages.pin(.{
@@ -1724,7 +1724,7 @@ test "SelectionGesture autoscroll tick scrolls and continues drag" {
 }
 
 test "SelectionGesture autoscroll tick resolves drag pin after scrolling" {
-    var t = try Terminal.init(testing.io, testing.allocator, .{ .cols = 5, .rows = 3, .max_scrollback = 10 });
+    var t = try Terminal.init(testing.io, testing.allocator, .{ .cols = 5, .rows = 3, .max_scrollback_bytes = 10 });
     defer t.deinit(testing.allocator);
     try t.printString("1111\n2222\n3333\n4444\n5555");
     t.scrollViewport(.{ .delta = -2 });

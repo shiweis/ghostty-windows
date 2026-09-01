@@ -19,6 +19,7 @@ pub const c = @cImport({
 const input = @import("../../../input.zig");
 const Config = @import("../../../config.zig").Config;
 const ApprtWindow = @import("../class/window.zig").Window;
+const GlobalShortcuts = @import("../class/global_shortcuts.zig").GlobalShortcuts;
 const BlurRegion = @import("BlurRegion.zig");
 
 const log = std.log.scoped(.gtk_x11);
@@ -157,6 +158,16 @@ pub const App = struct {
 
         return mods;
     }
+
+    pub fn bindGlobalShortcuts(
+        _: *App,
+        _: *GlobalShortcuts,
+        _: *const Config,
+    ) bool {
+        return false;
+    }
+
+    pub fn clearGlobalShortcuts(_: *App) void {}
 
     pub fn supportsQuickTerminal(_: App) bool {
         log.warn("quick terminal is not yet supported on X11", .{});

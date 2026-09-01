@@ -381,7 +381,7 @@ test "compressed history match spanning page boundary remains compressed" {
     var t: Terminal = try .init(io, alloc, .{
         .cols = 80,
         .rows = 24,
-        .max_scrollback = 10 * 1024 * 1024,
+        .max_scrollback_bytes = 10 * 1024 * 1024,
     });
     defer t.deinit(alloc);
 
@@ -487,7 +487,11 @@ test "feed with pruned page" {
     const alloc = testing.allocator;
 
     // Zero here forces minimum max size to effectively two pages.
-    var p: PageList = try .init(alloc, 80, 24, 0);
+    var p: PageList = try .init(alloc, .{
+        .cols = 80,
+        .rows = 24,
+        .max_size = 0,
+    });
     defer p.deinit();
 
     // Grow to capacity
@@ -530,7 +534,10 @@ test "feed with pruned page" {
 
 test "feed keeps its tracked pin within a shorter page" {
     const alloc = testing.allocator;
-    var pages: PageList = try .init(alloc, 10, 2, null);
+    var pages: PageList = try .init(alloc, .{
+        .cols = 10,
+        .rows = 2,
+    });
     defer pages.deinit();
 
     const first = pages.pages.first.?;

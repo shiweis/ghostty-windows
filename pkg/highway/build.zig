@@ -99,6 +99,13 @@ pub fn build(b: *std.Build) !void {
             "-fmath-errno",
             "-fno-exceptions",
         });
+    } else if (target.result.abi == .msvc) {
+        try flags.appendSlice(b.allocator, &.{
+            // -fno-autolink also drops UCRT's /alternatename fallback.
+            "-D_Avx2WmemEnabledWeakValue=_Avx2WmemEnabled",
+            "-fno-autolink",
+            "-fno-stack-protector",
+        });
     }
 
     lib.root_module.addCSourceFiles(.{ .flags = flags.items, .files = &.{

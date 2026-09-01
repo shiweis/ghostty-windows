@@ -30,9 +30,9 @@ active: *Screen,
 /// All screens that are initialized.
 all: std.EnumMap(Key, *Screen),
 
-/// Monotonic generation counter for each screen key. This changes whenever a
-/// screen is removed so external handles can distinguish a newly initialized
-/// screen from stale references into destroyed screen storage.
+/// Monotonic generation counter for each screen key. This changes whenever
+/// screen storage is removed or replaced so external handles can distinguish a
+/// newly initialized screen from stale references into destroyed storage.
 generations: std.EnumMap(Key, usize),
 
 pub fn init(

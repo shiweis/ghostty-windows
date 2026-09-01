@@ -43,6 +43,10 @@ app: *App,
 /// The parent Window that contains this Surface as a tab.
 parent_window: *Window = undefined,
 
+/// Last title reported by the core for getTitle/copy-title consumers.
+title_len: usize = 0,
+title: [4096]u8 = std.mem.zeroes([4096]u8),
+
 /// The core terminal surface. Initialized by init() after creating
 /// the window and WGL context. Manages fonts, renderer, PTY, and IO.
 core_surface: CoreSurface = undefined,
@@ -205,6 +209,24 @@ pub fn init(
     parent: *Window,
     context: apprt.surface.NewSurfaceContext,
 ) !void {
+    return self.initWithOptions(app, parent, .{ .context = context });
+}
+
+pub const InitOptions = struct {
+    context: apprt.surface.NewSurfaceContext,
+    command: ?*const configpkg.Command = null,
+    title: ?[:0]const u8 = null,
+};
+
+/// Initialize a surface with optional per-surface config overrides. The
+/// overrides are cloned into the surface config arena before this function
+/// returns, so callers only need to keep them alive for the duration of init.
+pub fn initWithOptions(
+    self: *Surface,
+    app: *App,
+    parent: *Window,
+    options: InitOptions,
+) !void {
     self.* = .{
         .app = app,
         .parent_window = parent,
@@ -307,8 +329,16 @@ pub fn init(
     errdefer app.core_app.deleteSurface(self);
 
     // Create a config copy for this surface.
-    var config = try apprt.surface.newConfig(app.core_app, &app.config, context);
+    var config = try apprt.surface.newConfig(app.core_app, &app.config, options.context);
     defer config.deinit();
+
+    if (options.command) |command| {
+        config.command = try command.clone(config.arenaAlloc());
+        config.@"shell-integration" = .detect;
+    }
+    if (options.title) |title| {
+        config.title = try config.arenaAlloc().dupeZ(u8, title);
+    }
 
     // Initialize the core surface. This sets up fonts, the renderer, PTY,
     // and spawns the renderer + IO threads.
@@ -546,9 +576,8 @@ pub fn getCursorPos(self: *const Surface) !apprt.CursorPos {
 }
 
 pub fn getTitle(self: *const Surface) ?[:0]const u8 {
-    _ = self;
-    // TODO: Store and return the title set via setTitle.
-    return null;
+    if (self.title_len == 0) return null;
+    return self.title[0..self.title_len :0];
 }
 
 /// Notify the core whether this surface is currently visible. When a surface
@@ -643,9 +672,41 @@ pub fn clipboardRequest(
     self: *Surface,
     clipboard_type: apprt.Clipboard,
     state: apprt.ClipboardRequest,
-) !bool {
+) !apprt.ClipboardReadResult {
     // Only the standard clipboard is supported on Win32.
-    if (clipboard_type != .standard) return false;
+    if (clipboard_type != .standard) return .unsupported;
+
+    // Kitty writes carry their committed representations in the request, so
+    // they only need to pass through the core's authorization flow.
+    if (state == .kitty_write) {
+        return self.completeClipboardRequestWithConfirmation(
+            state,
+            &.{},
+            &.{},
+        );
+    }
+
+    // Paste events request a target listing without reading clipboard data.
+    // Win32 exposes files and Unicode text as a text/plain representation.
+    if (state == .list) {
+        if (w32.OpenClipboard(self.hwnd) == 0) {
+            log.warn("OpenClipboard failed", .{});
+            return .unavailable;
+        }
+        defer _ = w32.CloseClipboard();
+
+        if (w32.GetClipboardData(w32.CF_HDROP) == null and
+            w32.GetClipboardData(w32.CF_UNICODETEXT) == null)
+        {
+            return .unavailable;
+        }
+
+        return self.completeClipboardRequestWithConfirmation(
+            state,
+            &.{},
+            &.{"text/plain"},
+        );
+    }
 
     const alloc = self.app.core_app.alloc;
 
@@ -656,7 +717,7 @@ pub fn clipboardRequest(
     const utf8z: [:0]const u8 = blk: {
         if (w32.OpenClipboard(self.hwnd) == 0) {
             log.warn("OpenClipboard failed", .{});
-            return false;
+            return .unavailable;
         }
         defer _ = w32.CloseClipboard();
 
@@ -682,10 +743,11 @@ pub fn clipboardRequest(
             break :blk try alloc.dupeZ(u8, paths);
         }
 
-        const hglobal = w32.GetClipboardData(w32.CF_UNICODETEXT) orelse return false;
+        const hglobal = w32.GetClipboardData(w32.CF_UNICODETEXT) orelse
+            return .unavailable;
         const ptr16 = w32.GlobalLock(hglobal) orelse {
             log.warn("GlobalLock failed", .{});
-            return false;
+            return .unavailable;
         };
         defer _ = w32.GlobalUnlock(hglobal);
 
@@ -695,17 +757,29 @@ pub fn clipboardRequest(
 
         const utf8 = std.unicode.utf16LeToUtf8Alloc(alloc, wptr[0..wlen]) catch |err| {
             log.warn("utf16LeToUtf8Alloc failed: {}", .{err});
-            return false;
+            return .unavailable;
         };
         defer alloc.free(utf8);
         break :blk try alloc.dupeZ(u8, utf8);
     };
     defer alloc.free(utf8z);
 
-    // The confirmation prompt below runs a modal message loop that can tick
-    // the core (child-exited → surface close → this Surface freed). Capture
-    // what we need to re-resolve the surface by id afterwards rather than
-    // dereferencing `self`.
+    return self.completeClipboardRequestWithConfirmation(
+        state,
+        &.{.{ .mime = "text/plain", .data = utf8z }},
+        &.{},
+    );
+}
+
+/// Complete a structured clipboard request and run the native authorization
+/// prompt when the core requires it. The modal dialog can destroy the surface,
+/// so all post-dialog access re-resolves the core surface by id.
+fn completeClipboardRequestWithConfirmation(
+    self: *Surface,
+    state: apprt.ClipboardRequest,
+    contents: []const terminal.clipboard.Content,
+    available: []const []const u8,
+) apprt.ClipboardReadResult {
     const core_app = self.app.core_app;
     const surface_id = self.core_surface.id;
 
@@ -714,7 +788,10 @@ pub fn clipboardRequest(
     // unauthorized (clipboard-read = ask), prompt and only re-complete with
     // confirmed=true on approval. Passing confirmed=true up front — as this
     // used to — silently disabled both guards on Windows.
-    self.core_surface.completeClipboardRequest(state, utf8z, false) catch |err| {
+    self.core_surface.completeClipboardRequest(state, .{
+        .contents = contents,
+        .available = available,
+    }) catch |err| {
         // confirmClipboard takes comptime strings (utf8ToUtf16LeStringLiteral),
         // so each error path calls it with its own literals. `self` may be
         // freed while the modal dialog pumps messages, so re-resolve the
@@ -725,24 +802,47 @@ pub fn clipboardRequest(
                     "commands unexpectedly (for example, newlines).\n\nPaste anyway?",
                 "Ghostty \u{2014} Potentially Unsafe Paste",
             ),
-            error.UnauthorizedPaste => self.confirmClipboard(
-                "An application is requesting access to read the clipboard.\n\nAllow this?",
-                "Ghostty \u{2014} Authorize Clipboard Access",
-            ),
+            error.UnauthorizedPaste => switch (state) {
+                .kitty_write, .osc_52_write => self.confirmClipboard(
+                    "An application is requesting to write to the system clipboard.\n\nAllow this?",
+                    "Ghostty \u{2014} Authorize Clipboard Access",
+                ),
+                else => self.confirmClipboard(
+                    "An application is requesting access to read the clipboard.\n\nAllow this?",
+                    "Ghostty \u{2014} Authorize Clipboard Access",
+                ),
+            },
             else => {
                 log.err("completeClipboardRequest error: {}", .{err});
-                return true;
+                return .started;
             },
         };
+
+        const cs = core_app.findSurfaceByID(surface_id) orelse {
+            // Kitty requests own arenas that the apprt must release even if
+            // their surface disappeared while the modal dialog was open.
+            switch (state) {
+                .kitty_read => |kitty| kitty.destroy(),
+                .kitty_write => |kitty| kitty.destroy(),
+                else => {},
+            }
+            return .started;
+        };
+
         if (approved) {
-            const cs = core_app.findSurfaceByID(surface_id) orelse return true;
-            cs.completeClipboardRequest(state, utf8z, true) catch |e| {
+            cs.completeClipboardRequest(state, .{
+                .contents = contents,
+                .available = available,
+                .confirmed = true,
+            }) catch |e| {
                 log.err("completeClipboardRequest (confirmed) error: {}", .{e});
             };
+        } else {
+            cs.denyClipboardRequest(state);
         }
     };
 
-    return true;
+    return .started;
 }
 
 pub fn setClipboard(
@@ -835,6 +935,10 @@ pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
 
 /// Set the window title. Called from performAction(.set_title).
 pub fn setTitle(self: *Surface, title: [:0]const u8) void {
+    const len = @min(title.len, self.title.len - 1);
+    @memcpy(self.title[0..len], title[0..len]);
+    self.title[len] = 0;
+    self.title_len = len;
     self.parent_window.onTabTitleChanged(self, title);
 }
 
@@ -1302,7 +1406,7 @@ const palette_entries = [_]PaletteEntry{
     .{ .name = "Scroll to Bottom", .action = .scroll_to_bottom },
     .{ .name = "Clear Screen", .action = .clear_screen },
     .{ .name = "Reset Terminal", .action = .reset },
-    .{ .name = "Open Config", .action = .open_config },
+    .{ .name = "Open Config", .action = .{ .open_config = .default } },
     .{ .name = "Reload Config", .action = .reload_config },
     .{ .name = "Quit", .action = .quit },
 };

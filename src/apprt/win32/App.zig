@@ -627,30 +627,19 @@ pub fn performAction(
         },
 
         .open_config => {
-            // Open the config file in the default editor.
-            const config_path = configpkg.preferredDefaultFilePath(
+            const config_path = configpkg.edit.openPath(
                 self.core_app.alloc,
             ) catch |err| {
                 log.err("failed to get config path: {}", .{err});
-                return true;
+                return false;
             };
             defer self.core_app.alloc.free(config_path);
 
-            // Convert to wide string for ShellExecuteW.
-            var wbuf: [512]u16 = undefined;
-            const wlen = std.unicode.utf8ToUtf16Le(&wbuf, config_path) catch return true;
-            if (wlen < wbuf.len) {
-                wbuf[wlen] = 0;
-                _ = w32.ShellExecuteW(
-                    null,
-                    std.unicode.utf8ToUtf16LeStringLiteral("open"),
-                    @ptrCast(&wbuf),
-                    null,
-                    null,
-                    w32.SW_SHOW,
-                );
-            }
-            return true;
+            return switch (value) {
+                .os_open => self.openConfigWithOs(config_path),
+                .new_window => (try self.openConfigInNewWindow(config_path)) or
+                    self.openConfigWithOs(config_path),
+            };
         },
 
         .scrollbar => {
@@ -800,6 +789,16 @@ pub fn performAction(
             return true;
         },
 
+        .set_window_title => {
+            switch (target) {
+                .app => return false,
+                .surface => |core_surface| {
+                    core_surface.rt_surface.parent_window.setWindowTitle(value.title);
+                },
+            }
+            return true;
+        },
+
         .move_tab => {
             switch (target) {
                 .app => {},
@@ -808,6 +807,14 @@ pub fn performAction(
                 },
             }
             return true;
+        },
+
+        .move_tab_to_new_window => {
+            return switch (target) {
+                .app => false,
+                .surface => |core_surface| try core_surface.rt_surface.parent_window
+                    .moveTabToNewWindow(core_surface.rt_surface),
+            };
         },
 
         .toggle_tab_overview => {
@@ -1015,6 +1022,8 @@ pub fn performAction(
             }
             return true;
         },
+
+        .export_terminal_io => return self.exportTerminalIo(target, value.contents),
 
         .render => {
             switch (target) {
@@ -1351,18 +1360,17 @@ pub fn performAction(
         },
 
         .prompt_title => {
-            switch (target) {
-                .app => {},
-                .surface => |core_surface| {
-                    // Both .tab and .surface trigger inline rename on the
-                    // current tab. On Win32 there's no separate surface title
-                    // UI — the tab title IS the surface identity.
-                    core_surface.rt_surface.parent_window.startTabRename(
-                        core_surface.rt_surface.parent_window.active_tab,
-                    );
+            return switch (target) {
+                .app => false,
+                .surface => |core_surface| blk: {
+                    const window = core_surface.rt_surface.parent_window;
+                    switch (value) {
+                        .surface, .tab => window.startTabRename(window.active_tab),
+                        .window => window.startWindowRename(),
+                    }
+                    break :blk true;
                 },
-            }
-            return true;
+            };
         },
 
         .check_for_updates => {
@@ -1405,6 +1413,137 @@ pub fn performAction(
 
         // All 66 apprt actions are now handled above.
     }
+}
+
+/// Open the configuration with the Windows file association.
+fn openConfigWithOs(self: *App, path: [:0]const u8) bool {
+    const alloc = self.core_app.alloc;
+    const path_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch |err| {
+        log.warn("unable to encode config path: {}", .{err});
+        return false;
+    };
+    defer alloc.free(path_w);
+
+    const result = w32.ShellExecuteW(
+        null,
+        std.unicode.utf8ToUtf16LeStringLiteral("open"),
+        path_w,
+        null,
+        null,
+        w32.SW_SHOW,
+    );
+    return result > 32;
+}
+
+/// Open the configuration in a new Ghostty window using VISUAL or EDITOR.
+/// Returns false when no terminal editor is configured so callers can fall
+/// back to the Windows file association.
+fn openConfigInNewWindow(self: *App, path: [:0]const u8) !bool {
+    const alloc = self.core_app.alloc;
+    const editor = global.environ().getAlloc(alloc, "VISUAL") catch
+        global.environ().getAlloc(alloc, "EDITOR") catch return false;
+    defer alloc.free(editor);
+    if (std.mem.trim(u8, editor, " \t\r\n").len == 0) return false;
+
+    // Windows paths cannot contain a double quote, so quoting the path is
+    // sufficient while leaving editor arguments supplied by the user intact.
+    const command_text = try std.fmt.allocPrintSentinel(
+        alloc,
+        "{s} \"{s}\"",
+        .{ editor, path },
+        0,
+    );
+    defer alloc.free(command_text);
+    const command: configpkg.Command = .{ .shell = command_text };
+
+    const title = try std.fmt.allocPrintSentinel(
+        alloc,
+        "Editing configuration file {s}",
+        .{path},
+        0,
+    );
+    defer alloc.free(title);
+
+    const window = try alloc.create(Window);
+    window.init(self, .{}) catch |err| {
+        alloc.destroy(window);
+        return err;
+    };
+    self.windows.append(alloc, window) catch |err| {
+        window.deinit();
+        alloc.destroy(window);
+        return err;
+    };
+
+    _ = window.addTabWithOptions(.{
+        .context = .window,
+        .command = &command,
+        .title = title,
+    }) catch |err| {
+        window.close();
+        return err;
+    };
+    return true;
+}
+
+/// Present a native Save As dialog and write the borrowed terminal-I/O log
+/// before returning from the action callback.
+fn exportTerminalIo(self: *App, target: apprt.Target, contents: []const u8) bool {
+    const owner = switch (target) {
+        .app => return false,
+        .surface => |core_surface| core_surface.rt_surface.parent_window.hwnd,
+    };
+
+    var file_buf: [32768]u16 = std.mem.zeroes([32768]u16);
+    const default_name = std.unicode.utf8ToUtf16LeStringLiteral("ghostty-terminal-io.txt");
+    @memcpy(file_buf[0..default_name.len], default_name);
+
+    // The common-dialog filter is a sequence of NUL-terminated label/pattern
+    // pairs followed by an additional NUL.
+    const filter = std.unicode.utf8ToUtf16LeStringLiteral(
+        "Text files (*.txt)\x00*.txt\x00All files (*.*)\x00*.*\x00",
+    );
+    var dialog: w32.OPENFILENAMEW = std.mem.zeroes(w32.OPENFILENAMEW);
+    dialog.lStructSize = @sizeOf(w32.OPENFILENAMEW);
+    dialog.hwndOwner = owner;
+    dialog.lpstrFilter = filter;
+    dialog.nFilterIndex = 1;
+    dialog.lpstrFile = &file_buf;
+    dialog.nMaxFile = file_buf.len;
+    dialog.lpstrTitle = std.unicode.utf8ToUtf16LeStringLiteral("Export Terminal IO Events");
+    dialog.lpstrDefExt = std.unicode.utf8ToUtf16LeStringLiteral("txt");
+    dialog.Flags = w32.OFN_EXPLORER |
+        w32.OFN_NOCHANGEDIR |
+        w32.OFN_PATHMUSTEXIST |
+        w32.OFN_OVERWRITEPROMPT;
+
+    // Cancellation is a handled action, just with no file written.
+    if (w32.GetSaveFileNameW(&dialog) == 0) return true;
+
+    const path_len = std.mem.indexOfScalar(u16, &file_buf, 0) orelse file_buf.len;
+    const alloc = self.core_app.alloc;
+    const path = std.unicode.utf16LeToUtf8Alloc(alloc, file_buf[0..path_len]) catch |err| {
+        log.warn("unable to decode terminal IO export path: {}", .{err});
+        return false;
+    };
+    defer alloc.free(path);
+
+    var file = std.Io.Dir.createFileAbsolute(global.io(), path, .{ .truncate = true }) catch |err| {
+        log.warn("unable to create terminal IO export file: {}", .{err});
+        return false;
+    };
+    defer file.close(global.io());
+    var write_buf: [4096]u8 = undefined;
+    var writer = file.writer(global.io(), &write_buf);
+    writer.interface.writeAll(contents) catch |err| {
+        log.warn("unable to write terminal IO export file: {}", .{err});
+        return false;
+    };
+    writer.interface.flush() catch |err| {
+        log.warn("unable to flush terminal IO export file: {}", .{err});
+        return false;
+    };
+    return true;
 }
 
 /// Ctrl-modified VKs that should remain with the focused Edit control
@@ -2393,4 +2532,9 @@ fn msgWndProc(
     }
 
     return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+test "export terminal IO requires a surface target" {
+    var app: App = undefined;
+    try std.testing.expect(!app.exportTerminalIo(.app, "test contents"));
 }

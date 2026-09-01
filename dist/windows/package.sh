@@ -5,9 +5,9 @@
 #   ./dist/windows/package.sh              # ReleaseFast, x86_64
 #   ./dist/windows/package.sh Debug        # Debug build (Console subsystem)
 #
-# Output: dist/windows/ghostty-windows-x64.zip
+# Output: dist/windows/ghostty-windows-x64-<version>.zip
 
-set -uo pipefail
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -64,11 +64,12 @@ fi
 # Create a minimal README
 cat > "$STAGE_DIR/README.txt" << READMEEOF
 Ghostty for Windows — $VERSION
-https://github.com/InsipidPoint/ghostty-windows
+https://github.com/shiweis/ghostty-windows
 
 QUICK START
   1. Run ghostty.exe
-  2. Config file: %LOCALAPPDATA%\\ghostty\\config
+  2. Config file: %LOCALAPPDATA%\\ghostty\\config.ghostty
+     (the legacy filename "config" is also supported)
 
 KEYBOARD SHORTCUTS
   Ctrl+Shift+T        New tab
@@ -118,14 +119,6 @@ if [ -f "$ZIP_PATH" ]; then
     SIZE=$(du -h "$ZIP_PATH" | cut -f1)
     echo ""
     echo "Package created: dist/windows/$ZIP_NAME ($SIZE)"
-
-    # Also copy to Desktop
-    USERPROFILE="$(cmd.exe /c "echo %USERPROFILE%" 2>/dev/null | tr -d '\r')"
-    if [ -n "$USERPROFILE" ]; then
-        DESKTOP="$(wslpath "$USERPROFILE")/Desktop"
-        cp "$ZIP_PATH" "$DESKTOP/" 2>/dev/null && echo "Copied to Desktop/$ZIP_NAME"
-        cp zig-out/bin/ghostty.exe "$DESKTOP/ghostty.exe" 2>/dev/null && echo "Copied ghostty.exe to Desktop"
-    fi
 else
     echo "ERROR: Failed to create ZIP"
     exit 1

@@ -138,7 +138,7 @@ pub fn create(
         .terminal = try .init(global.io(), alloc, .{
             .rows = opts.@"terminal-rows",
             .cols = opts.@"terminal-cols",
-            .max_scrollback = opts.@"max-scrollback",
+            .max_scrollback_bytes = opts.@"max-scrollback",
         }),
     };
     return ptr;

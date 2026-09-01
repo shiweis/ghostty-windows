@@ -7,6 +7,13 @@ pub const ColorScheme = lib.Enum(lib.target, &.{
     "dark",
 });
 
+/// The visibility state reported in response to a CSI ? 998 n query or when
+/// DEC mode 2033 is enabled.
+pub const Visibility = lib.Enum(lib.target, &.{
+    "potentially_visible",
+    "not_visible",
+});
+
 /// Maximum number of bytes that `encodeColorSchemeReport` will write.
 pub const max_color_scheme_report_encode_size = max: {
     var result: usize = 0;
@@ -30,6 +37,21 @@ pub fn encodeColorSchemeReport(
     try writer.writeAll(switch (scheme) {
         .dark => "\x1B[?997;1n",
         .light => "\x1B[?997;2n",
+    });
+}
+
+/// Maximum number of bytes that `encodeVisibilityReport` will write.
+pub const max_visibility_report_encode_size = "\x1B[?999;2n".len;
+
+/// Encode a visibility report response for CSI ? 998 n queries and DEC mode
+/// 2033 notifications.
+pub fn encodeVisibilityReport(
+    writer: *std.Io.Writer,
+    visibility: Visibility,
+) std.Io.Writer.Error!void {
+    try writer.writeAll(switch (visibility) {
+        .potentially_visible => "\x1B[?999;1n",
+        .not_visible => "\x1B[?999;2n",
     });
 }
 
@@ -91,6 +113,7 @@ const entries: []const Entry = &.{
     .{ .name = "operating_status", .value = 5 },
     .{ .name = "cursor_position", .value = 6 },
     .{ .name = "color_scheme", .value = 996, .question = true },
+    .{ .name = "visibility", .value = 998, .question = true },
 };
 
 test "encode color scheme report dark" {
@@ -107,4 +130,15 @@ test "encode color scheme report light" {
     var writer: std.Io.Writer = .fixed(&buf);
     try encodeColorSchemeReport(&writer, .light);
     try std.testing.expectEqualStrings("\x1B[?997;2n", writer.buffered());
+}
+
+test "encode visibility report" {
+    var buf: [max_visibility_report_encode_size]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try encodeVisibilityReport(&writer, .potentially_visible);
+    try std.testing.expectEqualStrings("\x1B[?999;1n", writer.buffered());
+
+    writer = .fixed(&buf);
+    try encodeVisibilityReport(&writer, .not_visible);
+    try std.testing.expectEqualStrings("\x1B[?999;2n", writer.buffered());
 }

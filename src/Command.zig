@@ -890,6 +890,9 @@ test "Command: custom env vars" {
         .args = &.{ "C:\\Windows\\System32\\cmd.exe", "/C", "echo %VALUE%" },
         .stdout = stdout,
         .env = &env,
+        // WSL launches Windows test binaries from a UNC working directory,
+        // which cmd.exe rejects before evaluating the command.
+        .cwd = "C:\\Windows\\System32",
         .os_pre_exec = null,
         .rt_pre_exec = null,
         .rt_post_fork = null,

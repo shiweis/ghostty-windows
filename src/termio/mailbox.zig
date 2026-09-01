@@ -53,6 +53,7 @@ pub const Mailbox = union(enum) {
     pub fn deinit(self: *Mailbox, alloc: Allocator) void {
         switch (self.*) {
             .spsc => |*v| {
+                while (v.queue.pop(global.io())) |msg| msg.deinit();
                 v.queue.destroy(alloc);
                 v.wakeup.deinit();
             },
@@ -82,6 +83,7 @@ pub const Mailbox = union(enum) {
                 // lock so we need to unlock.
                 mb.wakeup.notify() catch |err| {
                     log.warn("failed to wake up writer, data will be dropped err={}", .{err});
+                    msg.deinit();
                     return;
                 };
 
@@ -98,17 +100,7 @@ pub const Mailbox = union(enum) {
                 defer if (mutex) |m| m.lockUncancelable(global.io());
                 if (mb.queue.push(global.io(), msg, .{ .ns = send_timeout_ns }) == 0) {
                     log.err("io mailbox full, message dropped (data loss)", .{});
-
-                    // The consumer never took ownership, so free any
-                    // payload the message owns.
-                    switch (msg) {
-                        .write_alloc => |v| v.alloc.free(v.data),
-                        .change_config => |v| {
-                            v.ptr.deinit();
-                            v.alloc.destroy(v.ptr);
-                        },
-                        else => {},
-                    }
+                    msg.deinit();
                 }
             },
         }

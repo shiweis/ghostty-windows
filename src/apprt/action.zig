@@ -196,6 +196,9 @@ pub const Action = union(Key) {
     /// rendered at the next opportunity.
     render_inspector,
 
+    /// Export the Terminal IO inspector event log.
+    export_terminal_io: ExportTerminalIO,
+
     /// Show a desktop notification.
     desktop_notification: DesktopNotification,
 
@@ -204,6 +207,9 @@ pub const Action = union(Key) {
 
     /// Set the tab title override for the target's tab.
     set_tab_title: SetTitle,
+
+    /// Set the window title override for the target's tab.
+    set_window_title: SetTitle,
 
     /// Set the title of the target to a prompted value. It is up to
     /// the apprt to prompt. The value specifies whether to prompt for the
@@ -228,7 +234,7 @@ pub const Action = union(Key) {
     /// Open the Ghostty configuration. This is platform-specific about
     /// what it means; it can mean opening a dedicated UI or just opening
     /// a file in a text editor.
-    open_config,
+    open_config: OpenConfig,
 
     /// Called when there are no more surfaces and the app should quit
     /// after the configured delay.
@@ -348,6 +354,9 @@ pub const Action = union(Key) {
     /// otherwise the terminal-set title.
     copy_title_to_clipboard,
 
+    /// Move a tab to a new window.
+    move_tab_to_new_window,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -381,9 +390,11 @@ pub const Action = union(Key) {
         inspector,
         show_gtk_inspector,
         render_inspector,
+        export_terminal_io,
         desktop_notification,
         set_title,
         set_tab_title,
+        set_window_title,
         prompt_title,
         pwd,
         mouse_shape,
@@ -416,6 +427,7 @@ pub const Action = union(Key) {
         search_selected,
         readonly,
         copy_title_to_clipboard,
+        move_tab_to_new_window,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -457,7 +469,7 @@ pub const Action = union(Key) {
         // At the time of writing, we don't promise ABI compatibility
         // so we can change this but I want to be aware of it.
         assert(@sizeOf(CValue) == switch (@sizeOf(usize)) {
-            4 => 16,
+            4 => 24,
             8 => 24,
             else => unreachable,
         });
@@ -612,6 +624,37 @@ pub const Inspector = enum(c_int) {
     }
 };
 
+/// Terminal IO inspector contents to export. The contents are only valid for
+/// the duration of the action callback.
+pub const ExportTerminalIO = struct {
+    contents: []const u8,
+
+    // Sync with: ghostty_action_export_terminal_io_s
+    pub const C = extern struct {
+        contents: [*]const u8,
+        len: usize,
+    };
+
+    pub fn cval(self: ExportTerminalIO) C {
+        return .{
+            .contents = self.contents.ptr,
+            .len = self.contents.len,
+        };
+    }
+
+    pub fn format(
+        value: @This(),
+        comptime _: []const u8,
+        _: std.fmt.Options,
+        writer: *std.Io.Writer,
+    ) !void {
+        try writer.print(
+            "{s}{{ contents: {d} bytes }}",
+            .{ @typeName(@This()), value.contents.len },
+        );
+    }
+};
+
 pub const QuitTimer = enum(c_int) {
     start,
     stop,
@@ -639,10 +682,11 @@ pub const MouseVisibility = enum(c_int) {
     }
 };
 
-/// Whether to prompt for the surface title or tab title.
+/// Whether to prompt for the surface, tab, or window title.
 pub const PromptTitle = enum(c_int) {
     surface,
     tab,
+    window,
 
     test "ghostty.h PromptTitle" {
         try lib.checkGhosttyHEnum(PromptTitle, "GHOSTTY_PROMPT_TITLE_");
@@ -906,6 +950,11 @@ pub const OpenUrl = struct {
         /// The URL is known to contain HTML content.
         html,
 
+        /// The URL came from an OSC 8 hyperlink. Application runtimes should
+        /// treat this as untrusted terminal output and apply a platform-specific
+        /// safe-opening policy.
+        osc8,
+
         test "ghostty.h OpenUrl.Kind" {
             try lib.checkGhosttyHEnum(Kind, "GHOSTTY_ACTION_OPEN_URL_KIND_");
         }
@@ -1001,6 +1050,19 @@ pub const SearchSelected = struct {
         return .{
             .selected = if (self.selected) |s| @intCast(s) else -1,
         };
+    }
+};
+
+/// sync with ghostty_action_close_tab_mode_e in ghostty.h
+pub const OpenConfig = enum(c_int) {
+    /// Open the config in the OS default editor.
+    os_open,
+
+    /// Open the config in a new window using $EDITOR or $VISUAL
+    new_window,
+
+    test "ghostty.h OpenConfig" {
+        try lib.checkGhosttyHEnum(OpenConfig, "GHOSTTY_ACTION_OPEN_CONFIG_");
     }
 };
 

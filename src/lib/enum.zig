@@ -5,18 +5,16 @@ const Target = @import("target.zig").Target;
 /// if we're targeting C, otherwise a Zig enum with smallest possible
 /// backing type.
 ///
-/// In all cases, the enum keys will be created in the order given.
-/// For C ABI, this means that the order MUST NOT be changed in order
-/// to preserve ABI compatibility. You can set a key to null to
-/// remove it from the Zig enum while keeping the "hole" in the C enum
-/// to preserve ABI compatibility.
+/// In all cases, each enum value is its index in `keys`. The order MUST NOT
+/// be changed when the integer values are part of an ABI or serialized format.
+/// A null key removes that field while preserving its integer hole.
 ///
 /// C detection is up to the caller, since there are multiple ways
 /// to do that. We rely on the `target` parameter to determine whether we
 /// should create a C compatible enum or a Zig enum.
 ///
-/// For the Zig enum, the enum value is not guaranteed to be stable, so
-/// it shouldn't be relied for things like serialization.
+/// C enums use `c_int`. Zig enums use the smallest unsigned integer that can
+/// represent every key index, including holes.
 pub fn Enum(
     target: Target,
     keys: []const ?[:0]const u8,
@@ -24,14 +22,12 @@ pub fn Enum(
     var names_raw: [keys.len][]const u8 = undefined;
     var values_raw: [keys.len]comptime_int = undefined;
     const names_actual, const values_actual = kv: {
-        // Remove any holes in the input (null values). As mentioned in the
-        // function docs, in the event of the C ABI, we need to preserve the
-        // original value, so we account for that.
+        // Remove null fields while preserving their positions as integer holes.
         var to: comptime_int = 0;
         for (0..keys.len) |from| {
             if (keys[from]) |key| {
                 names_raw[to] = key;
-                values_raw[to] = if (target == .c) from else to;
+                values_raw[to] = from;
                 to += 1;
             }
         }
@@ -41,7 +37,7 @@ pub fn Enum(
 
     const TagInt = switch (target) {
         .c => c_int,
-        .zig => std.math.IntFittingRange(0, names_actual.len - 1),
+        .zig => std.math.IntFittingRange(0, keys.len - 1),
     };
 
     return @Enum(TagInt, .exhaustive, names_actual, &(values: {
@@ -69,7 +65,7 @@ test "c" {
     try testing.expectEqual(c_int, info.tag_type);
 }
 
-test "abi by removing a key" {
+test "stable values when removing a key" {
     const testing = std.testing;
     // C
     {
@@ -84,8 +80,26 @@ test "abi by removing a key" {
         const T = Enum(.zig, &.{ "a", "b", null, "d" });
         const info = @typeInfo(T).@"enum";
         try testing.expectEqual(u2, info.tag_type);
-        try testing.expectEqual(2, @intFromEnum(T.d));
+        try testing.expectEqual(3, @intFromEnum(T.d));
     }
+}
+
+test "zig backing integer includes trailing holes" {
+    const testing = std.testing;
+    const T = Enum(.zig, &.{ "a", null, null, null, null });
+    const info = @typeInfo(T).@"enum";
+    try testing.expectEqual(u3, info.tag_type);
+    try testing.expectEqual(0, @intFromEnum(T.a));
+}
+
+test "zig values remain stable across multiple holes" {
+    const testing = std.testing;
+    const T = Enum(.zig, &.{ null, "b", null, "d", null, "f" });
+    const info = @typeInfo(T).@"enum";
+    try testing.expectEqual(u3, info.tag_type);
+    try testing.expectEqual(1, @intFromEnum(T.b));
+    try testing.expectEqual(3, @intFromEnum(T.d));
+    try testing.expectEqual(5, @intFromEnum(T.f));
 }
 
 /// Verify that for every key in enum T, there is a matching declaration in
@@ -121,7 +135,10 @@ pub fn checkGhosttyHEnum(
 
         if (@hasDecl(c, expected_name)) {
             std.testing.expectEqual(field.value, @field(c, expected_name)) catch |e| {
-                std.log.err(@typeName(T) ++ " key " ++ field.name ++ " does not have the same backing int as " ++ expected_name, .{});
+                std.log.err(
+                    "{s} key {s} does not have the same backing int as " ++ expected_name,
+                    .{ @typeName(T), field.name },
+                );
                 return e;
             };
 

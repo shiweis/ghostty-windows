@@ -241,6 +241,7 @@ const Preview = struct {
     allocator: std.mem.Allocator,
     should_quit: bool,
     tty: vaxis.Tty,
+    env_map: std.process.Environ.Map,
     vx: vaxis.Vaxis,
     mouse: ?vaxis.Mouse,
     themes: []ThemeListElement,
@@ -264,16 +265,15 @@ const Preview = struct {
         theme_filter: ColorScheme,
         buf: []u8,
     ) !*Preview {
-        var env_map = try global.environMap();
-        defer env_map.deinit();
-
         const self = try allocator.create(Preview);
+        errdefer allocator.destroy(self);
 
         self.* = .{
             .allocator = allocator,
             .should_quit = false,
             .tty = try .init(global.io(), buf),
-            .vx = try vaxis.init(global.io(), allocator, &env_map, .{}),
+            .env_map = try global.environMap(),
+            .vx = undefined,
             .mouse = null,
             .themes = themes,
             .filtered = try .initCapacity(allocator, themes.len),
@@ -285,6 +285,7 @@ const Preview = struct {
             .text_input = .init(allocator),
             .theme_filter = theme_filter,
         };
+        self.vx = try vaxis.init(global.io(), allocator, &self.env_map, .{});
 
         try self.updateFiltered();
 
@@ -296,14 +297,17 @@ const Preview = struct {
         self.filtered.deinit(allocator);
         self.text_input.deinit();
         self.vx.deinit(allocator, self.tty.writer());
+        self.env_map.deinit();
         self.tty.deinit();
         allocator.destroy(self);
     }
 
     pub fn run(self: *Preview) !void {
         var loop: vaxis.Loop(Event) = .init(global.io(), &self.tty, &self.vx);
-        const writer = self.tty.writer();
+        try loop.start();
+        defer loop.stop();
 
+        const writer = self.tty.writer();
         try self.vx.enterAltScreen(writer);
         try self.vx.setTitle(writer, "👻 Ghostty Theme Preview 👻");
         try self.vx.queryTerminal(writer, .fromSeconds(1));
@@ -460,9 +464,9 @@ const Preview = struct {
                             self.text_input.buf.clearRetainingCapacity();
                             try self.updateFiltered();
                         }
-                        if (key.matchesAny(&.{ vaxis.Key.home, vaxis.Key.kp_home }, .{}))
+                        if (key.matchesAny(&.{ vaxis.Key.home, vaxis.Key.kp_home, 'g' }, .{}))
                             self.current = 0;
-                        if (key.matchesAny(&.{ vaxis.Key.end, vaxis.Key.kp_end }, .{}))
+                        if (key.matchesAny(&.{ vaxis.Key.end, vaxis.Key.kp_end, 'G' }, .{}))
                             self.current = self.filtered.items.len - 1;
                         if (key.matchesAny(&.{ 'j', '+', vaxis.Key.down, vaxis.Key.kp_down, vaxis.Key.kp_add }, .{}))
                             self.down(1);
@@ -775,8 +779,8 @@ const Preview = struct {
                     .{ .keys = "d", .help = "Show palette numbers in decimal." },
                     .{ .keys = "c", .help = "Copy theme name to the clipboard." },
                     .{ .keys = "C", .help = "Copy theme path to the clipboard." },
-                    .{ .keys = "Home", .help = "Go to the start of the list." },
-                    .{ .keys = "End", .help = "Go to the end of the list." },
+                    .{ .keys = "Home, g", .help = "Go to the start of the list." },
+                    .{ .keys = "End, G", .help = "Go to the end of the list." },
                     .{ .keys = "/", .help = "Start search." },
                     .{ .keys = "^X, ^/", .help = "Clear search." },
                     .{ .keys = "⏎", .help = "Save theme or close search window." },
@@ -1201,7 +1205,7 @@ const Preview = struct {
                         .x_off = x_off,
                         .y_off = next_start,
                         .width = width,
-                        .height = 24,
+                        .height = 28,
                     },
                 );
                 const bold: vaxis.Style = .{
@@ -1378,7 +1382,9 @@ const Preview = struct {
                         .{ .text = "pub ", .style = color5 },
                         .{ .text = "fn ", .style = color12 },
                         .{ .text = "main", .style = color2 },
-                        .{ .text = "() ", .style = standard },
+                        .{ .text = "(init: ", .style = standard },
+                        .{ .text = "std.process.Init", .style = color12 },
+                        .{ .text = ") ", .style = standard },
                         .{ .text = "!", .style = color5 },
                         .{ .text = "void", .style = color12 },
                         .{ .text = " {", .style = standard },
@@ -1391,10 +1397,11 @@ const Preview = struct {
                 _ = child.print(
                     &.{
                         .{ .text = "   4   │     ", .style = color238 },
-                        .{ .text = "const ", .style = color5 },
-                        .{ .text = "stdout ", .style = standard },
-                        .{ .text = "=", .style = color5 },
-                        .{ .text = " std.Io.getStdOut().writer();", .style = standard },
+                        .{ .text = "var ", .style = color5 },
+                        .{ .text = "buf:", .style = standard },
+                        .{ .text = " [1024]u8", .style = color12 },
+                        .{ .text = " =", .style = color5 },
+                        .{ .text = " undefined;", .style = standard },
                     },
                     .{
                         .row_offset = 7,
@@ -1405,11 +1412,9 @@ const Preview = struct {
                     &.{
                         .{ .text = "   5   │     ", .style = color238 },
                         .{ .text = "var ", .style = color5 },
-                        .{ .text = "i:", .style = standard },
-                        .{ .text = " usize", .style = color12 },
-                        .{ .text = " =", .style = color5 },
-                        .{ .text = " 1", .style = color4 },
-                        .{ .text = ";", .style = standard },
+                        .{ .text = "stdout ", .style = standard },
+                        .{ .text = "=", .style = color5 },
+                        .{ .text = " std.Io.File.stdout().writer(init.io, &buf);", .style = standard },
                     },
                     .{
                         .row_offset = 8,
@@ -1419,6 +1424,43 @@ const Preview = struct {
                 _ = child.print(
                     &.{
                         .{ .text = "   6   │     ", .style = color238 },
+                        .{ .text = "const ", .style = color5 },
+                        .{ .text = "w ", .style = standard },
+                        .{ .text = "=", .style = color5 },
+                        .{ .text = " &stdout.interface;", .style = standard },
+                    },
+                    .{
+                        .row_offset = 9,
+                        .col_offset = 2,
+                    },
+                );
+                _ = child.print(
+                    &.{
+                        .{ .text = "   7   │", .style = color238 },
+                    },
+                    .{
+                        .row_offset = 10,
+                        .col_offset = 2,
+                    },
+                );
+                _ = child.print(
+                    &.{
+                        .{ .text = "   8   │     ", .style = color238 },
+                        .{ .text = "var ", .style = color5 },
+                        .{ .text = "i:", .style = standard },
+                        .{ .text = " usize", .style = color12 },
+                        .{ .text = " =", .style = color5 },
+                        .{ .text = " 1", .style = color4 },
+                        .{ .text = ";", .style = standard },
+                    },
+                    .{
+                        .row_offset = 11,
+                        .col_offset = 2,
+                    },
+                );
+                _ = child.print(
+                    &.{
+                        .{ .text = "   9   │     ", .style = color238 },
                         .{ .text = "while ", .style = color5 },
                         .{ .text = "(i ", .style = standard },
                         .{ .text = "<= ", .style = color5 },
@@ -1429,13 +1471,13 @@ const Preview = struct {
                         .{ .text = ") {", .style = standard },
                     },
                     .{
-                        .row_offset = 9,
+                        .row_offset = 12,
                         .col_offset = 2,
                     },
                 );
                 _ = child.print(
                     &.{
-                        .{ .text = "   7   │         ", .style = color238 },
+                        .{ .text = "  10   │         ", .style = color238 },
                         .{ .text = "if ", .style = color5 },
                         .{ .text = "(i ", .style = standard },
                         .{ .text = "% ", .style = color5 },
@@ -1445,28 +1487,28 @@ const Preview = struct {
                         .{ .text = ") {", .style = standard },
                     },
                     .{
-                        .row_offset = 10,
+                        .row_offset = 13,
                         .col_offset = 2,
                     },
                 );
                 _ = child.print(
                     &.{
-                        .{ .text = "   8   │             ", .style = color238 },
+                        .{ .text = "  11   │             ", .style = color238 },
                         .{ .text = "try ", .style = color5 },
-                        .{ .text = "stdout.writeAll(", .style = standard },
+                        .{ .text = "w.writeAll(", .style = standard },
                         .{ .text = "\"ZiggZagg", .style = color10 },
                         .{ .text = "\\n", .style = color12 },
                         .{ .text = "\"", .style = color10 },
                         .{ .text = ");", .style = standard },
                     },
                     .{
-                        .row_offset = 11,
+                        .row_offset = 14,
                         .col_offset = 2,
                     },
                 );
                 _ = child.print(
                     &.{
-                        .{ .text = "   9   │         ", .style = color238 },
+                        .{ .text = "  12   │         ", .style = color238 },
                         .{ .text = "} ", .style = standard },
                         .{ .text = "else if ", .style = color5 },
                         .{ .text = "(i ", .style = standard },
@@ -1477,28 +1519,28 @@ const Preview = struct {
                         .{ .text = ") {", .style = standard },
                     },
                     .{
-                        .row_offset = 12,
+                        .row_offset = 15,
                         .col_offset = 2,
                     },
                 );
                 _ = child.print(
                     &.{
-                        .{ .text = "  10   │             ", .style = color238 },
+                        .{ .text = "  13   │             ", .style = color238 },
                         .{ .text = "try ", .style = color5 },
-                        .{ .text = "stdout.writeAll(", .style = standard },
+                        .{ .text = "w.writeAll(", .style = standard },
                         .{ .text = "\"Zigg", .style = color10 },
                         .{ .text = "\\n", .style = color12 },
                         .{ .text = "\"", .style = color10 },
                         .{ .text = ");", .style = standard },
                     },
                     .{
-                        .row_offset = 13,
+                        .row_offset = 16,
                         .col_offset = 2,
                     },
                 );
                 _ = child.print(
                     &.{
-                        .{ .text = "  11   │         ", .style = color238 },
+                        .{ .text = "  14   │         ", .style = color238 },
                         .{ .text = "} ", .style = standard },
                         .{ .text = "else if ", .style = color5 },
                         .{ .text = "(i ", .style = standard },
@@ -1509,53 +1551,19 @@ const Preview = struct {
                         .{ .text = ") {", .style = standard },
                     },
                     .{
-                        .row_offset = 14,
-                        .col_offset = 2,
-                    },
-                );
-                _ = child.print(
-                    &.{
-                        .{ .text = "  12   │             ", .style = color238 },
-                        .{ .text = "try ", .style = color5 },
-                        .{ .text = "stdout.writeAll(", .style = standard },
-                        .{ .text = "\"Zagg", .style = color10 },
-                        .{ .text = "\\n", .style = color12 },
-                        .{ .text = "\"", .style = color10 },
-                        .{ .text = ");", .style = standard },
-                    },
-                    .{
-                        .row_offset = 15,
-                        .col_offset = 2,
-                    },
-                );
-                _ = child.print(
-                    &.{
-                        .{ .text = "  13   │         ", .style = color238 },
-                        .{ .text = "} ", .style = standard },
-                        .{ .text = "else ", .style = color5 },
-                        .{ .text = "{", .style = standard },
-                    },
-                    .{
-                        .row_offset = 16,
-                        .col_offset = 2,
-                    },
-                );
-                _ = child.print(
-                    &.{
-                        .{ .text = "  14   │             ", .style = color238 },
-                        .{ .text = "try ", .style = color5 },
-                        .{ .text = "stdout.print(\"{d}\\n\", .{i})", .style = standard_selection },
-                        .{ .text = ";", .style = cursor },
-                    },
-                    .{
                         .row_offset = 17,
                         .col_offset = 2,
                     },
                 );
                 _ = child.print(
                     &.{
-                        .{ .text = "  15   │         ", .style = color238 },
-                        .{ .text = "}", .style = standard },
+                        .{ .text = "  15   │             ", .style = color238 },
+                        .{ .text = "try ", .style = color5 },
+                        .{ .text = "w.writeAll(", .style = standard },
+                        .{ .text = "\"Zagg", .style = color10 },
+                        .{ .text = "\\n", .style = color12 },
+                        .{ .text = "\"", .style = color10 },
+                        .{ .text = ");", .style = standard },
                     },
                     .{
                         .row_offset = 18,
@@ -1564,8 +1572,10 @@ const Preview = struct {
                 );
                 _ = child.print(
                     &.{
-                        .{ .text = "  16   │     ", .style = color238 },
-                        .{ .text = "}", .style = standard },
+                        .{ .text = "  16   │         ", .style = color238 },
+                        .{ .text = "} ", .style = standard },
+                        .{ .text = "else ", .style = color5 },
+                        .{ .text = "{", .style = standard },
                     },
                     .{
                         .row_offset = 19,
@@ -1574,11 +1584,54 @@ const Preview = struct {
                 );
                 _ = child.print(
                     &.{
-                        .{ .text = "  17   │ ", .style = color238 },
-                        .{ .text = "}", .style = standard },
+                        .{ .text = "  17   │             ", .style = color238 },
+                        .{ .text = "try ", .style = color5 },
+                        .{ .text = "w.print(\"{d}\\n\", .{i})", .style = standard_selection },
+                        .{ .text = ";", .style = cursor },
                     },
                     .{
                         .row_offset = 20,
+                        .col_offset = 2,
+                    },
+                );
+                _ = child.print(
+                    &.{
+                        .{ .text = "  18   │         ", .style = color238 },
+                        .{ .text = "}", .style = standard },
+                    },
+                    .{
+                        .row_offset = 21,
+                        .col_offset = 2,
+                    },
+                );
+                _ = child.print(
+                    &.{
+                        .{ .text = "  19   │     ", .style = color238 },
+                        .{ .text = "}", .style = standard },
+                    },
+                    .{
+                        .row_offset = 22,
+                        .col_offset = 2,
+                    },
+                );
+                _ = child.print(
+                    &.{
+                        .{ .text = "  20   │     ", .style = color238 },
+                        .{ .text = "try ", .style = color5 },
+                        .{ .text = "w.flush();", .style = standard },
+                    },
+                    .{
+                        .row_offset = 23,
+                        .col_offset = 2,
+                    },
+                );
+                _ = child.print(
+                    &.{
+                        .{ .text = "  21   │ ", .style = color238 },
+                        .{ .text = "}", .style = standard },
+                    },
+                    .{
+                        .row_offset = 24,
                         .col_offset = 2,
                     },
                 );
@@ -1591,7 +1644,7 @@ const Preview = struct {
                             },
                         },
                         .{
-                            .row_offset = 21,
+                            .row_offset = 25,
                             .col_offset = 2,
                         },
                     );
@@ -1606,7 +1659,7 @@ const Preview = struct {
                                     },
                                 },
                                 .{
-                                    .row_offset = 21,
+                                    .row_offset = 25,
                                     .col_offset = col,
                                 },
                             );
@@ -1620,12 +1673,12 @@ const Preview = struct {
                         .{ .text = " main ", .style = color4 },
                         .{ .text = "[+] ", .style = color1 },
                         .{ .text = "via ", .style = standard },
-                        .{ .text = " v0.13.0 ", .style = color3 },
+                        .{ .text = " v0.16.0 ", .style = color3 },
                         .{ .text = "via ", .style = standard },
                         .{ .text = "  impure (ghostty-env)", .style = color4 },
                     },
                     .{
-                        .row_offset = 22,
+                        .row_offset = 26,
                         .col_offset = 2,
                     },
                 );
@@ -1637,7 +1690,7 @@ const Preview = struct {
                         .{ .text = "→", .style = color2 },
                     },
                     .{
-                        .row_offset = 23,
+                        .row_offset = 27,
                         .col_offset = 2,
                     },
                 );

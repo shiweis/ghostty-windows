@@ -58,6 +58,12 @@ pub fn initWasm(
     // There is no entrypoint for this wasm module.
     exe.entry = .disabled;
 
+    // Default Zig stack size in Zig 0.16 is 1MB. Lower to 128 KB since
+    // this has to be preallocated up front in Wasm linear memory. Peak
+    // stack under various artificial loads is 17 KB at the time of this
+    // comment but lets do 128KB to be safe. We can lower later.
+    exe.stack_size = 128 * 1024;
+
     // Zig's WASM linker doesn't support --growable-table, so the table
     // is emitted with max == min and can't be grown from JS. Run a
     // small Zig build tool that patches the binary's table section to
@@ -183,7 +189,7 @@ pub fn initStaticAppleUniversal(
         const target_query: std.Target.Query = .{
             .cpu_arch = .aarch64,
             .os_tag = p.os_tag,
-            .os_version_min = Config.osVersionMin(p.os_tag),
+            .os_version_min = Config.osVersionMinLibVt(p.os_tag),
         };
         if (detectAppleSDK(
             b.graph.io,
@@ -197,7 +203,7 @@ pub fn initStaticAppleUniversal(
             const sim_zig = try zig.retarget(b, cfg, deps, b.resolveTargetQuery(.{
                 .cpu_arch = .aarch64,
                 .os_tag = p.os_tag,
-                .os_version_min = Config.osVersionMin(p.os_tag),
+                .os_version_min = Config.osVersionMinLibVt(p.os_tag),
                 .abi = .simulator,
                 .cpu_model = .{ .explicit = &std.Target.aarch64.cpu.apple_a17 },
             }));
@@ -240,13 +246,28 @@ fn initLib(
 
         // Enable PIC so the static library can be linked into PIE
         // executables, which is the default on most Linux distributions.
-        lib.root_module.pic = true;
+        // Native freestanding targets don't have a dynamic loader and some,
+        // such as Xtensa, don't support PIC relocations.
+        lib.root_module.pic = target.result.os.tag != .freestanding;
     }
 
     if (target.result.os.tag == .windows) {
         // Zig's ubsan emits /exclude-symbols linker directives that
         // are incompatible with the MSVC linker (LNK4229).
         lib.bundle_ubsan_rt = false;
+
+        if (kind == .static) {
+            if (target.result.abi == .msvc) {
+                // Zig's compiler runtime doesn't provide MSVC's security
+                // cookie symbols when libc is linked. Disable stack-protector
+                // generation so static consumers don't need BufferOverflowU.
+                lib.root_module.stack_protector = false;
+            }
+
+            // The Zig standard library uses NT and kernel32 symbols.
+            lib.root_module.linkSystemLibrary("ntdll", .{});
+            lib.root_module.linkSystemLibrary("kernel32", .{});
+        }
     }
 
     if (lib.rootModuleTarget().abi.isAndroid()) {

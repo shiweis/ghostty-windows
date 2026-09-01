@@ -68,12 +68,17 @@ drag_active: bool = false,
 rename_edit: ?w32.HWND = null,
 rename_font: ?*anyopaque = null,
 rename_tab: usize = 0,
+rename_window: bool = false,
 
 /// UTF-16 title buffers for each tab (for painting the tab bar).
 tab_titles: [64][256]u16 = undefined,
 
 /// Length of each tab title in UTF-16 code units.
 tab_title_lens: [64]u16 = undefined,
+
+/// Explicit top-level window title override. Null follows the active tab.
+window_title_override_len: ?u16 = null,
+window_title_override: [256]u16 = undefined,
 
 /// Whether the window is currently in fullscreen mode.
 is_fullscreen: bool = false,
@@ -428,13 +433,20 @@ fn findHandle(self: *Window, tab_idx: usize, surface: *Surface) ?SplitTree(Surfa
 /// Add a new tab surface to this window. The surface is created,
 /// initialized, and inserted at the position dictated by config.
 pub fn addTab(self: *Window) !*Surface {
+    return self.addTabWithOptions(.{ .context = .tab });
+}
+
+pub const AddTabOptions = Surface.InitOptions;
+
+/// Add a tab with per-surface configuration overrides.
+pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
     if (self.closing) return error.WindowClosing;
     if (self.tab_count >= MAX_TABS) return error.TooManyTabs;
     self.cancelTabRename();
 
     const alloc = self.app.core_app.alloc;
     const surface = try alloc.create(Surface);
-    try surface.init(self.app, self, .tab);
+    try surface.initWithOptions(self.app, self, options);
     // After surface.init succeeds, create the SplitTree which takes ownership
     // via ref(). If this fails, we manually clean up.
     var tree = SplitTree(Surface).init(alloc, surface) catch |err| {
@@ -1024,15 +1036,121 @@ pub fn moveTab(self: *Window, amount: isize) void {
     self.invalidateTabBar();
 }
 
+/// Move the tab containing `surface`, including all of its splits, into a new
+/// native window without restarting any child processes.
+pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
+    if (self.is_quick_terminal or self.tab_count <= 1) return false;
+    const tab_idx = self.findTabIndex(surface) orelse return false;
+
+    const alloc = self.app.core_app.alloc;
+    const destination = try alloc.create(Window);
+    destination.init(self.app, .{}) catch |err| {
+        alloc.destroy(destination);
+        return err;
+    };
+    errdefer {
+        destination.deinit();
+        alloc.destroy(destination);
+    }
+
+    try self.app.windows.append(alloc, destination);
+    var tracked = true;
+    errdefer if (tracked) {
+        for (self.app.windows.items, 0..) |window, i| {
+            if (window == destination) {
+                _ = self.app.windows.orderedRemove(i);
+                break;
+            }
+        }
+    };
+
+    const destination_hwnd = destination.hwnd orelse return error.Win32Error;
+    var moved_tree = self.tab_trees[tab_idx];
+
+    // Reparent every child HWND first so a failure can be rolled back before
+    // either window's tab arrays are mutated.
+    var it = moved_tree.iterator();
+    while (it.next()) |entry| {
+        const child = entry.view.hwnd orelse continue;
+        if (w32.SetParent(child, destination_hwnd) == null) {
+            if (self.hwnd) |source_hwnd| {
+                var rollback = moved_tree.iterator();
+                while (rollback.next()) |rollback_entry| {
+                    if (rollback_entry.view.hwnd) |h| _ = w32.SetParent(h, source_hwnd);
+                }
+            }
+            return error.Win32Error;
+        }
+    }
+
+    const moved_active = self.tab_active_surface[tab_idx];
+    const moved_title = self.tab_titles[tab_idx];
+    const moved_title_len = self.tab_title_lens[tab_idx];
+
+    var i = tab_idx;
+    while (i + 1 < self.tab_count) : (i += 1) {
+        self.tab_trees[i] = self.tab_trees[i + 1];
+        self.tab_active_surface[i] = self.tab_active_surface[i + 1];
+        self.tab_titles[i] = self.tab_titles[i + 1];
+        self.tab_title_lens[i] = self.tab_title_lens[i + 1];
+    }
+    self.tab_count -= 1;
+    if (self.active_tab > tab_idx) {
+        self.active_tab -= 1;
+    } else if (self.active_tab >= self.tab_count) {
+        self.active_tab = self.tab_count - 1;
+    }
+
+    destination.tab_trees[0] = moved_tree;
+    destination.tab_active_surface[0] = moved_active;
+    destination.tab_titles[0] = moved_title;
+    destination.tab_title_lens[0] = moved_title_len;
+    destination.tab_count = 1;
+    destination.active_tab = 0;
+
+    it = destination.tab_trees[0].iterator();
+    while (it.next()) |entry| entry.view.parent_window = destination;
+
+    self.selectTabIndex(self.active_tab);
+    self.updateTabBarVisibility();
+    self.invalidateTabBar();
+
+    destination.updateTabBarVisibility();
+    destination.updateWindowTitle();
+    _ = w32.ShowWindow(destination_hwnd, w32.SW_SHOW);
+    _ = w32.UpdateWindow(destination_hwnd);
+    destination.layoutSplits();
+    if (moved_active.hwnd) |h| _ = w32.SetFocus(h);
+
+    tracked = false;
+    return true;
+}
+
 /// Update the top-level window title to match the active tab's title.
 fn updateWindowTitle(self: *Window) void {
     const hwnd = self.hwnd orelse return;
     if (self.tab_count == 0) return;
-    const len = self.tab_title_lens[self.active_tab];
+    const len = self.window_title_override_len orelse
+        self.tab_title_lens[self.active_tab];
     var buf: [257]u16 = undefined;
-    @memcpy(buf[0..len], self.tab_titles[self.active_tab][0..len]);
+    if (self.window_title_override_len != null) {
+        @memcpy(buf[0..len], self.window_title_override[0..len]);
+    } else {
+        @memcpy(buf[0..len], self.tab_titles[self.active_tab][0..len]);
+    }
     buf[len] = 0;
     _ = w32.SetWindowTextW(hwnd, @ptrCast(&buf));
+}
+
+/// Set or clear the explicit top-level window title override.
+pub fn setWindowTitle(self: *Window, title: [:0]const u8) void {
+    if (title.len == 0) {
+        self.window_title_override_len = null;
+    } else {
+        const len = std.unicode.utf8ToUtf16Le(&self.window_title_override, title) catch 0;
+        self.window_title_override_len = @intCast(@min(len, self.window_title_override.len));
+    }
+    self.updateWindowTitle();
 }
 
 /// Called when a tab's title changes. Updates the stored title
@@ -1682,9 +1800,23 @@ const RENAME_EDIT_ID: u16 = 300;
 pub fn startTabRename(self: *Window, tab_idx: usize) void {
     // Cancel any existing rename
     self.cancelTabRename();
+    self.rename_window = false;
 
     const hwnd = self.hwnd orelse return;
-    const rect = self.tab_rects[tab_idx];
+    const rect = rect: {
+        if (self.tab_bar_visible) break :rect self.tab_rects[tab_idx];
+
+        // A single-tab window has no tab bar. Use a compact editor at the
+        // top of the client area so prompt_*_title remains usable.
+        var client: w32.RECT = undefined;
+        if (w32.GetClientRect(hwnd, &client) == 0) return;
+        break :rect w32.RECT{
+            .left = 8,
+            .top = 8,
+            .right = @max(168, client.right - 8),
+            .bottom = 38,
+        };
+    };
 
     // tab_titles stores only `tab_title_lens` valid u16s; the rest is
     // uninitialized. CreateWindowExW reads a NUL-terminated wide string,
@@ -1754,6 +1886,23 @@ pub fn startTabRename(self: *Window, tab_idx: usize) void {
     self.rename_tab = tab_idx;
 }
 
+/// Prompt for an explicit top-level window title using the same lightweight
+/// inline editor as tab renaming.
+pub fn startWindowRename(self: *Window) void {
+    self.startTabRename(self.active_tab);
+    const edit = self.rename_edit orelse return;
+    self.rename_window = true;
+
+    var title: [257]u16 = undefined;
+    const len: usize = if (self.window_title_override_len) |override_len| len: {
+        @memcpy(title[0..override_len], self.window_title_override[0..override_len]);
+        break :len override_len;
+    } else @intCast(w32.GetWindowTextW(self.hwnd.?, &title, 256));
+    title[len] = 0;
+    _ = w32.SetWindowTextW(edit, @ptrCast(&title));
+    _ = w32.SendMessageW(edit, 0x00B1, 0, -1); // EM_SETSEL(0, -1)
+}
+
 /// Apply the edit text as the new tab title and destroy the edit control.
 pub fn finishTabRename(self: *Window) void {
     const edit = self.rename_edit orelse return;
@@ -1762,7 +1911,16 @@ pub fn finishTabRename(self: *Window) void {
     // Read the edit control text
     var wbuf: [256]u16 = undefined;
     const wlen: usize = @intCast(w32.GetWindowTextW(edit, &wbuf, 256));
-    if (wlen > 0) {
+    if (self.rename_window) {
+        if (wlen == 0) {
+            self.window_title_override_len = null;
+        } else {
+            const len: u16 = @intCast(@min(wlen, 255));
+            @memcpy(self.window_title_override[0..len], wbuf[0..len]);
+            self.window_title_override_len = len;
+        }
+        self.updateWindowTitle();
+    } else if (wlen > 0) {
         const len: u16 = @intCast(@min(wlen, 255));
         @memcpy(self.tab_titles[tab_idx][0..len], wbuf[0..len]);
         self.tab_title_lens[tab_idx] = len;
@@ -1774,6 +1932,7 @@ pub fn finishTabRename(self: *Window) void {
     // the WM_COMMAND handler. The early `orelse return` then makes that
     // re-entrant call a no-op.
     self.rename_edit = null;
+    self.rename_window = false;
     _ = w32.DestroyWindow(edit);
     if (self.rename_font) |f| {
         _ = w32.DeleteObject(f);
@@ -1792,6 +1951,7 @@ pub fn cancelTabRename(self: *Window) void {
     if (self.rename_edit) |edit| {
         // Same re-entry concern as finishTabRename: null before destroy.
         self.rename_edit = null;
+        self.rename_window = false;
         _ = w32.DestroyWindow(edit);
         if (self.rename_font) |f| {
             _ = w32.DeleteObject(f);

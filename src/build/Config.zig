@@ -63,6 +63,10 @@ emit_xcframework: bool = false,
 emit_webdata: bool = false,
 emit_unicode_table_gen: bool = false,
 
+/// Feature gates for libghostty-vt artifacts (-Dvt-features). The full
+/// Ghostty application ignores this and always enables everything.
+vt_features: TerminalBuildOptions.Features = .{},
+
 /// True when Ghostty is being built as a dependency of another project
 /// rather than as the root project.
 is_dep: bool = false,
@@ -74,6 +78,15 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
     // Setup our standard Zig target and optimize options, i.e.
     // `-Doptimize` and `-Dtarget`.
     const optimize = b.standardOptimizeOption(.{});
+
+    // Default dependency builds to libghostty-vt-only mode. Consumers can
+    // still explicitly disable this to request the full Ghostty build.
+    const is_dep = b.dep_prefix.len > 0;
+    const emit_lib_vt = b.option(
+        bool,
+        "emit-lib-vt",
+        "Set defaults for a libghostty-vt-only build (disables xcframework, macOS app, and docs).",
+    ) orelse is_dep;
     const target = target: {
         var result = b.standardTargetOptions(.{});
 
@@ -98,18 +111,47 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
             result = b.resolveTargetQuery(query);
         }
 
+        // On wasm, default to enabling the simd128 feature. Every
+        // browser engine has supported it since 2023 or earlier
+        // (Chrome 91, Firefox 89, Safari 16.4) and it is a large
+        // performance win for the terminal hot paths (50%+ on
+        // print-heavy VT streams). Only apply when no explicit CPU
+        // was requested; targets for exotic non-browser runtimes
+        // can opt out with `-Dcpu=generic`.
+        if (result.result.cpu.arch.isWasm() and
+            result.query.cpu_model == .determined_by_arch_os and
+            result.query.cpu_features_add.isEmpty() and
+            result.query.cpu_features_sub.isEmpty())
+        {
+            var query = result.query;
+            query.cpu_features_add.addFeature(
+                @intFromEnum(std.Target.wasm.Feature.simd128),
+            );
+            result = b.resolveTargetQuery(query);
+        }
+
+        // The full Ghostty build no longer supports iOS; Fail early
+        // with a clear message rather than partway through the build.
+        if (result.result.os.tag == .ios and !emit_lib_vt) {
+            std.log.err(
+                "iOS is not a supported target for the full Ghostty build; " ++
+                    "only libghostty-vt supports iOS (-Demit-lib-vt)",
+                .{},
+            );
+            return error.UnsupportedTarget;
+        }
+
         // If we have no minimum OS version, we set the default based on
         // our tag. Not all tags have a minimum so this may be null.
         if (result.query.os_version_min == null) {
-            result.query.os_version_min = osVersionMin(result.result.os.tag);
+            result.query.os_version_min = if (emit_lib_vt)
+                osVersionMinLibVt(result.result.os.tag)
+            else
+                osVersionMin(result.result.os.tag);
         }
 
         break :target result;
     };
-
-    // Detect if Ghostty is a dependency of another project.
-    // dep_prefix is non-empty when this build is running as a dependency.
-    const is_dep = b.dep_prefix.len > 0;
 
     // This is set to true when we're building a system package. For now
     // this is trivially detected using the "system_package_mode" bool
@@ -205,9 +247,10 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
         "simd",
         "Build with SIMD-accelerated code paths. Results in significant performance improvements.",
     ) orelse simd: {
-        // We can't build our SIMD dependencies for Wasm. Note that we may
-        // still use SIMD features in the Wasm-builds.
-        if (target.result.cpu.arch.isWasm()) break :simd false;
+        // We can't build our SIMD dependencies for Wasm or freestanding
+        // targets. Note that we may still use SIMD features in the Wasm-builds.
+        if (target.result.cpu.arch.isWasm() or
+            target.result.os.tag == .freestanding) break :simd false;
 
         break :simd true;
     };
@@ -348,22 +391,39 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
     // may be fixed in 0.17.0. We may want to revisit this afterwards; although
     // I'm not too sure if that helps to clean up rpath, this may just be the
     // better option. See https://codeberg.org/ziglang/zig/issues/31760.
-    if ((target.result.os.tag == .linux) and target.query.isNativeCpu()) {
-        const in_nix_shell = env.get("IN_NIX_SHELL") != null;
-        if (b.option(
-            bool,
-            "patchelf",
-            "Patch interpreter and rpath in the built binary (default if IN_NIX_SHELL is set)",
-        ) orelse in_nix_shell) {
-            var patchelf: PatchElf = .{};
-            if (b.findProgram(&.{"ld.so"}, &.{})) |ld_so| {
-                patchelf.interp = std.Io.Dir.realPathFileAbsoluteAlloc(b.graph.io, ld_so, b.allocator) catch null;
-            } else |_| {}
-            if (env.get("LD_LIBRARY_PATH")) |ld_library_path| {
-                patchelf.rpath = if (ld_library_path.len > 0) ld_library_path else null;
-            }
-            if (patchelf.interp != null or patchelf.rpath != null) {
-                config.patchelf = patchelf;
+    if (b.option(
+        []const u8,
+        "patch-interp",
+        "Inject the supplied path as the dynamic linker in the built binary. " ++
+            "Under Nix, this defaults to the dynamic linker found in PATH.",
+    )) |interp| {
+        PatchElf.setInterp(&config, interp);
+    } else patch_interp: {
+        if (!(target.result.os.tag == .linux) or !target.query.isNativeCpu()) break :patch_interp;
+        if (env.get("IN_NIX_SHELL") == null) break :patch_interp;
+
+        if (b.findProgram(&.{"ld.so"}, &.{})) |ld_so| {
+            PatchElf.setInterp(
+                &config,
+                std.Io.Dir.realPathFileAbsoluteAlloc(b.graph.io, ld_so, b.allocator) catch break :patch_interp,
+            );
+        } else |_| {}
+    }
+
+    if (b.option(
+        []const u8,
+        "patch-rpath",
+        "Inject the supplied colon-delimited search path as the rpath in the built binary. " ++
+            "This defaults to LD_LIBRARY_PATH if we're in a Nix shell environment.",
+    )) |rpath| {
+        PatchElf.setRpath(&config, rpath);
+    } else patch_rpath: {
+        if (!(target.result.os.tag == .linux) or !target.query.isNativeCpu()) break :patch_rpath;
+        if (env.get("IN_NIX_SHELL") == null) break :patch_rpath;
+
+        if (env.get("LD_LIBRARY_PATH")) |ld_library_path| {
+            if (ld_library_path.len > 0) {
+                PatchElf.setRpath(&config, ld_library_path);
             }
         }
     }
@@ -387,11 +447,31 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
     //---------------------------------------------------------------
     // Artifacts to Emit
 
-    config.emit_lib_vt = b.option(
-        bool,
-        "emit-lib-vt",
-        "Set defaults for a libghostty-vt-only build (disables xcframework, macOS app, and docs).",
-    ) orelse false;
+    config.emit_lib_vt = emit_lib_vt;
+
+    config.vt_features = features: {
+        const list = b.option(
+            []const u8,
+            "vt-features",
+            "Comma-separated libghostty-vt feature modifications applied " ++
+                "to the default all-enabled set, -Dcpu style: `+feature` " ++
+                "or `feature` enables, `-feature` disables, and `all` " ++
+                "means every feature (e.g. `-all,+render-state` for a " ++
+                "render-only build). Only applies to lib artifacts.",
+        ) orelse break :features .{};
+        break :features TerminalBuildOptions.Features.parse(list) catch {
+            var valid: std.ArrayList(u8) = .empty;
+            inline for (@typeInfo(TerminalBuildOptions.Features).@"struct".fields) |field| {
+                if (valid.items.len > 0) try valid.appendSlice(b.allocator, ", ");
+                try valid.appendSlice(b.allocator, field.name);
+            }
+            std.log.err(
+                "-Dvt-features={s} contains an unknown feature. Valid features: all, {s}",
+                .{ list, valid.items },
+            );
+            return error.UnknownVtFeature;
+        };
+    };
 
     config.emit_exe = b.option(
         bool,
@@ -562,6 +642,24 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
 const PatchElf = struct {
     interp: ?[]const u8 = null,
     rpath: ?[]const u8 = null,
+
+    fn setInterp(config: *Config, interp: []const u8) void {
+        if (config.patchelf) |*patchelf| {
+            patchelf.interp = interp;
+            return;
+        }
+
+        config.patchelf = .{ .interp = interp };
+    }
+
+    fn setRpath(config: *Config, rpath: []const u8) void {
+        if (config.patchelf) |*patchelf| {
+            patchelf.rpath = rpath;
+            return;
+        }
+
+        config.patchelf = .{ .rpath = rpath };
+    }
 };
 
 /// Add a patchelf step for the supplied `artifact`, depending on the supplied
@@ -638,6 +736,12 @@ pub fn terminalOptions(
         .simd = self.simd,
         .oniguruma = true,
         .c_abi = false,
+        // The application requires every feature; only lib artifacts
+        // may trim them.
+        .features = switch (artifact) {
+            .ghostty => .{},
+            .lib => self.vt_features,
+        },
         .version = switch (artifact) {
             .ghostty => self.version,
             .lib => self.lib_version,
@@ -715,17 +819,20 @@ pub fn osVersionMin(tag: std.Target.Os.Tag) ?std.Target.Query.OsVersion {
             .patch = 0,
         } },
 
-        // iOS 17 picked arbitrarily
-        .ios => .{ .semver = .{
-            .major = 17,
-            .minor = 0,
-            .patch = 0,
-        } },
-
         // This should never happen currently. If we add a new target then
         // we should add a new case here.
         else => null,
     };
+}
+
+/// Returns the minimum OS version for lib-vt build.
+///
+/// This should only be used for Darwin targets.
+pub fn osVersionMinLibVt(tag: std.Target.Os.Tag) ?std.Target.Query.OsVersion {
+    // lib-vt is the only thing we still build for iOS, so its deployment
+    // target lives here rather than in osVersionMin.
+    if (tag == .ios) return .{ .semver = .{ .major = 13, .minor = 0, .patch = 0 } };
+    return osVersionMin(tag);
 }
 
 // Returns a ResolvedTarget for a mac with a `target.result.cpu.model.name` of `generic`.

@@ -47,7 +47,7 @@ pub const Inspector = struct {
 
     pub fn draw(
         self: *Inspector,
-        surface: *const Surface,
+        surface: *Surface,
         mouse: Mouse,
     ) void {
         // Create our dockspace first. If we had to setup our dockspace,
@@ -111,7 +111,7 @@ pub const Inspector = struct {
                 defer cimgui.c.ImGui_End();
                 if (open) {
                     self.vt_stream.draw(
-                        surface.alloc,
+                        surface,
                         &t.colors.palette.current,
                     );
                 }

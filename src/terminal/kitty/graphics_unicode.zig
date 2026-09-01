@@ -363,29 +363,17 @@ pub const Placement = struct {
         image: *const Image,
         cell_width: u32,
         cell_height: u32,
-    ) !struct {
+    ) Error!struct {
         rows: u32,
         columns: u32,
     } {
         // Get the placement. If an ID is specified we look for the exact one.
         // If no ID, then we find the first virtual placement for this image.
-        const placement = if (self.placement_id > 0) storage.placements.get(.{
-            .image_id = self.image_id,
-            .placement_id = .{ .tag = .external, .id = self.placement_id },
-        }) orelse {
-            return Error.PlacementMissingPlacement;
-        } else placement: {
-            var it = storage.placements.iterator();
-            while (it.next()) |entry| {
-                if (entry.key_ptr.image_id == self.image_id and
-                    entry.value_ptr.location == .virtual)
-                {
-                    break :placement entry.value_ptr.*;
-                }
-            }
-
-            return Error.PlacementMissingPlacement;
-        };
+        const target = storage.placeholderTarget(
+            self.image_id,
+            self.placement_id,
+        ) orelse return Error.PlacementMissingPlacement;
+        const placement = target.placement;
 
         // Use requested rows/columns if specified
         // For unspecified rows/columns, calculate based on the image size.
@@ -1195,8 +1183,8 @@ test "unicode render placement: dog 4x2" {
     defer s.deinit(alloc, t.screens.active);
 
     const image: Image = .{ .id = 1, .width = 500, .height = 306 };
-    try s.addImage(io, alloc, image);
-    try s.addPlacement(io, alloc, 1, 0, .{
+    try s.addImage(io, alloc, t.screens.active, image);
+    try s.addPlacement(io, alloc, t.screens.active, 1, 0, .{
         .location = .{ .virtual = {} },
         .columns = 4,
         .rows = 2,
@@ -1263,8 +1251,8 @@ test "unicode render placement: dog 2x2 with blank cells" {
     defer s.deinit(alloc, t.screens.active);
 
     const image: Image = .{ .id = 1, .width = 500, .height = 306 };
-    try s.addImage(io, alloc, image);
-    try s.addPlacement(io, alloc, 1, 0, .{
+    try s.addImage(io, alloc, t.screens.active, image);
+    try s.addPlacement(io, alloc, t.screens.active, 1, 0, .{
         .location = .{ .virtual = {} },
         .columns = 2,
         .rows = 2,
@@ -1330,8 +1318,8 @@ test "unicode render placement: dog 1x1" {
     defer s.deinit(alloc, t.screens.active);
 
     const image: Image = .{ .id = 1, .width = 500, .height = 306 };
-    try s.addImage(io, alloc, image);
-    try s.addPlacement(io, alloc, 1, 0, .{
+    try s.addImage(io, alloc, t.screens.active, image);
+    try s.addPlacement(io, alloc, t.screens.active, 1, 0, .{
         .location = .{ .virtual = {} },
         .columns = 1,
         .rows = 1,

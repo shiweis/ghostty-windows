@@ -50,10 +50,16 @@ pub fn build(b: *std.Build) !void {
 
     if (no_libcxx) {
         try flags.append(b.allocator, "-DSIMDUTF_NO_LIBCXX");
-        if (target.result.abi != .msvc) {
-            // Clang/GCC-only flags; MSVC doesn't accept these.
-            try flags.append(b.allocator, "-fno-exceptions");
-            try flags.append(b.allocator, "-fno-rtti");
+        try flags.append(b.allocator, "-fno-exceptions");
+        try flags.append(b.allocator, "-fno-rtti");
+        if (target.result.abi == .msvc) {
+            try flags.appendSlice(b.allocator, &.{
+                "-D_USE_STD_VECTOR_ALGORITHMS=0",
+                // -fno-autolink also drops UCRT's /alternatename fallback.
+                "-D_Avx2WmemEnabledWeakValue=_Avx2WmemEnabled",
+                "-fno-autolink",
+                "-fno-stack-protector",
+            });
         }
 
         lib.root_module.addCMacro("SIMDUTF_NO_LIBCXX", "1");

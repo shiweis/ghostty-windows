@@ -472,6 +472,11 @@ pub extern "user32" fn GetParent(
     hWnd: HWND,
 ) callconv(.winapi) ?HWND;
 
+pub extern "user32" fn SetParent(
+    hWndChild: HWND,
+    hWndNewParent: ?HWND,
+) callconv(.winapi) ?HWND;
+
 pub extern "user32" fn AdjustWindowRectEx(
     lpRect: *RECT,
     dwStyle: u32,
@@ -904,6 +909,45 @@ pub extern "user32" fn MessageBoxW(
     lpText: [*:0]const u16,
     lpCaption: [*:0]const u16,
     uType: u32,
+) callconv(.winapi) i32;
+
+// -----------------------------------------------------------------------
+// Common file dialog API
+// -----------------------------------------------------------------------
+
+pub const OFN_OVERWRITEPROMPT: u32 = 0x00000002;
+pub const OFN_NOCHANGEDIR: u32 = 0x00000008;
+pub const OFN_PATHMUSTEXIST: u32 = 0x00000800;
+pub const OFN_EXPLORER: u32 = 0x00080000;
+
+pub const OPENFILENAMEW = extern struct {
+    lStructSize: u32,
+    hwndOwner: ?HWND,
+    hInstance: ?HINSTANCE,
+    lpstrFilter: ?[*]const u16,
+    lpstrCustomFilter: ?[*]u16,
+    nMaxCustFilter: u32,
+    nFilterIndex: u32,
+    lpstrFile: [*]u16,
+    nMaxFile: u32,
+    lpstrFileTitle: ?[*]u16,
+    nMaxFileTitle: u32,
+    lpstrInitialDir: ?[*:0]const u16,
+    lpstrTitle: ?[*:0]const u16,
+    Flags: u32,
+    nFileOffset: u16,
+    nFileExtension: u16,
+    lpstrDefExt: ?[*:0]const u16,
+    lCustData: isize,
+    lpfnHook: ?*const anyopaque,
+    lpTemplateName: ?[*:0]const u16,
+    pvReserved: ?*anyopaque,
+    dwReserved: u32,
+    FlagsEx: u32,
+};
+
+pub extern "comdlg32" fn GetSaveFileNameW(
+    lpofn: *OPENFILENAMEW,
 ) callconv(.winapi) i32;
 
 // -----------------------------------------------------------------------

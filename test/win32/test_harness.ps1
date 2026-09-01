@@ -7,6 +7,7 @@
 #   sendkeys    — Send keystrokes to ghostty window
 #   sendtext    — Type text into ghostty window
 #   check       — Check if ghostty window exists, output title + size
+#   child-count — Count direct child processes of the test executable
 #   close       — Close ghostty window gracefully
 #   kill        — Force-kill ghostty process
 #
@@ -58,6 +59,9 @@ public class Win32Test {
 
     [DllImport("user32.dll")]
     public static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindow(IntPtr hWnd);
 
     [DllImport("user32.dll")]
     public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
@@ -116,9 +120,25 @@ function Find-GhosttyWindow {
     # even IsWindowVisible fail due to desktop isolation.
     if ($DirectHwnd -ne 0) {
         $hWnd = [IntPtr]$DirectHwnd
+        if (-not [Win32Test]::IsWindow($hWnd)) { return $null }
+
+        $class = New-Object System.Text.StringBuilder 256
+        [Win32Test]::GetClassName($hWnd, $class, 256) | Out-Null
+        if ($class.ToString() -ne "GhosttyWindow") { return $null }
+
+        [uint32]$actualProcessId = 0
+        [Win32Test]::GetWindowThreadProcessId($hWnd, [ref]$actualProcessId) | Out-Null
+        if ($ProcessId -ne 0 -and $actualProcessId -ne [uint32]$ProcessId) {
+            return $null
+        }
+        $actualProcess = Get-Process -Id $actualProcessId -ErrorAction SilentlyContinue
+        if (-not $actualProcess -or $actualProcess.Name -ne "ghostty-test") {
+            return $null
+        }
+
         $tb = New-Object System.Text.StringBuilder 256
         [Win32Test]::GetWindowText($hWnd, $tb, 256) | Out-Null
-        return @{ Handle = $hWnd; Title = $tb.ToString(); Pid = $ProcessId }
+        return @{ Handle = $hWnd; Title = $tb.ToString(); Pid = $actualProcessId }
     }
 
     # Strategy 1: Get-Process.MainWindowHandle — works from the same
@@ -128,9 +148,7 @@ function Find-GhosttyWindow {
         $p = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
         if ($p) { $procs = @($p) }
     } else {
-        $procs = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
-            $_.Name -like "*ghostty*"
-        })
+        $procs = @(Get-Process ghostty-test -ErrorAction SilentlyContinue)
     }
 
     foreach ($p in $procs) {
@@ -311,16 +329,34 @@ function Invoke-Resize {
 
 function Invoke-Kill {
     if ($ProcessId) {
+        $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        if (-not $process -or $process.Name -ne "ghostty-test") {
+            Write-Output "KILLED=none"
+            return
+        }
         # Use taskkill /T to kill the entire process tree (ghostty + child cmd.exe).
         # Stop-Process only kills the main process, leaving orphaned children.
         & taskkill /PID $ProcessId /T /F 2>$null | Out-Null
         Write-Output "KILLED=$ProcessId"
     } else {
-        Get-Process ghostty*  -ErrorAction SilentlyContinue | ForEach-Object {
+        # Never match a developer's normal Ghostty terminal. The harness copy
+        # has a deliberately unique process name for safe scoped cleanup.
+        Get-Process ghostty-test -ErrorAction SilentlyContinue | ForEach-Object {
             & taskkill /PID $_.Id /T /F 2>$null | Out-Null
         }
-        Write-Output "KILLED=all"
+        Write-Output "KILLED=test-processes"
     }
+}
+
+function Invoke-ChildCount {
+    $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if (-not $process -or $process.Name -ne "ghostty-test") {
+        Write-Error "Process is not the harness test executable"
+        exit 1
+    }
+
+    $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $ProcessId")
+    Write-Output "CHILD_COUNT=$($children.Count)"
 }
 
 function Invoke-ScrollbarQuery {
@@ -370,6 +406,7 @@ switch ($Action.ToLower()) {
     "sendkeys"        { Invoke-SendKeys }
     "sendtext"        { Invoke-SendText }
     "check"           { Invoke-Check }
+    "child-count"     { Invoke-ChildCount }
     "close"           { Invoke-Close }
     "resize"          { Invoke-Resize }
     "kill"            { Invoke-Kill }

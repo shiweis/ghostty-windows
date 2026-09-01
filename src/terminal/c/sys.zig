@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const lib = @import("../lib.zig");
 const CAllocator = lib.alloc.Allocator;
 const terminal_sys = @import("../sys.zig");
+const stderr = @import("../../os/stderr.zig");
 const Result = @import("result.zig").Result;
 
 /// C: GhosttySysImage
@@ -20,6 +21,13 @@ pub const DecodePngFn = *const fn (
     [*]const u8,
     usize,
     *Image,
+) callconv(lib.calling_conv) bool;
+
+/// C: GhosttySysRandomSecureFn
+pub const RandomSecureFn = *const fn (
+    ?*anyopaque,
+    [*]u8,
+    usize,
 ) callconv(lib.calling_conv) bool;
 
 /// C: GhosttySysLogLevel
@@ -54,12 +62,14 @@ pub const Option = enum(c_int) {
     userdata = 0,
     decode_png = 1,
     log = 2,
+    random_secure = 3,
 
     pub fn InType(comptime self: Option) type {
         return switch (self) {
             .userdata => ?*const anyopaque,
             .decode_png => ?DecodePngFn,
             .log => ?LogFn,
+            .random_secure => ?RandomSecureFn,
         };
     }
 };
@@ -70,6 +80,7 @@ const Global = struct {
     userdata: ?*anyopaque = null,
     decode_png: ?DecodePngFn = null,
     log: ?LogFn = null,
+    random_secure: ?RandomSecureFn = null,
 };
 
 /// Global state for the C sys interface.
@@ -95,6 +106,12 @@ fn decodePngWrapper(
         .height = out.height,
         .data = result_data[0..out.data_len],
     };
+}
+
+/// Zig-compatible wrapper that calls through to the stored C callback.
+fn randomSecureWrapper(buffer: []u8) terminal_sys.RandomSecureError!void {
+    const func = global.random_secure orelse return error.EntropyUnavailable;
+    if (!func(global.userdata, buffer.ptr, buffer.len)) return error.EntropyUnavailable;
 }
 
 pub fn set(
@@ -126,6 +143,10 @@ fn setTyped(
             terminal_sys.decode_png = if (value != null) &decodePngWrapper else null;
         },
         .log => global.log = value,
+        .random_secure => {
+            global.random_secure = value;
+            terminal_sys.random_secure = if (value != null) &randomSecureWrapper else null;
+        },
     }
     return .success;
 }
@@ -211,8 +232,12 @@ pub fn logFn(
 /// Formats each message as "[level](scope): message\n". Can be passed
 /// directly to ghostty_sys_set(GHOSTTY_SYS_OPT_LOG, &ghostty_sys_log_stderr).
 ///
-/// Uses std.debug.lockStderrWriter for thread-safe, mutex-protected output.
-/// On freestanding/wasm targets this is a no-op (no stderr available).
+/// Each log line is emitted with a single raw write to stderr, which keeps
+/// concurrent log lines from interleaving. We intentionally avoid
+/// `std.debug.lockStderr` because it routes through `std.Options.debug_io`
+/// and would keep the entire `std.Io.Threaded` vtable alive in the binary
+/// (see `os/stderr.zig`). On freestanding/wasm targets this is a no-op
+/// (no stderr available).
 pub fn logStderr(
     _: ?*anyopaque,
     level: LogLevel,
@@ -233,16 +258,32 @@ pub fn logStderr(
         .debug => "debug",
     };
 
-    var buffer: [64]u8 = undefined;
-    var locked_stderr = std.debug.lockStderr(&buffer);
-    defer std.debug.unlockStderr();
-    nosuspend {
-        if (scope.len > 0) {
-            locked_stderr.file_writer.interface.print("[{s}]({s}): {s}\n", .{ level_text, scope, message }) catch {};
-        } else {
-            locked_stderr.file_writer.interface.print("[{s}]: {s}\n", .{ level_text, message }) catch {};
-        }
+    // Large enough for a full logFn chunk plus the level/scope prefix.
+    var buffer: [LogEmitter.buffer_size + 128]u8 = undefined;
+    const line: ?[]const u8 = if (scope.len > 0)
+        std.fmt.bufPrint(&buffer, "[{s}]({s}): {s}\n", .{ level_text, scope, message }) catch null
+    else
+        std.fmt.bufPrint(&buffer, "[{s}]: {s}\n", .{ level_text, message }) catch null;
+    if (line) |v| {
+        stderr.write(v);
+        return;
     }
+
+    // The line didn't fit in our buffer (an embedder called us directly
+    // with a very large message). Fall back to writing the pieces
+    // separately; interleaving with other threads is possible here but
+    // this is a best-effort diagnostic path.
+    stderr.write("[");
+    stderr.write(level_text);
+    stderr.write("]");
+    if (scope.len > 0) {
+        stderr.write("(");
+        stderr.write(scope);
+        stderr.write(")");
+    }
+    stderr.write(": ");
+    stderr.write(message);
+    stderr.write("\n");
 }
 
 test "set decode_png with null clears" {

@@ -701,6 +701,7 @@ pub fn add(
                     step.root_module.linkSystemLibrary("imm32", .{});
                     step.root_module.linkSystemLibrary("shell32", .{});
                     step.root_module.linkSystemLibrary("wininet", .{});
+                    step.root_module.linkSystemLibrary("comdlg32", .{});
                 }
             },
         }
@@ -732,6 +733,7 @@ fn addGtkNg(
             .{ "gdk", "gdk4" },
             .{ "gio", "gio2" },
             .{ "glib", "glib2" },
+            .{ "glibunix", "glibunix2" },
             .{ "gobject", "gobject2" },
             .{ "gtk", "gtk4" },
             .{ "xlib", "xlib2" },
@@ -829,13 +831,19 @@ fn addGtkNg(
         );
         scanner.addSystemProtocol("staging/xdg-activation/xdg-activation-v1.xml");
         scanner.addSystemProtocol("staging/ext-background-effect/ext-background-effect-v1.xml");
+        scanner.addCustomProtocol(
+            b.path("src/apprt/gtk/winproto/wayland/protocols/vicinae-hotkey-v1.xml"),
+        );
 
         scanner.generate("wl_compositor", 1);
+        // Only referenced by vicinae_hotkey_manager_v1.bind (nullable arg).
+        scanner.generate("wl_seat", 1);
         scanner.generate("org_kde_kwin_server_decoration_manager", 1);
         scanner.generate("org_kde_kwin_slide_manager", 1);
         scanner.generate("kde_output_order_v1", 1);
         scanner.generate("xdg_activation_v1", 1);
         scanner.generate("ext_background_effect_manager_v1", 1);
+        scanner.generate("vicinae_hotkey_manager_v1", 1);
 
         step.root_module.addImport("wayland", b.createModule(.{
             .root_source_file = scanner.result,
@@ -997,6 +1005,11 @@ pub fn addSimd(
         if (target.result.os.tag == .windows) try flags.appendSlice(b.allocator, &.{
             "-fno-sanitize=undefined",
             "-fno-sanitize-trap=undefined",
+        });
+        if (target.result.abi == .msvc) try flags.appendSlice(b.allocator, &.{
+            // -fno-autolink also drops UCRT's /alternatename fallback.
+            "-D_Avx2WmemEnabledWeakValue=_Avx2WmemEnabled",
+            "-fno-autolink",
         });
 
         m.addCSourceFiles(.{

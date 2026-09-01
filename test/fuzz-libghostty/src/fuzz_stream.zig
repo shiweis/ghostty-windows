@@ -44,7 +44,7 @@ pub export fn zig_fuzz_test(
     var t = Terminal.init(threaded.io(), alloc, .{
         .cols = 80,
         .rows = 24,
-        .max_scrollback = 100,
+        .max_scrollback_bytes = 100,
     }) catch return;
     defer t.deinit(alloc);
 

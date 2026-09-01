@@ -1395,6 +1395,188 @@ test_open_config() {
     echo "  ● PASSED"
 }
 
+test_window_title_actions() {
+    echo "▶ test_window_title_actions"
+    local test_root
+    test_root="$(wslpath "$WIN_TEMP")/ghostty-title-actions"
+    mkdir -p "$test_root/ghostty"
+    cat > "$test_root/ghostty/config.ghostty" << 'CFGEOF'
+keybind = ctrl+shift+y=set_window_title:Automated Window Title
+keybind = ctrl+shift+u=prompt_window_title
+CFGEOF
+
+    export XDG_CONFIG_HOME="$(wslpath -w "$test_root")"
+    export WSLENV="XDG_CONFIG_HOME/w"
+    GHOSTTY_HWND=0
+    launch_and_set_hwnd 5000
+    local output="$LAUNCH_OUTPUT"
+    local pid window_found
+    pid="$(get_val "$output" PID)"
+    window_found="$(get_val "$output" WINDOW_FOUND)"
+    unset XDG_CONFIG_HOME WSLENV
+
+    if [ "$window_found" != "true" ]; then
+        echo "  ✗ Window did not appear"
+        FAIL=$((FAIL + 1))
+        ps -Action kill -ProcessId "$pid" 2>/dev/null || true
+        rm -rf "$test_root"
+        return
+    fi
+
+    local result=0 check title
+    ps -Action sendkeys -ProcessId "$pid" -Keys "^+y"
+    sleep 1
+    check="$(ps -Action check -ProcessId "$pid")"
+    title="$(get_val "$check" TITLE)"
+    if [ "$title" = "Automated Window Title" ]; then
+        echo "  ✓ set_window_title updated the native title"
+    else
+        echo "  ✗ set_window_title produced '$title'"
+        result=1
+    fi
+
+    ps -Action sendkeys -ProcessId "$pid" -Keys "^+u"
+    sleep 1
+    ps -Action sendtext -ProcessId "$pid" -Text "Prompted Window Title"
+    ps -Action sendkeys -ProcessId "$pid" -Keys "{ENTER}"
+    sleep 1
+    check="$(ps -Action check -ProcessId "$pid")"
+    title="$(get_val "$check" TITLE)"
+    if [ "$title" = "Prompted Window Title" ]; then
+        echo "  ✓ prompt_window_title committed the edited title"
+    else
+        echo "  ✗ prompt_window_title produced '$title'"
+        result=1
+    fi
+
+    ps -Action kill -ProcessId "$pid" 2>/dev/null || true
+    rm -rf "$test_root"
+    if [ "$result" -eq 0 ]; then
+        PASS=$((PASS + 1))
+        echo "  ● PASSED"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  ● FAILED"
+    fi
+}
+
+test_move_tab_to_new_window() {
+    echo "▶ test_move_tab_to_new_window"
+    local test_root
+    test_root="$(wslpath "$WIN_TEMP")/ghostty-move-tab"
+    mkdir -p "$test_root/ghostty"
+    cat > "$test_root/ghostty/config.ghostty" << 'CFGEOF'
+keybind = ctrl+shift+y=set_tab_title:MOVED_TAB
+keybind = ctrl+shift+m=move_tab_to_new_window
+CFGEOF
+
+    export XDG_CONFIG_HOME="$(wslpath -w "$test_root")"
+    export WSLENV="XDG_CONFIG_HOME/w"
+    GHOSTTY_HWND=0
+    launch_and_set_hwnd 5000
+    local output="$LAUNCH_OUTPUT"
+    local pid window_found
+    pid="$(get_val "$output" PID)"
+    window_found="$(get_val "$output" WINDOW_FOUND)"
+    unset XDG_CONFIG_HOME WSLENV
+
+    if [ "$window_found" != "true" ]; then
+        echo "  ✗ Window did not appear"
+        FAIL=$((FAIL + 1))
+        ps -Action kill -ProcessId "$pid" 2>/dev/null || true
+        rm -rf "$test_root"
+        return
+    fi
+
+    ps -Action sendkeys -ProcessId "$pid" -Keys "^+t"
+    sleep 2
+    ps -Action sendkeys -ProcessId "$pid" -Keys "^+y"
+    sleep 1
+    local before after exists result=0
+    before="$(ps -Action check -ProcessId "$pid")"
+    if [ "$(get_val "$before" TITLE)" != "MOVED_TAB" ]; then
+        echo "  ✗ Could not mark the tab before moving it"
+        result=1
+    fi
+
+    ps -Action sendkeys -ProcessId "$pid" -Keys "^+m"
+    sleep 2
+    after="$(ps -Action check -ProcessId "$pid")"
+    exists="$(get_val "$after" EXISTS)"
+    if [ "$exists" = "true" ] && [ "$(get_val "$after" TITLE)" != "MOVED_TAB" ]; then
+        echo "  ✓ moved tab left the source window alive with its original tab"
+    else
+        echo "  ✗ tab did not detach cleanly from the source window"
+        result=1
+    fi
+
+    ps -Action kill -ProcessId "$pid" 2>/dev/null || true
+    rm -rf "$test_root"
+    if [ "$result" -eq 0 ]; then
+        PASS=$((PASS + 1))
+        echo "  ● PASSED"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  ● FAILED"
+    fi
+}
+
+test_open_config_new_window() {
+    echo "▶ test_open_config_new_window"
+    local test_root
+    test_root="$(wslpath "$WIN_TEMP")/ghostty-open-config-window"
+    mkdir -p "$test_root/ghostty"
+    cat > "$test_root/ghostty/config.ghostty" << 'CFGEOF'
+keybind = ctrl+shift+g=open_config:new_window
+CFGEOF
+
+    export XDG_CONFIG_HOME="$(wslpath -w "$test_root")"
+    export VISUAL="cmd.exe /K rem"
+    export WSLENV="XDG_CONFIG_HOME/w:VISUAL"
+    GHOSTTY_HWND=0
+    launch_and_set_hwnd 5000
+    local output="$LAUNCH_OUTPUT"
+    local pid window_found
+    pid="$(get_val "$output" PID)"
+    window_found="$(get_val "$output" WINDOW_FOUND)"
+    unset XDG_CONFIG_HOME VISUAL WSLENV
+
+    if [ "$window_found" != "true" ]; then
+        echo "  ✗ Window did not appear"
+        FAIL=$((FAIL + 1))
+        ps -Action kill -ProcessId "$pid" 2>/dev/null || true
+        rm -rf "$test_root"
+        return
+    fi
+
+    local before after before_count after_count result=0
+    before="$(ps -Action child-count -ProcessId "$pid")"
+    before_count="$(get_val "$before" CHILD_COUNT)"
+    ps -Action sendkeys -ProcessId "$pid" -Keys "^+g"
+    sleep 3
+    after="$(ps -Action child-count -ProcessId "$pid")"
+    after_count="$(get_val "$after" CHILD_COUNT)"
+    if [[ "$before_count" =~ ^[0-9]+$ ]] &&
+        [[ "$after_count" =~ ^[0-9]+$ ]] &&
+        [ "$after_count" -gt "$before_count" ]
+    then
+        echo "  ✓ open_config:new_window launched an additional editor shell"
+    else
+        echo "  ✗ child count did not grow ($before_count -> $after_count)"
+        result=1
+    fi
+
+    ps -Action kill -ProcessId "$pid" 2>/dev/null || true
+    rm -rf "$test_root"
+    if [ "$result" -eq 0 ]; then
+        PASS=$((PASS + 1))
+        echo "  ● PASSED"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  ● FAILED"
+    fi
+}
+
 test_quick_terminal() {
     echo "▶ test_quick_terminal"
 
@@ -1485,6 +1667,9 @@ list_tests() {
     echo "  font_size          — Font zoom in/out/reset"
     echo "  fullscreen         — Fullscreen toggle via Ctrl+Enter"
     echo "  open_config        — Open config file in editor"
+    echo "  window_title_actions — Set and prompt for a native window title"
+    echo "  move_tab_to_new_window — Detach a live tab into a new window"
+    echo "  open_config_new_window — Open config in a new editor window"
     echo "  quick_terminal     — Quick terminal toggle with keybinding"
 }
 
@@ -1515,6 +1700,9 @@ run_test() {
         font_size)           test_font_size ;;
         fullscreen)          test_fullscreen ;;
         open_config)         test_open_config ;;
+        window_title_actions) test_window_title_actions ;;
+        move_tab_to_new_window) test_move_tab_to_new_window ;;
+        open_config_new_window) test_open_config_new_window ;;
         quick_terminal)      test_quick_terminal ;;
         *)                   echo "Unknown test: $1"; exit 1 ;;
     esac
@@ -1579,6 +1767,12 @@ case "${1:-all}" in
         test_fullscreen
         echo ""
         test_open_config
+        echo ""
+        test_window_title_actions
+        echo ""
+        test_move_tab_to_new_window
+        echo ""
+        test_open_config_new_window
         echo ""
         test_quick_terminal
         echo ""

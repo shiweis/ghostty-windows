@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("terminal_options");
+const lib = @import("../lib/main.zig");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const assert = @import("../quirks.zig").inlineAssert;
@@ -89,6 +90,7 @@ const AllocWindows = struct {
 /// for alignment.
 const grapheme_chunk_len = 4;
 const grapheme_chunk = grapheme_chunk_len * @sizeOf(u21);
+pub const grapheme_max_len = 64;
 const GraphemeAlloc = BitmapAllocator(grapheme_chunk);
 const grapheme_count_default = GraphemeAlloc.bitmap_bit_size;
 pub const grapheme_bytes_default = grapheme_count_default * grapheme_chunk;
@@ -1289,6 +1291,18 @@ pub const Page = struct {
         @memset(@as([]u64, @ptrCast(cells)), 0);
     }
 
+    /// Reset the given row to the default state: all cells zeroed and
+    /// all row metadata reset, as if the row was never used. This
+    /// reclaims memory used by graphemes, styles, etc. like clearCells.
+    ///
+    /// This must be used instead of clearCells whenever a row's storage
+    /// is recycled. Clearing the cells alone is not enough because row
+    /// metadata such as the wrap state and semantic prompt remain.
+    pub inline fn resetRow(self: *Page, row: *Row) void {
+        self.clearCells(row, 0, self.size.cols);
+        row.reset();
+    }
+
     /// Returns the hyperlink ID for the given cell.
     pub inline fn lookupHyperlink(self: *const Page, cell: *const Cell) ?hyperlink.Id {
         const cell_offset = getOffset(Cell, self.memory, cell);
@@ -1502,7 +1516,8 @@ pub const Page = struct {
     }
 
     /// Set the graphemes for the given cell. This asserts that the cell
-    /// has no graphemes set, and only contains a single codepoint.
+    /// has no graphemes set, and only contains a single codepoint. Input
+    /// beyond grapheme_max_len is ignored.
     pub inline fn setGraphemes(
         self: *Page,
         row: *Row,
@@ -1516,14 +1531,15 @@ pub const Page = struct {
 
         const cell_offset = getOffset(Cell, self.memory, cell);
         var map = self.grapheme_map.map(self.memory);
+        const stored_cps = cps[0..@min(cps.len, grapheme_max_len)];
 
-        const slice = self.grapheme_alloc.alloc(u21, self.memory, cps.len) catch |e| {
+        const slice = self.grapheme_alloc.alloc(u21, self.memory, stored_cps.len) catch |e| {
             comptime assert(@TypeOf(e) == error{OutOfMemory});
             // The grapheme alloc capacity needs to be increased.
             return error.GraphemeAllocOutOfMemory;
         };
         errdefer self.grapheme_alloc.free(self.memory, slice);
-        @memcpy(slice, cps);
+        @memcpy(slice, stored_cps);
 
         map.putNoClobber(cell_offset, .{
             .offset = getOffset(u21, self.memory, @ptrCast(slice.ptr)),
@@ -1541,7 +1557,8 @@ pub const Page = struct {
         return;
     }
 
-    /// Append a codepoint to the given cell as a grapheme.
+    /// Append a codepoint to the given cell as a grapheme. Once the cell has
+    /// grapheme_max_len suffix codepoints, additional codepoints are ignored.
     pub fn appendGrapheme(self: *Page, row: *Row, cell: *Cell, cp: u21) Allocator.Error!void {
         defer self.assertIntegrity();
 
@@ -1574,6 +1591,10 @@ pub const Page = struct {
         assert(row.grapheme);
 
         const slice = map.getPtr(cell_offset).?;
+
+        // Terminal input is untrusted. In addition to bounding memory, this
+        // prevents repeated chunk growth and copying from becoming quadratic.
+        if (slice.len >= grapheme_max_len) return;
 
         // If our slice len doesn't divide evenly by the grapheme chunk
         // length then we can utilize the additional chunk space.
@@ -2032,6 +2053,26 @@ pub const Row = packed struct(u64) {
         // Ordered on purpose for likelihood.
         return self.styled or self.hyperlink or self.grapheme;
     }
+
+    /// Reset all row metadata to the default state, preserving only
+    /// the cells offset, and mark the row dirty. This is a single
+    /// 8-byte store.
+    ///
+    /// This must be applied to any row whose storage is recycled as a
+    /// blank row or retired into unused page capacity, in addition to
+    /// clearing its cells (in either order; this doesn't touch cell
+    /// memory). See Page.resetRow, which does both, for details. This
+    /// exists separately for callers that clear the cells in a
+    /// specialized way (e.g. filling with a background-colored blank
+    /// cell rather than zeroing).
+    ///
+    /// Asserts that the row has no managed memory: releasing that is
+    /// the cell-clearing side's job and must happen while the flags
+    /// are still accurate.
+    pub inline fn reset(self: *Row) void {
+        assert(!self.managedMemory());
+        self.* = .{ .cells = self.cells, .dirty = true };
+    }
 };
 
 /// A cell represents a single terminal grid cell.
@@ -2136,6 +2177,51 @@ pub const Cell = packed struct(u64) {
         prompt = 2,
     };
 
+    /// Metadata for the C representation. All physical bit offsets and
+    /// widths are reflected from Cell.
+    pub const CLayout = lib.Packed(Cell, .{ .fields = .{
+        .content_tag = .{ .type_name = "GhosttyCellContentTag" },
+        .content = .{ .encoding = .{ .tagged_union = lib.PackedTaggedUnion(
+            Cell,
+            .content,
+            .content_tag,
+            .{ .arms = .{
+                .codepoint = .{ .codepoint = lib.Packed(
+                    @FieldType(@FieldType(Cell, "content"), "codepoint"),
+                    .{ .fields = .{
+                        .data = .{ .name = "codepoint" },
+                        ._pad = .{ .omit = true },
+                    } },
+                ) },
+                .codepoint_grapheme = .{ .codepoint = lib.Packed(
+                    @FieldType(@FieldType(Cell, "content"), "codepoint"),
+                    .{ .fields = .{
+                        .data = .{ .name = "codepoint" },
+                        ._pad = .{ .omit = true },
+                    } },
+                ) },
+                .bg_color_palette = .{ .color_palette = lib.Packed(
+                    @FieldType(@FieldType(Cell, "content"), "color_palette"),
+                    .{ .fields = .{
+                        .data = .{
+                            .name = "index",
+                            .type_name = "GhosttyColorPaletteIndex",
+                        },
+                        ._pad = .{ .omit = true },
+                    } },
+                ) },
+                .bg_color_rgb = .{ .color_rgb = lib.Packed(
+                    @FieldType(@FieldType(Cell, "content"), "color_rgb"),
+                    .{},
+                ) },
+            } },
+        ) } },
+        .style_id = .{ .type_name = "GhosttyStyleId" },
+        .wide = .{ .type_name = "GhosttyCellWide" },
+        .semantic_content = .{ .type_name = "GhosttyCellSemanticContent" },
+        ._padding = .{ .omit = true },
+    } });
+
     /// The backing integer of this packed struct. Prefer this over
     /// hardcoding the integer type so that code is resilient to the
     /// size changing.
@@ -2239,6 +2325,12 @@ pub const Cell = packed struct(u64) {
 /// struct T, used for masked compares of raw backing-integer values
 /// (e.g. `Row.Backing`, `Cell.Backing`). This is an implementation
 /// detail of `Mask`, which is the public API built on top of this.
+///
+/// A field may be a dot-separated path (e.g. "content.codepoint.data")
+/// to cover only a nested field of a packed struct or packed union
+/// member. This allows a mask to be more precise than a whole
+/// top-level field, e.g. covering the codepoint bits of a cell without
+/// its padding.
 fn fieldMask(
     comptime T: type,
     comptime fields: []const []const u8,
@@ -2246,16 +2338,33 @@ fn fieldMask(
     // Backing int of the packed struct
     const Int = @typeInfo(T).@"struct".backing_integer.?;
 
-    var mask: Int = 0;
-    inline for (fields) |field| {
+    comptime var mask: Int = 0;
+    inline for (fields) |path| {
+        // Walk the path to find the total bit offset and the type of
+        // the (possibly nested) field.
+        comptime var offset = 0;
+        comptime var Field = T;
+        comptime var it = std.mem.splitScalar(u8, path, '.');
+        inline while (comptime it.next()) |name| {
+            offset += switch (@typeInfo(Field)) {
+                .@"struct" => @bitOffsetOf(Field, name),
+
+                // Packed union members all share bit offset zero.
+                .@"union" => |u| offset: {
+                    comptime assert(u.layout == .@"packed");
+                    break :offset 0;
+                },
+
+                else => @compileError("invalid field path: " ++ path),
+            };
+            Field = @FieldType(Field, name);
+        }
+
         // The type that fits all the bits we need to set.
-        const Ones = std.meta.Int(
-            .unsigned,
-            @bitSizeOf(@FieldType(T, field)),
-        );
+        const Ones = std.meta.Int(.unsigned, @bitSizeOf(Field));
 
         // Mask out the ones
-        mask |= @as(Int, std.math.maxInt(Ones)) << @bitOffsetOf(T, field);
+        mask |= @as(Int, std.math.maxInt(Ones)) << offset;
     }
 
     return mask;
@@ -2378,6 +2487,21 @@ pub fn Mask(
             return pattern(v) == expected;
         }
 
+        /// Returns true if any value in the group of group_len values
+        /// starting at index i has masked fields equal to the expected
+        /// pattern (see `pattern`). This is the "any" counterpart to
+        /// `eql`: use it to detect the presence of a specific value
+        /// within a group, e.g. a run scan that must stop when it
+        /// encounters a sentinel codepoint anywhere in the group.
+        pub inline fn eqlAny(
+            values: []const T,
+            i: usize,
+            expected: Backing,
+        ) bool {
+            const masked = load(values, i) & @as(Group, @splat(mask));
+            return @reduce(.Or, masked == @as(Group, @splat(expected)));
+        }
+
         /// Like `eql` but returns the number of leading values whose
         /// masked fields equal the expected pattern, i.e. group_len if
         /// the entire group matches. This is useful for early-exit run
@@ -2496,6 +2620,59 @@ test "Mask" {
         styled_other.style_id = 6;
         try testing.expectEqual(M.strip(styled), M.strip(styled_other));
         try testing.expect(M.strip(styled) != M.strip(styled2));
+    }
+
+    // eqlAny: presence of a matching value anywhere in the group
+    {
+        const expected = M.pattern(styled);
+        var cells: [4]Cell = .{ plain, plain, plain, plain };
+        try testing.expect(!M.eqlAny(&cells, 0, expected));
+
+        cells[2] = styled;
+        try testing.expect(M.eqlAny(&cells, 0, expected));
+
+        // Masked compare: same masked fields with a different
+        // codepoint still matches.
+        cells[2] = styled2;
+        try testing.expect(M.eqlAny(&cells, 0, expected));
+    }
+}
+
+test "Mask nested field path" {
+    // Mask only the codepoint data bits of the content field, not
+    // the padding next to it or any other field.
+    const M = Mask(Cell, &.{"content.codepoint.data"}, 4);
+
+    const a: Cell = .init('A');
+    var b: Cell = .init('A');
+    b.style_id = 5;
+    b.wide = .wide;
+    const c: Cell = .init('C');
+
+    // Same codepoint matches regardless of other fields.
+    const expected = M.pattern(a);
+    try testing.expect(M.eqlScalar(b, expected));
+    try testing.expect(!M.eqlScalar(c, expected));
+
+    // The mask must cover exactly the codepoint data bits.
+    const cp_offset = @bitOffsetOf(Cell, "content");
+    try testing.expectEqual(
+        @as(u64, std.math.maxInt(u21)) << cp_offset,
+        comptime fieldMask(Cell, &.{"content.codepoint.data"}),
+    );
+
+    // Group variants
+    {
+        var cells: [4]Cell = .{ a, b, a, b };
+        try testing.expect(M.eql(&cells, 0, expected));
+        try testing.expect(M.eqlAny(&cells, 0, expected));
+
+        cells[1] = c;
+        try testing.expect(!M.eql(&cells, 0, expected));
+        try testing.expect(M.eqlAny(&cells, 0, expected));
+
+        const none: [4]Cell = .{ c, c, c, c };
+        try testing.expect(!M.eqlAny(&none, 0, expected));
     }
 }
 
@@ -2738,6 +2915,49 @@ test "Page appendGrapheme larger than chunk" {
     for (0..count) |i| {
         try testing.expectEqual(@as(u21, @intCast(0x0A + i)), cps[i]);
     }
+}
+
+test "Page appendGrapheme caps codepoints per cell" {
+    var page = try Page.init(.{
+        .cols = 10,
+        .rows = 10,
+        .styles = 8,
+    });
+    defer page.deinit();
+
+    const rac = page.getRowAndCell(0, 0);
+    rac.cell.* = .init('A');
+
+    for (0..grapheme_max_len + 16) |i| {
+        try page.appendGrapheme(rac.row, rac.cell, @intCast(0x0300 + i));
+    }
+
+    const cps = page.lookupGrapheme(rac.cell).?;
+    try testing.expectEqual(@as(usize, grapheme_max_len), cps.len);
+    for (0..grapheme_max_len) |i| {
+        try testing.expectEqual(@as(u21, @intCast(0x0300 + i)), cps[i]);
+    }
+}
+
+test "Page setGraphemes caps codepoints per cell" {
+    var page = try Page.init(.{
+        .cols = 10,
+        .rows = 10,
+        .styles = 8,
+    });
+    defer page.deinit();
+
+    var input: [grapheme_max_len + 16]u21 = undefined;
+    for (&input, 0..) |*cp, i| cp.* = @intCast(0x0300 + i);
+
+    const rac = page.getRowAndCell(0, 0);
+    rac.cell.* = .init('A');
+    try page.setGraphemes(rac.row, rac.cell, &input);
+
+    try testing.expectEqual(
+        @as(usize, grapheme_max_len),
+        page.lookupGrapheme(rac.cell).?.len,
+    );
 }
 
 test "Page clearGrapheme not all cells" {

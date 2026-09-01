@@ -26,7 +26,7 @@ pub fn init(b: *std.Build, cfg: *const Config) !GhosttyI18n {
         // so we need to remove it from `locale` to have a correct destination string.
         // (/usr/local/share/locale/en_AU/LC_MESSAGES)
         const target_locale = comptime if (builtin.target.os.tag == .freebsd)
-            std.mem.trimRight(u8, locale, ".UTF-8")
+            std.mem.trimEnd(u8, locale, ".UTF-8")
         else
             locale;
 
@@ -66,6 +66,7 @@ fn createUpdateStep(b: *std.Build) !*std.Build.Step {
         "--language=C", // Silence the "unknown extension" errors
         "--from-code=UTF-8",
         "--keyword=_",
+        "--keyword=N_",
         "--keyword=C_:1c,2",
     });
 
@@ -147,6 +148,11 @@ fn createUpdateStep(b: *std.Build) !*std.Build.Step {
             xgettext.addFileInput(b.path(path));
         }
     }
+
+    // For localization of command palette
+    const command_palette_path = "src/input/command.zig";
+    xgettext.addArg(command_palette_path);
+    xgettext.addFileInput(b.path(command_palette_path));
 
     // Add support for localizing our `nautilus` integration
     const xgettext_py = b.addSystemCommand(&.{
