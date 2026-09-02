@@ -649,6 +649,38 @@ pub fn supportsClipboard(
     };
 }
 
+/// Normalize the newline convention required by CF_UNICODETEXT before the
+/// shared paste encoder sees it. Windows clipboard producers conventionally
+/// use CRLF, while the non-bracketed encoder turns LF into CR. Passing CRLF
+/// through unchanged would therefore produce CRCR and submit an extra blank
+/// line for every pasted line. Preserve lone CR and LF bytes as supplied.
+fn normalizeWindowsClipboardNewlines(data: []u8) []u8 {
+    var read_idx: usize = 0;
+    var write_idx: usize = 0;
+
+    while (read_idx < data.len) {
+        if (data[read_idx] == '\r' and
+            read_idx + 1 < data.len and
+            data[read_idx + 1] == '\n')
+        {
+            data[write_idx] = '\n';
+            read_idx += 2;
+        } else {
+            data[write_idx] = data[read_idx];
+            read_idx += 1;
+        }
+        write_idx += 1;
+    }
+
+    return data[0..write_idx];
+}
+
+test "normalize Windows clipboard newlines" {
+    var data = "one\r\ntwo\r\n\r\nthree\rfour\n".*;
+    const normalized = normalizeWindowsClipboardNewlines(data[0..]);
+    try std.testing.expectEqualStrings("one\ntwo\n\nthree\rfour\n", normalized);
+}
+
 /// Show a modal clipboard confirmation dialog on the owning window and
 /// return true if the user approved. Mirrors the macOS/GTK clipboard
 /// confirmation flow so the core's paste-protection and OSC 52
@@ -760,7 +792,10 @@ pub fn clipboardRequest(
             return .unavailable;
         };
         defer alloc.free(utf8);
-        break :blk try alloc.dupeZ(u8, utf8);
+        break :blk try alloc.dupeZ(
+            u8,
+            normalizeWindowsClipboardNewlines(utf8),
+        );
     };
     defer alloc.free(utf8z);
 

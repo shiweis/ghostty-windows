@@ -1196,6 +1196,46 @@ pub fn invalidateTabBar(self: *Window) void {
     _ = w32.InvalidateRect(hwnd, &rect, 0);
 }
 
+/// Populate equal-width tab rectangles and return their rightmost edge.
+fn layoutTabRects(
+    rects: []w32.RECT,
+    available_w: i32,
+    bar_h: i32,
+    min_tab_w: i32,
+    max_tab_w: i32,
+) i32 {
+    const tab_count: i32 = @intCast(rects.len);
+    if (tab_count == 0) return 0;
+
+    var tab_w = @divTrunc(available_w, tab_count);
+    tab_w = @max(tab_w, min_tab_w);
+    tab_w = @min(tab_w, max_tab_w);
+
+    var x: i32 = 0;
+    for (rects) |*rect| {
+        rect.* = .{
+            .left = x,
+            .top = 0,
+            .right = x + tab_w,
+            .bottom = bar_h,
+        };
+        x += tab_w;
+    }
+
+    return x;
+}
+
+test "tab bar keeps tab widths equal" {
+    var rects: [2]w32.RECT = undefined;
+
+    const tabs_right = layoutTabRects(&rects, 964, 30, 60, 200);
+
+    try std.testing.expectEqual(@as(i32, 400), tabs_right);
+    try std.testing.expectEqual(@as(i32, 200), rects[0].right - rects[0].left);
+    try std.testing.expectEqual(@as(i32, 200), rects[1].right - rects[1].left);
+    try std.testing.expectEqual(rects[0].right, rects[1].left);
+}
+
 /// Paint the tab bar using double-buffered GDI painting.
 /// Draws tab backgrounds, text labels, close buttons (x), and the new-tab (+) button.
 fn paintTabBar(self: *Window) void {
@@ -1278,44 +1318,30 @@ fn paintTabBar(self: *Window) void {
     const text_pad: i32 = @intFromFloat(@round(10.0 * self.scale));
     const accent_h: i32 = @intFromFloat(@round(2.0 * self.scale));
 
-    const tab_count_i32: i32 = @intCast(self.tab_count);
     const available_w = client_w - new_tab_btn_w;
 
-    // Calculate each tab's width: proportional, min 60px.
+    // Calculate equal tab widths within the configured bounds. Any width left
+    // after the maximum is reached remains empty instead of stretching the
+    // final tab.
     const min_tab_w: i32 = @intFromFloat(@round(60.0 * self.scale));
     const max_tab_w: i32 = @intFromFloat(@round(200.0 * self.scale));
-
-    var tab_w: i32 = if (tab_count_i32 > 0)
-        @divTrunc(available_w, tab_count_i32)
-    else
-        0;
-    tab_w = @max(tab_w, min_tab_w);
-    tab_w = @min(tab_w, max_tab_w);
+    const tabs_right = layoutTabRects(
+        self.tab_rects[0..self.tab_count],
+        available_w,
+        bar_h,
+        min_tab_w,
+        max_tab_w,
+    );
 
     // --- Draw each tab ---
-    var x: i32 = 0;
     for (0..self.tab_count) |i| {
         const is_active = (i == self.active_tab);
         const is_hovered = (@as(isize, @intCast(i)) == self.hover_tab);
-
-        // Last tab gets remainder width to fill the available area.
-        const this_tab_w: i32 = if (i == self.tab_count - 1 and tab_count_i32 > 0)
-            @max(available_w - x, min_tab_w)
-        else
-            tab_w;
-
-        // Store hit-test rect.
-        self.tab_rects[i] = w32.RECT{
-            .left = x,
-            .top = 0,
-            .right = x + this_tab_w,
-            .bottom = bar_h,
-        };
+        const x = self.tab_rects[i].left;
+        const this_tab_w = self.tab_rects[i].right - x;
 
         // Draw tab background. CreateSolidBrush failures are rare (GDI
-        // handle exhaustion) and must NOT skip the loop body's geometry
-        // update at the bottom — `continue`ing would leave subsequent
-        // tabs sharing the same x position.
+        // handle exhaustion), but should not skip the rest of the tab.
         if (is_active) {
             var tab_rect = w32.RECT{ .left = x, .top = 0, .right = x + this_tab_w, .bottom = bar_h };
             if (w32.CreateSolidBrush(active_bg_color)) |brush| {
@@ -1386,14 +1412,12 @@ fn paintTabBar(self: *Window) void {
                 w32.DT_LEFT | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
             );
         }
-
-        x += this_tab_w;
     }
 
     // --- Draw new-tab (+) button ---
     {
-        const btn_left = x;
-        const btn_right = x + new_tab_btn_w;
+        const btn_left = tabs_right;
+        const btn_right = btn_left + new_tab_btn_w;
         self.new_tab_rect = w32.RECT{
             .left = btn_left,
             .top = 0,
@@ -2334,9 +2358,8 @@ pub fn windowWndProc(
                     window.drag_active = true;
                 }
                 if (window.drag_active and window.tab_count > 1) {
-                    // Use uniform tab widths for drag target calculation,
-                    // not the painted widths (the last tab gets stretched
-                    // to fill remaining space, skewing its midpoint).
+                    // Use the uniform painted width for drag target
+                    // calculation.
                     const from: usize = @intCast(window.drag_tab);
                     const first_w = window.tab_rects[0].right - window.tab_rects[0].left;
                     var target: usize = 0;
