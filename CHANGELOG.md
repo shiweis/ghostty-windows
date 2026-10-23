@@ -20,6 +20,9 @@ the underlying upstream commit when known.
 
 ### Windows Fixes and Adaptations
 
+- Restyle the standalone tab strip with equal-width tabs, centered Segoe UI
+  titles, theme-derived selection colors, and right-side hover close buttons.
+  Keep the native Windows caption and separate tab row.
 - Add a native searchable tab overview through `toggle_tab_overview` and the
   command palette, with Unicode filtering, keyboard switching, DPI scaling,
   and whole-tab closing that confirms running processes across all splits.
@@ -49,6 +52,8 @@ the underlying upstream commit when known.
 
 ### Testing and Development
 
+- Add an HWND-scoped tab-strip regression covering opaque, translucent, and
+  light windows without desktop-global input.
 - Add the phased Windows feature roadmap with explicit completion criteria
   and security gates for file links and protected input.
 - Add native tab-overview tests and an end-to-end test limited to validated,

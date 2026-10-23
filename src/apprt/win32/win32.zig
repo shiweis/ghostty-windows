@@ -738,10 +738,16 @@ pub extern "kernel32" fn CloseHandle(
 
 // Stock object indices for GetStockObject
 pub const BLACK_BRUSH: i32 = 4;
+pub const DC_BRUSH: i32 = 18;
 
 pub extern "gdi32" fn GetStockObject(
     i: i32,
 ) callconv(.winapi) ?*anyopaque;
+
+pub extern "gdi32" fn SetDCBrushColor(
+    hdc: HDC,
+    color: u32,
+) callconv(.winapi) u32;
 
 /// COLORREF is 0x00BBGGRR (blue in high byte, red in low byte).
 pub fn RGB(r: u8, g: u8, b: u8) u32 {
@@ -1187,6 +1193,7 @@ pub const PAINTSTRUCT = extern struct {
 pub const SRCCOPY: u32 = 0x00CC0020;
 pub const TRANSPARENT: i32 = 1;
 pub const DT_LEFT: u32 = 0;
+pub const DT_CENTER: u32 = 1;
 pub const DT_VCENTER: u32 = 4;
 pub const DT_SINGLELINE: u32 = 32;
 pub const DT_END_ELLIPSIS: u32 = 0x8000;

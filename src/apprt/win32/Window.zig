@@ -6,6 +6,7 @@ const Window = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const apprt = @import("../../apprt.zig");
+const Config = @import("../../config.zig").Config;
 
 const App = @import("App.zig");
 const Surface = @import("Surface.zig");
@@ -343,8 +344,8 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
         self.scale = @as(f32, @floatFromInt(dpi)) / 96.0;
     }
 
-    // Create the tab bar font (Segoe UI, 12px at 96 DPI, scaled).
-    const font_height: i32 = -@as(i32, @intFromFloat(16.0 * self.scale));
+    // Use the Windows UI font while keeping the compact macOS-like tab density.
+    const font_height: i32 = -@as(i32, @intFromFloat(14.0 * self.scale));
     self.tab_font = w32.CreateFontW(
         font_height, // cHeight (negative = character height)
         0, // cWidth
@@ -1256,44 +1257,41 @@ pub fn invalidateTabBar(self: *Window) void {
     _ = w32.InvalidateRect(hwnd, &rect, 0);
 }
 
-/// Populate equal-width tab rectangles and return their rightmost edge.
+/// Fill the strip with adjacent tabs, retaining a minimum width on overflow.
 fn layoutTabRects(
     rects: []w32.RECT,
     available_w: i32,
     bar_h: i32,
     min_tab_w: i32,
-    max_tab_w: i32,
 ) i32 {
     const tab_count: i32 = @intCast(rects.len);
     if (tab_count == 0) return 0;
-
-    var tab_w = @divTrunc(available_w, tab_count);
-    tab_w = @max(tab_w, min_tab_w);
-    tab_w = @min(tab_w, max_tab_w);
-
+    const tab_w = @max(@divTrunc(available_w, tab_count), min_tab_w);
+    const remainder: usize = @intCast(@max(available_w - tab_w * tab_count, 0));
     var x: i32 = 0;
-    for (rects) |*rect| {
-        rect.* = .{
-            .left = x,
-            .top = 0,
-            .right = x + tab_w,
-            .bottom = bar_h,
-        };
-        x += tab_w;
+    for (rects, 0..) |*rect, i| {
+        const width = tab_w + @as(i32, @intFromBool(i < remainder));
+        rect.* = .{ .left = x, .top = 0, .right = x + width, .bottom = bar_h };
+        x += width;
     }
-
     return x;
 }
 
-test "tab bar keeps tab widths equal" {
-    var rects: [2]w32.RECT = undefined;
+fn tabColor(bg: Config.Color, fg: Config.Color, weight: u8) u32 {
+    const foreground: u16 = weight;
+    const background: u16 = 255 - foreground;
+    return w32.RGB(
+        @intCast((@as(u16, bg.r) * background + @as(u16, fg.r) * foreground + 127) / 255),
+        @intCast((@as(u16, bg.g) * background + @as(u16, fg.g) * foreground + 127) / 255),
+        @intCast((@as(u16, bg.b) * background + @as(u16, fg.b) * foreground + 127) / 255),
+    );
+}
 
-    const tabs_right = layoutTabRects(&rects, 964, 30, 60, 200);
-
-    try std.testing.expectEqual(@as(i32, 400), tabs_right);
-    try std.testing.expectEqual(@as(i32, 200), rects[0].right - rects[0].left);
-    try std.testing.expectEqual(@as(i32, 200), rects[1].right - rects[1].left);
-    try std.testing.expectEqual(rects[0].right, rects[1].left);
+fn tabCloseRect(self: *const Window, tab: w32.RECT) w32.RECT {
+    const size: i32 = @intFromFloat(@round(24.0 * self.scale));
+    const inset: i32 = @intFromFloat(@round(4.0 * self.scale));
+    const top = @divTrunc(self.tabBarHeight() - size, 2);
+    return .{ .left = tab.right - inset - size, .top = top, .right = tab.right - inset, .bottom = top + size };
 }
 
 /// Paint the tab bar using double-buffered GDI painting.
@@ -1328,39 +1326,20 @@ fn paintTabBar(self: *Window) void {
         _ = w32.DeleteObject(mem_bmp);
     }
 
-    // --- Colors ---
     const bg = self.app.config.background;
-    // Bar background: terminal bg + 20 brightness per channel (slightly lighter).
-    const bar_r: u8 = @min(@as(u16, bg.r) + 20, 255);
-    const bar_g: u8 = @min(@as(u16, bg.g) + 20, 255);
-    const bar_b: u8 = @min(@as(u16, bg.b) + 20, 255);
-    const bar_color = w32.RGB(bar_r, bar_g, bar_b);
-
-    // Hover background: bar bg + 15 more (total +35 from terminal bg).
-    const hover_r: u8 = @min(@as(u16, bar_r) + 15, 255);
-    const hover_g: u8 = @min(@as(u16, bar_g) + 15, 255);
-    const hover_b: u8 = @min(@as(u16, bar_b) + 15, 255);
-    const hover_color = w32.RGB(hover_r, hover_g, hover_b);
-
-    // Active tab background: terminal bg (darker than bar).
-    const active_bg_color = w32.RGB(bg.r, bg.g, bg.b);
-
-    // Accent line color (blue).
-    const accent_color = w32.RGB(0x3D, 0x8E, 0xF8);
-
-    // Text colors.
-    const active_text_color = w32.RGB(230, 230, 230);
-    const inactive_text_color = w32.RGB(150, 150, 150);
-
-    // Close button colors.
-    const close_normal_color = w32.RGB(150, 150, 150);
-    const close_hover_color = w32.RGB(232, 65, 65);
+    const fg = self.app.config.foreground;
+    const bar_color = tabColor(bg, fg, 7);
+    const hover_color = tabColor(bg, fg, 16);
+    const active_bg_color = tabColor(bg, fg, 25);
+    const divider_color = tabColor(bg, fg, 40);
+    const active_text_color = w32.RGB(fg.r, fg.g, fg.b);
+    const inactive_text_color = tabColor(bg, fg, 195);
+    const brush: w32.HBRUSH = @ptrCast(w32.GetStockObject(w32.DC_BRUSH) orelse return);
 
     // --- Fill bar background ---
     var bar_rect = w32.RECT{ .left = 0, .top = 0, .right = client_w, .bottom = bar_h };
-    const bar_brush = w32.CreateSolidBrush(bar_color) orelse return;
-    _ = w32.FillRect(mem_dc, &bar_rect, bar_brush);
-    _ = w32.DeleteObject(@ptrCast(bar_brush));
+    _ = w32.SetDCBrushColor(mem_dc, bar_color);
+    _ = w32.FillRect(mem_dc, &bar_rect, brush);
 
     // --- Select font and set text mode ---
     var old_font: ?*anyopaque = null;
@@ -1374,23 +1353,18 @@ fn paintTabBar(self: *Window) void {
 
     // --- Calculate tab geometry ---
     const new_tab_btn_w: i32 = @intFromFloat(@round(36.0 * self.scale));
-    const close_btn_w: i32 = @intFromFloat(@round(20.0 * self.scale));
-    const text_pad: i32 = @intFromFloat(@round(10.0 * self.scale));
-    const accent_h: i32 = @intFromFloat(@round(2.0 * self.scale));
+    const title_pad: i32 = @intFromFloat(@round(28.0 * self.scale));
+    const divider_w: i32 = @max(1, @as(i32, @intFromFloat(@round(self.scale))));
+    const divider_inset: i32 = @intFromFloat(@round(8.0 * self.scale));
 
     const available_w = client_w - new_tab_btn_w;
 
-    // Calculate equal tab widths within the configured bounds. Any width left
-    // after the maximum is reached remains empty instead of stretching the
-    // final tab.
     const min_tab_w: i32 = @intFromFloat(@round(60.0 * self.scale));
-    const max_tab_w: i32 = @intFromFloat(@round(200.0 * self.scale));
     const tabs_right = layoutTabRects(
         self.tab_rects[0..self.tab_count],
         available_w,
         bar_h,
         min_tab_w,
-        max_tab_w,
     );
 
     // --- Draw each tab ---
@@ -1400,32 +1374,22 @@ fn paintTabBar(self: *Window) void {
         const x = self.tab_rects[i].left;
         const this_tab_w = self.tab_rects[i].right - x;
 
-        // Draw tab background. CreateSolidBrush failures are rare (GDI
-        // handle exhaustion), but should not skip the rest of the tab.
         if (is_active) {
-            var tab_rect = w32.RECT{ .left = x, .top = 0, .right = x + this_tab_w, .bottom = bar_h };
-            if (w32.CreateSolidBrush(active_bg_color)) |brush| {
-                _ = w32.FillRect(mem_dc, &tab_rect, brush);
-                _ = w32.DeleteObject(@ptrCast(brush));
-            }
-
-            // Draw accent line at bottom.
-            var accent_rect = w32.RECT{
-                .left = x,
-                .top = bar_h - accent_h,
-                .right = x + this_tab_w,
-                .bottom = bar_h,
-            };
-            if (w32.CreateSolidBrush(accent_color)) |brush| {
-                _ = w32.FillRect(mem_dc, &accent_rect, brush);
-                _ = w32.DeleteObject(@ptrCast(brush));
-            }
+            _ = w32.SetDCBrushColor(mem_dc, active_bg_color);
+            _ = w32.FillRect(mem_dc, &self.tab_rects[i], brush);
         } else if (is_hovered) {
-            var hover_rect = w32.RECT{ .left = x, .top = 0, .right = x + this_tab_w, .bottom = bar_h };
-            if (w32.CreateSolidBrush(hover_color)) |brush| {
-                _ = w32.FillRect(mem_dc, &hover_rect, brush);
-                _ = w32.DeleteObject(@ptrCast(brush));
-            }
+            _ = w32.SetDCBrushColor(mem_dc, hover_color);
+            _ = w32.FillRect(mem_dc, &self.tab_rects[i], brush);
+        }
+        if (i > 0) {
+            var divider = w32.RECT{
+                .left = x,
+                .top = divider_inset,
+                .right = x + divider_w,
+                .bottom = bar_h - divider_inset,
+            };
+            _ = w32.SetDCBrushColor(mem_dc, divider_color);
+            _ = w32.FillRect(mem_dc, &divider, brush);
         }
 
         // Draw tab title text.
@@ -1433,9 +1397,9 @@ fn paintTabBar(self: *Window) void {
         if (title_len > 0) {
             _ = w32.SetTextColor(mem_dc, if (is_active) active_text_color else inactive_text_color);
             var text_rect = w32.RECT{
-                .left = x + text_pad,
+                .left = x + title_pad,
                 .top = 0,
-                .right = x + this_tab_w - close_btn_w - text_pad,
+                .right = x + this_tab_w - title_pad,
                 .bottom = bar_h,
             };
             _ = w32.DrawTextW(
@@ -1443,33 +1407,24 @@ fn paintTabBar(self: *Window) void {
                 @ptrCast(&self.tab_titles[i]),
                 @intCast(title_len),
                 &text_rect,
-                w32.DT_LEFT | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_END_ELLIPSIS | w32.DT_NOPREFIX,
+                w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_END_ELLIPSIS | w32.DT_NOPREFIX,
             );
         }
 
-        // Draw close button (x) — visible on active or hovered tabs.
-        if (is_active or is_hovered) {
-            const close_x = x + this_tab_w - close_btn_w - @divTrunc(text_pad, 2);
-            const close_y_center = @divTrunc(bar_h, 2);
-            const close_text_color = if (is_hovered and self.hover_close and @as(isize, @intCast(i)) == self.hover_tab)
-                close_hover_color
-            else
-                close_normal_color;
-
-            _ = w32.SetTextColor(mem_dc, close_text_color);
-            const x_char = std.unicode.utf8ToUtf16LeStringLiteral("\u{00D7}"); // multiplication sign as close
-            var close_rect = w32.RECT{
-                .left = close_x,
-                .top = close_y_center - @divTrunc(close_btn_w, 2),
-                .right = close_x + close_btn_w,
-                .bottom = close_y_center + @divTrunc(close_btn_w, 2),
-            };
+        if (is_hovered) {
+            var close_rect = self.tabCloseRect(self.tab_rects[i]);
+            if (self.hover_close) {
+                _ = w32.SetDCBrushColor(mem_dc, divider_color);
+                _ = w32.FillRect(mem_dc, &close_rect, brush);
+            }
+            _ = w32.SetTextColor(mem_dc, if (self.hover_close) active_text_color else inactive_text_color);
+            const x_char = std.unicode.utf8ToUtf16LeStringLiteral("\u{00D7}");
             _ = w32.DrawTextW(
                 mem_dc,
                 x_char,
                 1,
                 &close_rect,
-                w32.DT_LEFT | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
+                w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
             );
         }
     }
@@ -1488,11 +1443,8 @@ fn paintTabBar(self: *Window) void {
         // Hover highlight for new-tab button.
         if (self.hover_new_tab) {
             var btn_rect = w32.RECT{ .left = btn_left, .top = 0, .right = btn_right, .bottom = bar_h };
-            const nt_brush = w32.CreateSolidBrush(hover_color);
-            if (nt_brush) |brush| {
-                _ = w32.FillRect(mem_dc, &btn_rect, brush);
-                _ = w32.DeleteObject(@ptrCast(brush));
-            }
+            _ = w32.SetDCBrushColor(mem_dc, hover_color);
+            _ = w32.FillRect(mem_dc, &btn_rect, brush);
         }
 
         _ = w32.SetTextColor(mem_dc, inactive_text_color);
@@ -1508,7 +1460,7 @@ fn paintTabBar(self: *Window) void {
             plus_char,
             1,
             &plus_rect,
-            w32.DT_LEFT | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
+            w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
         );
     }
 
@@ -1756,14 +1708,11 @@ fn handleTabBarClick(self: *Window, x: i16, y: i16) void {
     }
 
     // Check each tab.
-    const close_btn_w: i32 = @intFromFloat(@round(20.0 * self.scale));
-    const text_pad: i32 = @intFromFloat(@round(10.0 * self.scale));
     for (0..self.tab_count) |i| {
         const rect = self.tab_rects[i];
         if (x >= rect.left and x < rect.right) {
-            // Check close button area (right side of tab).
-            const close_left = rect.right - close_btn_w - @divTrunc(text_pad, 2);
-            if (x >= close_left) {
+            const close_rect = self.tabCloseRect(rect);
+            if (x >= close_rect.left and x < close_rect.right and y >= close_rect.top and y < close_rect.bottom) {
                 self.closeTabByIndex(i);
             } else {
                 self.selectTabIndex(i);
@@ -1851,14 +1800,12 @@ fn handleTabBarMouseMove(self: *Window, x: i16, y: i16) void {
             new_new_tab = true;
         } else {
             // Check tabs.
-            const close_btn_w: i32 = @intFromFloat(@round(20.0 * self.scale));
-            const text_pad: i32 = @intFromFloat(@round(10.0 * self.scale));
             for (0..self.tab_count) |i| {
                 const rect = self.tab_rects[i];
                 if (x >= rect.left and x < rect.right) {
                     new_hover = @intCast(i);
-                    const close_left = rect.right - close_btn_w - @divTrunc(text_pad, 2);
-                    new_close = x >= close_left;
+                    const close_rect = self.tabCloseRect(rect);
+                    new_close = x >= close_rect.left and x < close_rect.right and y >= close_rect.top and y < close_rect.bottom;
                     break;
                 }
             }

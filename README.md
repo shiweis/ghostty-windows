@@ -49,6 +49,7 @@ macOS/GTK feature parity.
 
 **Windows & Tabs**
 - Multiple windows, tabbed interface with custom GDI tab bar
+- Standalone theme-colored tab strip with centered titles and hover close buttons on the right
 - Tab drag-and-drop reorder, inline rename (double-click), right-click context menu
 - Close tab modes: current, all others, all to the right
 - Searchable native tab overview with keyboard switching and whole-tab closing
@@ -427,6 +428,22 @@ filtering, switching, close confirmation, split-tab closing, and child exits.
 Neither uses desktop-global keyboard/mouse injection. The harness stages the
 app under Windows `%TEMP%`. The `resize` and `window_properties` cases also
 avoid global input.
+
+The standalone tab-strip regression test runs directly under PowerShell 7:
+
+```powershell
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File test/win32/test_tab_bar.ps1 `
+  -ExePath "$PWD/zig-out/bin/ghostty.exe" `
+  -ResourcesPath "$PWD/zig-out/share" `
+  -OutputDirectory "$env:TEMP/ghostty-tab-bar-proof" -Case all
+```
+
+It validates every target HWND against its own app process before sending
+messages, without global input injection or foreground requests. Dark opaque,
+dark translucent, and light fixtures exercise tab creation, keyboard and mouse
+selection, independent PTY input, right-side closing, and inline title editing.
+JSON results, app logs, and native window captures are saved in the output
+directory. Blur is disabled in these fixtures; this is not a compositing test.
 
 The PowerShell integration regression test captures VT output in memory and
 needs neither a GUI nor the app binary. Run from the repository root in Windows:
