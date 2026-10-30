@@ -59,9 +59,11 @@ pub const WINDOW_CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyWin
 /// Window class for terminal surfaces (OpenGL via WGL, needs CS_OWNDC).
 pub const TERMINAL_CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyTerminal");
 
+/// Window class for GDI chrome that fills only regions outside terminal HWNDs.
+pub const CHROME_CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyChrome");
+
 /// Window class for the message-only HWND (WM_APP_WAKEUP, WM_TIMER).
 pub const MSG_CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyMsg");
-
 /// The core application.
 core_app: *CoreApp,
 
@@ -80,14 +82,13 @@ hinstance: w32.HINSTANCE,
 class_atom: u16 = 0,
 terminal_class_atom: u16 = 0,
 overview_class_atom: u16 = 0,
+chrome_class_atom: u16 = 0,
 msg_class_atom: u16 = 0,
 
 /// List of active Window containers (tabbed windows).
 windows: std.ArrayList(*Window) = .empty,
 
-/// Background brush created from the configured background color.
-/// Used by WM_ERASEBKGND to fill exposed areas during resize,
-/// matching the terminal background so the flash is invisible.
+/// Brush for opaque fallback surfaces.
 bg_brush: ?w32.HBRUSH = null,
 
 /// Quit timer state, mirroring GTK's three-state approach:
@@ -143,9 +144,7 @@ pub fn init(
     };
     errdefer config.deinit();
 
-    // Create a brush matching the configured background color so that
-    // any exposed window area during resize matches the terminal
-    // background, making the flash invisible.
+    // Keep a configured-color brush for terminal surfaces using opaque fallback.
     const bg = config.background;
     const bg_brush = w32.CreateSolidBrush(w32.RGB(bg.r, bg.g, bg.b));
 
@@ -173,7 +172,7 @@ pub fn init(
         .hInstance = hinstance,
         .hIcon = app_icon,
         .hCursor = w32.LoadCursorW(null, w32.IDC_ARROW),
-        .hbrBackground = bg_brush,
+        .hbrBackground = null,
         .lpszMenuName = null,
         .lpszClassName = WINDOW_CLASS_NAME,
         .hIconSm = app_icon,
@@ -205,6 +204,25 @@ pub fn init(
     if (self.terminal_class_atom == 0) return error.Win32Error;
     errdefer if (self.terminal_class_atom != 0) {
         _ = w32.UnregisterClassW(TERMINAL_CLASS_NAME, self.hinstance);
+    };
+    const cc = w32.WNDCLASSEXW{
+        .cbSize = @sizeOf(w32.WNDCLASSEXW),
+        .style = w32.CS_DBLCLKS,
+        .lpfnWndProc = &Window.chromeWndProc,
+        .cbClsExtra = 0,
+        .cbWndExtra = 0,
+        .hInstance = hinstance,
+        .hIcon = app_icon,
+        .hCursor = w32.LoadCursorW(null, w32.IDC_ARROW),
+        .hbrBackground = null,
+        .lpszMenuName = null,
+        .lpszClassName = CHROME_CLASS_NAME,
+        .hIconSm = app_icon,
+    };
+    self.chrome_class_atom = w32.RegisterClassExW(&cc);
+    if (self.chrome_class_atom == 0) return error.Win32Error;
+    errdefer if (self.chrome_class_atom != 0) {
+        _ = w32.UnregisterClassW(CHROME_CLASS_NAME, self.hinstance);
     };
 
     self.overview_class_atom = try TabOverview.registerClass(hinstance);
@@ -263,10 +281,14 @@ pub fn init(
 pub fn run(self: *App) !void {
     // Create the initial Window container with one tab.
     const alloc = self.core_app.alloc;
-    const window = try alloc.create(Window);
-    errdefer alloc.destroy(window);
-    try window.init(self, .{});
-    try self.windows.append(alloc, window);
+    const window = blk: {
+        const initial = try alloc.create(Window);
+        errdefer alloc.destroy(initial);
+        try initial.init(self, .{});
+        errdefer initial.deinit();
+        try self.windows.append(alloc, initial);
+        break :blk initial;
+    };
     _ = try window.addTab();
 
     // Enter the Win32 message loop
@@ -472,6 +494,11 @@ pub fn terminate(self: *App) void {
         _ = w32.UnregisterClassW(MSG_CLASS_NAME, self.hinstance);
         self.msg_class_atom = 0;
     }
+    if (self.chrome_class_atom != 0) {
+        _ = w32.UnregisterClassW(CHROME_CLASS_NAME, self.hinstance);
+        self.chrome_class_atom = 0;
+    }
+
     if (self.terminal_class_atom != 0) {
         _ = w32.UnregisterClassW(TERMINAL_CLASS_NAME, self.hinstance);
         self.terminal_class_atom = 0;
@@ -520,18 +547,9 @@ pub fn performAction(
         },
 
         .new_window => {
-            // Inherit opacity-toggle state from the parent window: if the
-            // user toggled it to opaque via toggle_background_opacity, the
-            // new window should start opaque too. Mirrors macOS behavior
-            // from upstream e5c31e8b3 (#11583).
-            const force_opaque: bool = switch (target) {
-                .app => false,
-                .surface => |cs| blk: {
-                    if (self.config.@"background-opacity" >= 1.0) break :blk false;
-                    const h = cs.rt_surface.parent_window.hwnd orelse break :blk false;
-                    const ex = w32.GetWindowLongW(h, w32.GWL_EXSTYLE);
-                    break :blk (ex & w32.WS_EX_LAYERED) == 0;
-                },
+            const opacity_mode: Window.OpacityMode = switch (target) {
+                .app => .configured,
+                .surface => |cs| cs.rt_surface.parent_window.opacity_mode,
             };
 
             const alloc = self.core_app.alloc;
@@ -539,7 +557,7 @@ pub fn performAction(
                 log.err("failed to allocate new window err={}", .{err});
                 return true;
             };
-            window.init(self, .{ .force_opaque = force_opaque }) catch |err| {
+            window.init(self, .{ .opacity_mode = opacity_mode }) catch |err| {
                 log.err("failed to init new window err={}", .{err});
                 alloc.destroy(window);
                 return true;
@@ -991,28 +1009,12 @@ pub fn performAction(
             switch (target) {
                 .app => {},
                 .surface => |core_surface| {
-                    if (core_surface.rt_surface.parent_window.hwnd) |h| {
-                        const current_ex = w32.GetWindowLongW(h, w32.GWL_EXSTYLE);
-                        if (current_ex & w32.WS_EX_LAYERED != 0) {
-                            // Remove layered style (restore full opacity).
-                            // Clearing WS_EX_LAYERED is not repainted
-                            // automatically — without an explicit redraw the
-                            // window stays translucent until the next
-                            // repaint (e.g. a later focus change).
-                            _ = w32.SetWindowLongW(h, w32.GWL_EXSTYLE, current_ex & ~w32.WS_EX_LAYERED);
-                            _ = w32.RedrawWindow(
-                                h,
-                                null,
-                                null,
-                                w32.RDW_ERASE | w32.RDW_INVALIDATE | w32.RDW_FRAME | w32.RDW_ALLCHILDREN,
-                            );
-                        } else {
-                            // Apply opacity from config
-                            _ = w32.SetWindowLongW(h, w32.GWL_EXSTYLE, current_ex | w32.WS_EX_LAYERED);
-                            const alpha: u8 = @intFromFloat(@round(self.config.@"background-opacity" * 255.0));
-                            _ = w32.SetLayeredWindowAttributes(h, 0, alpha, w32.LWA_ALPHA);
-                        }
-                    }
+                    const window = core_surface.rt_surface.parent_window;
+                    window.opacity_mode = if (window.opacity_mode == .configured)
+                        .forced_opaque
+                    else
+                        .configured;
+                    window.refreshOpacity();
                 },
             }
             return true;
@@ -1161,28 +1163,12 @@ pub fn performAction(
         },
 
         .color_change => {
-            // Track terminal background color changes (OSC 10/11) so the
-            // class background brush matches. The renderer paints the
-            // client area via OpenGL — the brush only affects the brief
-            // flash on resize before the renderer catches up.
+            // Keep the configured color available for opaque presentation fallback.
             if (value.kind != .background) return true;
             if (self.bg_brush) |old_brush| {
                 _ = w32.DeleteObject(@ptrCast(old_brush));
             }
             self.bg_brush = w32.CreateSolidBrush(w32.RGB(value.r, value.g, value.b));
-            // SetClassLongPtrW propagates the new brush to all existing
-            // windows of the class, not just future ones.
-            for (self.windows.items) |w| {
-                if (w.hwnd) |h| {
-                    if (self.bg_brush) |b| {
-                        _ = w32.SetClassLongPtrW(
-                            h,
-                            w32.GCLP_HBRBACKGROUND,
-                            @intCast(@intFromPtr(b)),
-                        );
-                    }
-                }
-            }
             return true;
         },
 
@@ -2148,6 +2134,10 @@ fn surfaceWndProc(
         return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
 
     switch (msg) {
+        Surface.WM_OPAQUE_PRESENTATION_FALLBACK => {
+            surface.completeOpaquePresentationFallback();
+            return 0;
+        },
         w32.WM_ENTERSIZEMOVE => {
             surface.in_live_resize = true;
             return 0;
@@ -2210,14 +2200,14 @@ fn surfaceWndProc(
         },
 
         w32.WM_ERASEBKGND => {
-            // Fill with the configured background color to prevent
-            // a visible flash during resize. The OpenGL renderer will
-            // overwrite the entire client area on the next frame.
-            if (surface.app.bg_brush) |brush| {
-                const hdc_erase: w32.HDC = @ptrFromInt(wparam);
-                var rect: w32.RECT = undefined;
-                if (w32.GetClientRect(hwnd, &rect) != 0) {
-                    _ = w32.FillRect(hdc_erase, &rect, brush);
+            // Palette popups and unsupported presentation retain the opaque fill.
+            if (is_palette_popup or !surface.transparency_supported or
+                !surface.parent_window.transparency_supported)
+            {
+                if (surface.app.bg_brush) |brush| {
+                    const hdc_erase: w32.HDC = @ptrFromInt(wparam);
+                    var rect: w32.RECT = undefined;
+                    if (w32.GetClientRect(hwnd, &rect) != 0) _ = w32.FillRect(hdc_erase, &rect, brush);
                 }
             }
             return 1;
@@ -2505,9 +2495,7 @@ fn surfaceWndProc(
         },
 
         w32.WM_SETFOCUS => {
-            // Update the active surface for this tab when a split pane gains focus.
-            const tab = surface.parent_window.active_tab;
-            surface.parent_window.tab_active_surface[tab] = surface;
+            surface.parent_window.onSurfaceFocus(surface);
             surface.handleFocus(true);
             return 0;
         },

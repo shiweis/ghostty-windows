@@ -15,6 +15,7 @@ const Dmabuf = @import("Dmabuf.zig");
 const is_wgl = apprt.runtime == apprt.win32;
 const w32 = if (is_wgl) @import("../apprt/win32/win32.zig") else struct {};
 pub const Device = if (is_wgl) @import("opengl/WGLDevice.zig") else @import("opengl/Device.zig");
+const WindowsPresentation = @import("opengl/WindowsPresentation.zig");
 
 pub const GraphicsAPI = OpenGL;
 pub const Target = @import("opengl/Target.zig");
@@ -28,7 +29,6 @@ pub const Texture = @import("opengl/Texture.zig");
 pub const shaders = @import("opengl/shaders.zig");
 
 pub const custom_shader_target: shadertoy.Target = .glsl;
-// The fragCoord for OpenGL shaders is +Y = up.
 pub const custom_shader_y_is_down = false;
 
 /// Triple-buffering gives the GPU room to pipeline renders without
@@ -36,20 +36,24 @@ pub const custom_shader_y_is_down = false;
 pub const swap_chain_count = 3;
 
 const log = std.log.scoped(.opengl);
-
 /// We require at least OpenGL 4.3
 pub const MIN_VERSION_MAJOR = 4;
 pub const MIN_VERSION_MINOR = 3;
 
-alloc: std.mem.Allocator,
-
-/// Alpha blending mode
+alloc: Allocator,
 blending: configpkg.Config.AlphaBlending,
 
 /// The shared render device.
 device: *const Device,
 
 egl_context: if (is_wgl) void else *gl.egl.Context,
+last_target: ?Target = null,
+windows_presentation: ?WindowsPresentation = null,
+windows_composition_supported: bool = false,
+windows_composition_unavailable: bool = false,
+windows_hwnd: if (is_wgl) ?std.os.windows.HWND else void = if (is_wgl) null else {},
+windows_surface: if (is_wgl) ?*apprt.Surface else void = if (is_wgl) null else {},
+
 context_loaded: bool = false,
 
 pub fn init(
@@ -60,12 +64,18 @@ pub fn init(
     // WGL contexts belong to native surfaces. GPU resources are now created
     // lazily on the render thread, so initialization must not bind the context
     // on the GUI thread or require an EGL installation on Windows.
-    if (comptime is_wgl) return .{
-        .alloc = alloc,
-        .blending = opts.config.blending,
-        .device = device,
-        .egl_context = {},
-    };
+    if (comptime is_wgl) {
+        const surface = opts.rt_surface;
+        return .{
+            .alloc = alloc,
+            .blending = opts.config.blending,
+            .device = device,
+            .egl_context = {},
+            .windows_hwnd = surface.hwnd,
+            .windows_surface = surface,
+            .windows_composition_supported = surface.transparency_supported,
+        };
+    }
 
     const display = device.display;
 
@@ -103,6 +113,7 @@ pub fn init(
 }
 
 pub fn deinit(self: *OpenGL) void {
+    if (self.windows_presentation) |*presentation| presentation.deinit();
     if (comptime !is_wgl) {
         self.device.display.releaseCurrent();
         self.egl_context.destroy(self.device.display) catch {};
@@ -278,6 +289,24 @@ pub fn setViewport(self: *const OpenGL, width: u32, height: u32) void {
     };
 }
 
+/// The presenter is valid only while its creating WGL context is current.
+pub fn gpuResourcesReleased(self: *OpenGL) void {
+    if (self.windows_presentation) |*presentation| presentation.deinit();
+    self.windows_presentation = null;
+    self.last_target = null;
+    if (comptime is_wgl) {
+        if (self.windows_surface) |surface| surface.invalidatePresentedFrame();
+    }
+}
+
+pub fn displayRealized(_: *const OpenGL) void {
+    if (comptime apprt.runtime == apprt.gtk) {
+        prepareContext(null) catch |err| {
+            log.warn("Error preparing GL context in displayRealized, err={}", .{err});
+        };
+    }
+}
+
 /// Actions taken before doing anything in `drawFrame`.
 ///
 /// Right now there's nothing we need to do for OpenGL.
@@ -287,9 +316,21 @@ pub fn drawFrameStart(self: *OpenGL) void {
 
 /// Actions taken after `drawFrame` is done.
 ///
-/// Right now there's nothing we need to do for OpenGL.
+/// The opaque Win32 fallback swaps its double-buffered WGL surface.
 pub fn drawFrameEnd(self: *OpenGL) void {
-    _ = self;
+    if (comptime apprt.runtime == apprt.win32) {
+        if (!self.windows_composition_supported) {
+            const hdc = w32.wglGetCurrentDC();
+            if (hdc != null and w32.SwapBuffers(hdc.?) != 0) {
+                if (self.last_target) |target| self.windows_surface.?.signalFrameDrawn(
+                    @intCast(target.width),
+                    @intCast(target.height),
+                );
+            } else {
+                self.windows_surface.?.invalidatePresentedFrame();
+            }
+        }
+    }
 }
 
 pub fn initShaders(
@@ -323,24 +364,43 @@ pub fn present(
     presentation_health: rendererpkg.Health,
 ) !ExportedFrame {
     if (comptime is_wgl) {
-        const hdc = w32.wglGetCurrentDC() orelse return error.NoCurrentContext;
-        const binding = try target.framebuffer.bind(.read);
-        defer binding.unbind();
-        // RenderPass restores the draw framebuffer to the window (zero).
-        // Present directly; Windows does not consume exported EGL frames.
-        try gl.blitFramebuffer(
-            0,
-            0,
-            @intCast(target.width),
-            @intCast(target.height),
-            0,
-            0,
-            @intCast(target.width),
-            @intCast(target.height),
-            .{ .color_buffer_bit = true },
-            .nearest,
-        );
-        if (w32.SwapBuffers(hdc) == 0) return error.SwapBuffersFailed;
+        const surface = self.windows_surface.?;
+        if (surface.transparency_supported and self.windows_composition_unavailable) {
+            surface.requestOpaquePresentation();
+            return error.CompositionUnavailable;
+        }
+        if (!surface.transparency_supported) {
+            if (self.windows_presentation == null)
+                self.windows_presentation = try WindowsPresentation.init(self.alloc, null);
+            try self.windows_presentation.?.present(target, self.blending);
+            self.windows_composition_supported = false;
+            self.last_target = target;
+            return;
+        }
+        if (self.windows_presentation == null) {
+            const hwnd = self.windows_hwnd orelse return error.InvalidSurface;
+            var presentation = try WindowsPresentation.init(self.alloc, hwnd);
+            if (!presentation.compositionSupported()) {
+                const hr = presentation.unavailable_hresult orelse @as(i32, @bitCast(@as(u32, 0x80004005)));
+                log.warn(
+                    "Windows transparency unavailable; switching to an opaque background (DirectComposition HRESULT=0x{x:0>8})",
+                    .{@as(u32, @bitCast(hr))},
+                );
+                presentation.deinit();
+                self.windows_composition_unavailable = true;
+                surface.requestOpaquePresentation();
+                return error.CompositionUnavailable;
+            }
+            self.windows_presentation = presentation;
+            self.windows_composition_supported = true;
+        }
+
+        self.windows_presentation.?.present(target, self.blending) catch |err| {
+            surface.invalidatePresentedFrame();
+            return err;
+        };
+        surface.signalFrameDrawn(@intCast(target.width), @intCast(target.height));
+        self.last_target = target;
         return;
     }
     // We only export DMABUFs when the apprt can present them.

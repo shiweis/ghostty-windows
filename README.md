@@ -439,12 +439,42 @@ For immediate recovery, open the command palette with `Ctrl+Shift+P` and select
 **Reset Mouse Reporting**, or bind the `reset_mouse_reporting` action. This
 preserves terminal contents and history.
 
+### Windows transparency
+
+`background-opacity` changes the terminal background, not text, cursors, images,
+or explicit cell backgrounds. Enable `background-opacity-cells` separately to
+make cell backgrounds translucent. `toggle_background_opacity` forces an opaque
+background until toggled back. Reload still updates the configured value while
+forced-opaque mode remains set.
+
+Transparency uses DirectComposition with hardware `WGL_NV_DX_interop2` support.
+The GPU presentation pass writes a stable shared texture, then copies it into
+the DXGI backbuffer; terminal frames are never copied through CPU memory.
+Unsupported presentation drivers emit an explicit transparency-unavailable
+warning and switch to an opaque WGL terminal.
+The tab strip follows the terminal's effective opacity and shares its blurred
+backdrop. Labels and button glyphs stay opaque. Its cached GDI pixel buffers are
+updated only when the strip changes, independently of terminal frames.
+Dividers and native title editors remain opaque on a separate GDI surface.
+The native title bar retains its existing caption color and Windows controls.
+
+`background-blur` requests untinted blur-behind when configured opacity is below
+1, leaving the theme's background color and `background-opacity` to supply the
+tint. This uses the checked, undocumented Windows accent API. If that request
+fails, Ghostty warns and tries Desktop Acrylic, whose additional tint is
+OS-controlled and can look brighter.
+`false` or `0` disables blur. `true` or any positive integer enables it; values
+such as `20` and `50` do not select different blur strengths on Windows.
+Windows controls the blur radius, and accessibility or power policy can
+suppress the effect. Unavailable blur APIs produce a warning rather than a
+software substitute.
+
 ## Architecture
 
 The Windows port adds a `win32` application runtime (`src/apprt/win32/`) alongside the existing GTK (Linux) and AppKit (macOS) runtimes. It reuses Ghostty's cross-platform core:
 
 - **Terminal emulation**: Shared VT parser, screen, scrollback (`src/terminal/`)
-- **Rendering**: OpenGL 4.3+ with WGL context management (`src/renderer/`)
+- **Rendering**: OpenGL 4.3+ with WGL context management and hardware DirectComposition presentation (`src/renderer/`)
 - **Fonts**: FreeType rasterization + HarfBuzz shaping + DirectWrite discovery (`src/font/`)
 - **PTY**: Windows ConPTY via `CreatePseudoConsole` (`src/pty.zig`)
 - **I/O**: libxev with IOCP backend (`src/termio/`)
@@ -577,6 +607,28 @@ dark translucent, and light fixtures exercise tab creation, keyboard and mouse
 selection, independent PTY input, right-side closing, and inline title editing.
 JSON results, app logs, and native window captures are saved in the output
 directory. Blur is disabled in these fixtures; this is not a compositing test.
+The native composition regression uses PowerShell 7 and an idle interactive
+desktop. It sends input messages only to validated test-owned HWNDs, without
+global keyboard/mouse injection or foreground requests. Its non-activating
+backdrop and app windows form an owned capture scene; screenshots are actual
+desktop-composited pixels, not PrintWindow output.
+
+```powershell
+pwsh.exe -NoProfile -File test/win32/test_composition.ps1 `
+  -ExePath "$PWD/zig-out/bin/ghostty.exe" `
+  -ResourcesPath "$PWD/zig-out/share/ghostty" `
+  -OutputDirectory "$env:TEMP/ghostty-composition-proof" -Case all
+```
+
+Use `-Case opacity`, `blur`, `chrome`, `creation`, or `lifecycle` for focused checks.
+The harness `toggle_opacity` case invokes the same native opacity regression.
+The fixtures disable resize overlays and update notifications, preserve the
+personal configuration, and reject obscured or focus-changing captures.
+The `chrome` case checks translucent tab backgrounds, opaque labels and title
+editing, dark/light reloads, and live tab-strip blur. Creation traces cover the
+incoming frame's actual reveal, with terminal-edge, interior, stable tab-chrome,
+and independent-session input assertions.
+PNG/JSON evidence and app logs are saved in the output directory.
 
 The PowerShell integration regression test captures VT output in memory and
 needs neither a GUI nor the app binary. Run from the repository root in Windows:

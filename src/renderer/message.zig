@@ -42,6 +42,9 @@ pub const Message = union(enum) {
         old_key: font.SharedGridSet.Key,
     },
 
+    /// Override the configured background opacity for this renderer.
+    background_opacity_override: ?f64,
+
     /// Changes the size. The screen size might change, padding, grid, etc.
     resize: renderer.Size,
 

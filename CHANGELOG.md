@@ -51,6 +51,19 @@ The README compatibility table and roadmap track the remaining gaps.
 - Parse native OpenSSH CRLF destination reports correctly and omit Unix
   socket multiplexing options on Windows during terminfo installation.
 - Update all Windows executable version resources to 1.4.0.0.
+- Apply background opacity through GPU-backed DirectComposition, preserving
+  opaque text, cursors, explicit cell backgrounds, dividers, and title editors.
+- Propagate opacity reloads and forced-opaque toggles across hidden tabs,
+  splits, detached tabs, new windows, and the quick terminal.
+- Share terminal opacity and blur with the tab strip while keeping labels and
+  controls opaque; hide and move the strip with its owning window.
+- Prefer untinted Windows blur-behind so dark themes avoid Desktop Acrylic's
+  added wash. Check API failures and retain OS-tinted Acrylic as a fallback.
+  Positive numeric blur values request the same OS-controlled blur radius.
+- Retain outgoing tab content until the incoming GPU frame is presented at
+  its final client extent, then switch child-window visibility together.
+- Recover failed composition frames through the existing bounded WGL
+  context-recovery path, with an opaque fallback for unsupported interop.
 - Honor read-only mode for Win32 keyboard and IME input packets.
 - Preserve search, command-palette, and link-preview window ownership when
   detaching tabs, and keep popup destruction from invalidating a live terminal.
@@ -109,6 +122,8 @@ The README compatibility table and roadmap track the remaining gaps.
   PowerShell prompt-injection coverage.
 - Automatically prune stale development cache entries before compilation
   under a build guard, and warn about local cache growth on development builds.
+- Add an HWND-scoped native composition regression using desktop pixel
+  captures for opacity, blur, tab transitions, and window lifecycle behavior.
 - Add focused input and popup-lifetime regressions, and extend the bounded
   reply-feedback test to glyph and clipboard replies without clipboard access.
 - Add the phased Windows feature roadmap with explicit completion criteria

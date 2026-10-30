@@ -413,8 +413,9 @@ fn drainMailbox(self: *Thread) !void {
             },
 
             .presentation_health => |v| self.renderer.setPresentationHealth(v),
-
             .resize => |v| self.renderer.setScreenSize(v),
+
+            .background_opacity_override => |v| self.renderer.setBackgroundOpacityOverride(v),
 
             .change_config => |config| {
                 defer config.alloc.destroy(config.thread);
@@ -507,13 +508,6 @@ fn drawFrame(self: *Thread, now: bool) void {
                 self.unhealthy_frames = 0;
             }
         }
-    }
-
-    // Signal the apprt that a frame has been presented. On Win32
-    // this wakes the main thread if it's blocking in handleResize
-    // during live window resize.
-    if (comptime @hasDecl(apprt.Surface, "signalFrameDrawn")) {
-        self.surface.signalFrameDrawn();
     }
 }
 

@@ -18,20 +18,15 @@
 //!     texture (the blit copies the already-sRGB-encoded pixel values
 //!     verbatim) and export that instead.
 const Self = @This();
-
 const std = @import("std");
-const Allocator = std.mem.Allocator;
+
 const gl = @import("opengl");
 const egl = gl.egl;
 const Dmabuf = @import("../Dmabuf.zig");
-
 const log = std.log.scoped(.opengl);
 
-/// Options for initializing a Target
 pub const Options = struct {
-    /// Desired width
     width: usize,
-    /// Desired height
     height: usize,
 };
 
@@ -49,7 +44,6 @@ export_framebuffer: gl.Framebuffer,
 
 /// Current width of this target.
 width: usize,
-/// Current height of this target.
 height: usize,
 
 pub fn init(opts: Options) !Self {

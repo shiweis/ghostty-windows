@@ -701,6 +701,14 @@ pub fn add(
             .win32 => {
                 // Link Windows system libraries for Win32 runtime
                 if (step.rootModuleTarget().os.tag == .windows) {
+                    step.root_module.addCSourceFiles(.{
+                        .files = &.{"src/apprt/win32/composition.c"},
+                        .language = .cpp,
+                        .flags = &.{ "-fno-exceptions", "-fno-rtti" },
+                    });
+                    step.root_module.linkSystemLibrary("d3d11", .{});
+                    step.root_module.linkSystemLibrary("dxgi", .{});
+                    step.root_module.linkSystemLibrary("dcomp", .{});
                     step.root_module.linkSystemLibrary("opengl32", .{});
                     step.root_module.linkSystemLibrary("gdi32", .{});
                     step.root_module.linkSystemLibrary("user32", .{});

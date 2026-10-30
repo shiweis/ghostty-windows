@@ -20,6 +20,8 @@ const Scrollbar = @import("Scrollbar.zig").Scrollbar;
 
 const log = std.log.scoped(.win32);
 
+pub const WM_OPAQUE_PRESENTATION_FALLBACK = w32.WM_APP + 20;
+
 /// The Win32 window handle.
 hwnd: ?w32.HWND = null,
 
@@ -42,6 +44,7 @@ app: *App,
 
 /// The parent Window that contains this Surface as a tab.
 parent_window: *Window = undefined,
+transparency_supported: bool = false,
 
 /// Last title reported by the core for getTitle/copy-title consumers.
 title_len: usize = 0,
@@ -96,6 +99,16 @@ in_live_resize: bool = false,
 /// a frame. The main thread waits on this during live resize to
 /// synchronize rendering with the DWM compositor.
 frame_event: ?w32.HANDLE = null,
+
+/// Renderer-to-UI handshake for switching an unsupported compositor to an
+/// opaque child window after the renderer has released its WGL context.
+opaque_transition_event: ?w32.HANDLE = null,
+opaque_fallback_requested: std.atomic.Value(bool) = .init(false),
+opaque_transition_succeeded: std.atomic.Value(bool) = .init(false),
+opaque_transition_cancelled: std.atomic.Value(bool) = .init(false),
+
+/// Last successfully presented client extent, published by the renderer.
+presented_size: std.atomic.Value(u64) = .init(0),
 
 /// Themed scrollbar (custom layered-popup overlay).
 /// Created lazily after the surface HWND exists.
@@ -234,17 +247,29 @@ pub fn initWithOptions(
     self.* = .{
         .app = app,
         .parent_window = parent,
+        .transparency_supported = parent.transparency_supported,
     };
 
     // Create a manual-reset event for synchronizing resize with the
     // renderer thread. Manual-reset so we control exactly when it's reset.
     self.frame_event = w32.CreateEventW(null, 1, 0, null);
+    if (self.frame_event == null) return error.Win32Error;
+    errdefer if (self.frame_event) |event| {
+        _ = w32.CloseHandle(event);
+        self.frame_event = null;
+    };
+    self.opaque_transition_event = w32.CreateEventW(null, 1, 0, null);
+    if (self.opaque_transition_event == null) return error.Win32Error;
+    errdefer if (self.opaque_transition_event) |event| {
+        _ = w32.CloseHandle(event);
+        self.opaque_transition_event = null;
+    };
 
     // Create a WS_CHILD window inside the parent Window container.
     const parent_hwnd = parent.hwnd orelse return error.Win32Error;
     const sr = parent.surfaceRect();
     const hwnd = w32.CreateWindowExW(
-        0,
+        if (parent.transparency_supported) w32.WS_EX_NOREDIRECTIONBITMAP else 0,
         App.TERMINAL_CLASS_NAME,
         std.unicode.utf8ToUtf16LeStringLiteral(""),
         w32.WS_CHILD,
@@ -259,7 +284,7 @@ pub fn initWithOptions(
     ) orelse return error.Win32Error;
     self.hwnd = hwnd;
     errdefer {
-        _ = w32.DestroyWindow(hwnd);
+        if (self.hwnd) |owned| _ = w32.DestroyWindow(owned);
         self.hwnd = null;
     }
 
@@ -276,7 +301,7 @@ pub fn initWithOptions(
     self.hdc = w32.GetDC(hwnd);
     if (self.hdc == null) return error.Win32Error;
     errdefer {
-        _ = w32.ReleaseDC(hwnd, self.hdc.?);
+        if (self.hwnd) |owned| _ = w32.ReleaseDC(owned, self.hdc.?);
         self.hdc = null;
     }
 
@@ -302,13 +327,12 @@ pub fn initWithOptions(
         self.scale,
     });
 
-    // Show the child window before initializing the core surface.
-    // core_surface.init() spawns ConPTY + cmd.exe which needs the
-    // window to be visible and have valid dimensions. On the old
-    // top-level architecture, ShowWindow was called in createWindow()
-    // before core_surface.init(). We must preserve that order.
-    _ = w32.ShowWindow(hwnd, w32.SW_SHOW);
-    _ = w32.UpdateWindow(hwnd);
+    // Keep additional children hidden during core initialization so they
+    // cannot obscure the outgoing tab before its owner prepares a frame.
+    if (parent.tab_count == 0) {
+        _ = w32.ShowWindow(hwnd, w32.SW_SHOW);
+        _ = w32.UpdateWindow(hwnd);
+    }
 
     // --- Core terminal surface initialization ---
     const alloc = app.core_app.alloc;
@@ -359,8 +383,118 @@ pub fn initWithOptions(
     self.core_surface_ready = true;
     self.core_surface_initialized = true;
 }
+/// Queue the UI transition for context recovery after it releases WGL.
+pub fn requestOpaquePresentation(self: *Surface) void {
+    self.opaque_fallback_requested.store(true, .release);
+}
+pub fn cancelOpaquePresentationFallback(self: *Surface) void {
+    self.opaque_fallback_requested.store(false, .release);
+    self.opaque_transition_succeeded.store(false, .release);
+    self.opaque_transition_cancelled.store(true, .release);
+    if (self.opaque_transition_event) |event| _ = w32.SetEvent(event);
+}
+
+/// Complete the fallback request on the UI thread, then release the renderer.
+pub fn completeOpaquePresentationFallback(self: *Surface) void {
+    self.opaque_transition_succeeded.store(false, .release);
+    self.parent_window.native_composition_failed = true;
+    self.parent_window.transparency_supported = false;
+    self.prepareOpaquePresentation() catch |err| {
+        log.err("opaque presentation fallback failed: {}", .{err});
+        self.parent_window.refreshOpacity();
+        if (self.opaque_transition_event) |event| _ = w32.SetEvent(event);
+        return;
+    };
+    self.parent_window.refreshOpacity();
+    self.opaque_transition_succeeded.store(true, .release);
+    if (self.opaque_transition_event) |event| _ = w32.SetEvent(event);
+}
+
+/// Replace the child HWND with a redirected one while the renderer is unbound.
+pub fn prepareOpaquePresentation(self: *Surface) !void {
+    const old_hwnd = self.hwnd orelse return error.Win32Error;
+    const old_hdc = self.hdc orelse return error.Win32Error;
+    const parent = self.parent_window.hwnd orelse return error.Win32Error;
+    const was_visible = w32.GetWindowLongW(old_hwnd, w32.GWL_STYLE) & w32.WS_VISIBLE_STYLE != 0;
+
+    const pixel_format = w32.GetPixelFormat(old_hdc);
+    if (pixel_format == 0) return error.Win32Error;
+    var pfd: w32.PIXELFORMATDESCRIPTOR = undefined;
+    if (w32.DescribePixelFormat(old_hdc, pixel_format, @sizeOf(w32.PIXELFORMATDESCRIPTOR), &pfd) == 0)
+        return error.Win32Error;
+
+    var rect: w32.RECT = undefined;
+    if (w32.GetWindowRect(old_hwnd, &rect) == 0) return error.Win32Error;
+    var points = [2]w32.POINT{
+        .{ .x = rect.left, .y = rect.top },
+        .{ .x = rect.right, .y = rect.bottom },
+    };
+    w32.SetLastError(0);
+    if (w32.MapWindowPoints(null, parent, &points[0], 2) == 0 and
+        std.os.windows.GetLastError() != .SUCCESS)
+        return error.Win32Error;
+
+    const replacement = w32.CreateWindowExW(
+        0,
+        App.TERMINAL_CLASS_NAME,
+        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        w32.WS_CHILD,
+        points[0].x,
+        points[0].y,
+        @max(points[1].x - points[0].x, 1),
+        @max(points[1].y - points[0].y, 1),
+        parent,
+        null,
+        self.app.hinstance,
+        null,
+    ) orelse return error.Win32Error;
+    errdefer _ = w32.DestroyWindow(replacement);
+
+    const new_hdc = w32.GetDC(replacement) orelse return error.Win32Error;
+    errdefer _ = w32.ReleaseDC(replacement, new_hdc);
+    if (w32.SetPixelFormat(new_hdc, pixel_format, &pfd) == 0) return error.Win32Error;
+    const userdata: isize = @bitCast(@intFromPtr(self));
+    _ = w32.SetWindowLongPtrW(replacement, w32.GWLP_USERDATA, userdata);
+    if (w32.GetWindowLongPtrW(replacement, w32.GWLP_USERDATA) != userdata)
+        return error.Win32Error;
+
+    if (self.scrollbar) |sb| {
+        if (w32.SetWindowLongPtrW(
+            sb.hwnd,
+            w32.GWLP_HWNDPARENT,
+            @bitCast(@intFromPtr(replacement)),
+        ) == 0) return error.Win32Error;
+        sb.owner = replacement;
+    }
+
+    _ = w32.DragAcceptFiles(replacement, 1);
+    self.hwnd = replacement;
+    self.hdc = new_hdc;
+    self.parent_window.surfaceHwndReplaced(old_hwnd, replacement);
+    if (was_visible) {
+        _ = w32.ShowWindow(replacement, w32.SW_SHOW);
+        _ = w32.UpdateWindow(replacement);
+    }
+    self.updateDpiScale();
+    self.updateClientSize();
+    self.transparency_supported = false;
+    _ = w32.SetWindowLongPtrW(old_hwnd, w32.GWLP_USERDATA, 0);
+    _ = w32.ReleaseDC(old_hwnd, old_hdc);
+    _ = w32.DestroyWindow(old_hwnd);
+}
+
+/// Read mutable native presentation state on the UI thread before sending a renderer snapshot.
+pub fn backgroundOpacityOverride(self: *const Surface) ?f64 {
+    if (self.parent_window.opacity_mode == .forced_opaque or
+        !self.parent_window.transparency_supported or !self.transparency_supported)
+    {
+        return 1;
+    }
+    return null;
+}
 
 pub fn deinit(self: *Surface) void {
+    self.cancelOpaquePresentationFallback();
     log.debug("surface deinit: start addr={x}", .{@intFromPtr(self)});
 
     if (self.core_surface_initialized) {
@@ -385,6 +519,10 @@ pub fn deinit(self: *Surface) void {
     if (self.frame_event) |event| {
         _ = w32.CloseHandle(event);
         self.frame_event = null;
+    }
+    if (self.opaque_transition_event) |event| {
+        _ = w32.CloseHandle(event);
+        self.opaque_transition_event = null;
     }
     log.debug("surface deinit: frame_event closed", .{});
 
@@ -519,23 +657,29 @@ pub fn renderDeviceOptions(_: *Surface) !@import("../../renderer.zig").Device.Op
     return .{};
 }
 
-/// Recreate the WGL context after GPU context loss (driver reset/TDR)
-/// and make it current. Renderer-thread only: the GUI thread touches
-/// hdc/hglrc only before the renderer thread spawns (init) and after
-/// it is joined (deinit), so there is no race. We do NOT re-run
-/// setupPixelFormat: SetPixelFormat is once-per-window and the
-/// CS_OWNDC device context keeps its format.
+/// Recreate the WGL context after context loss. The renderer thread owns this
+/// call; fallback HWND replacement is acknowledged by the UI before HDC reuse.
 pub fn recreateGLContext(self: *Surface) !void {
+    if (self.opaque_fallback_requested.swap(false, .acq_rel)) {
+        const hwnd = self.hwnd orelse return error.Win32Error;
+        const event = self.opaque_transition_event orelse return error.Win32Error;
+        _ = w32.ResetEvent(event);
+        if (self.opaque_transition_cancelled.load(.acquire))
+            return error.OpaquePresentationFallbackCancelled;
+        self.opaque_transition_succeeded.store(false, .release);
+        if (w32.PostMessageW(hwnd, WM_OPAQUE_PRESENTATION_FALLBACK, 0, 0) == 0)
+            return error.Win32Error;
+        if (w32.WaitForSingleObject(event, 5000) != w32.WAIT_OBJECT_0)
+            return error.OpaquePresentationFallbackTimeout;
+        if (!self.opaque_transition_succeeded.load(.acquire))
+            return error.OpaquePresentationFallbackFailed;
+    }
+
     const hdc = self.hdc orelse return error.Win32Error;
-
-    // Create the new context before deleting the old one so a failed
-    // allocation does not discard the surface's last context handle.
     const new = w32.wglCreateContext(hdc) orelse return error.Win32Error;
-
     _ = w32.wglMakeCurrent(null, null);
     if (self.hglrc) |old| _ = w32.wglDeleteContext(old);
     self.hglrc = new;
-
     if (w32.wglMakeCurrent(hdc, new) == 0) return error.Win32Error;
 }
 
@@ -3313,10 +3457,25 @@ test "Win32 Input Mode preserves translated text without replaying physical keys
     try Native.expect(surface, &.{});
 }
 
-/// Called by the renderer thread after SwapBuffers to signal that a
-/// frame has been presented. Wakes the main thread if it's blocking
-/// in handleResize during live resize.
-pub fn signalFrameDrawn(self: *Surface) void {
+pub fn invalidatePresentedFrame(self: *Surface) void {
+    self.presented_size.store(0, .release);
+}
+
+/// Called on the UI thread after laying out a hidden tab.
+pub fn hasPresentedFrame(self: *const Surface) bool {
+    const hwnd = self.hwnd orelse return false;
+    var rect: w32.RECT = undefined;
+    if (w32.GetClientRect(hwnd, &rect) == 0 or
+        rect.right <= rect.left or rect.bottom <= rect.top) return false;
+    // GPU targets span the HWND client; the grid can reserve a scrollbar gutter.
+    const extent = (@as(u64, @intCast(rect.right - rect.left)) << 32) |
+        @as(u32, @intCast(rect.bottom - rect.top));
+    return self.presented_size.load(.acquire) == extent;
+}
+
+/// Publish only an actual successful present, not a skipped draw attempt.
+pub fn signalFrameDrawn(self: *Surface, width: u32, height: u32) void {
+    self.presented_size.store((@as(u64, width) << 32) | height, .release);
     if (self.frame_event) |event| {
         _ = w32.SetEvent(event);
     }

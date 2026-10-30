@@ -141,9 +141,13 @@ try {
     } 'test window startup'
     function Surfaces { [OverviewTest]::Find('GhosttyTerminal', $window, $false) }
     function Active-Surface {
-        $found = [OverviewTest]::Find('GhosttyTerminal', $window, $true)
-        if ($found.Count -ne 1) { throw 'Expected one visible unsplit surface' }
-        return $found[0]
+        $script:activeSurface = [IntPtr]::Zero
+        Wait-For {
+            $found = [OverviewTest]::Find('GhosttyTerminal', $window, $true)
+            if ($found.Count -eq 1) { $script:activeSurface = $found[0]; return $true }
+            return $false
+        } 'one visible unsplit surface after presentation'
+        return $script:activeSurface
     }
     function Open-Overview {
         [OverviewTest]::Key((Active-Surface), 0x79) # F10, test-only binding

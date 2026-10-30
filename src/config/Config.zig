@@ -1054,6 +1054,9 @@ palette: Palette = .{},
 ///
 /// On X11, blur can only be enabled when using the KWin compositor
 /// as a part of KDE Plasma.
+///
+/// On Windows, numeric intensity is ignored: any positive integer or `true`
+/// enables the same OS-controlled blur material.
 @"background-blur": BackgroundBlur = .false,
 
 /// The opacity level (opposite of transparency) of an unfocused split.

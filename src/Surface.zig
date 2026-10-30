@@ -559,8 +559,8 @@ pub fn init(
         &derived_config.font,
         font_size,
     );
-    errdefer app.font_grid_set.deref(font_grid_key);
-
+    var font_grid_transferred = false;
+    errdefer if (!font_grid_transferred) app.font_grid_set.deref(font_grid_key);
     // Build our size struct which has all the sizes we need.
     const size: rendererpkg.Size = size: {
         var size: rendererpkg.Size = .{
@@ -677,6 +677,7 @@ pub fn init(
         // lets us get the most likely correct color theme and so on.
         .config_conditional_state = app.config_conditional_state,
     };
+    font_grid_transferred = true;
 
     log.debug("state stored, initializing IO...", .{});
 
@@ -2793,6 +2794,19 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
 
     // Schedule render which also drains our mailbox
     self.queueRender() catch unreachable;
+}
+
+pub fn setBackgroundOpacityOverride(self: *Surface, value: ?f64) !void {
+    if (self.renderer_thread.mailbox.push(
+        global.io(),
+        .{ .background_opacity_override = value },
+        .{ .ns = mailbox_timeout_ns },
+    ) == 0) {
+        self.queueRender() catch {};
+        return error.RendererMailboxFull;
+    }
+
+    try self.queueRender();
 }
 
 /// This queues a render operation with the renderer thread. The render

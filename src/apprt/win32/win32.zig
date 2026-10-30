@@ -87,14 +87,14 @@ pub const CS_DBLCLKS: u32 = 0x0008;
 // Window styles
 pub const WS_OVERLAPPEDWINDOW: u32 = 0x00CF0000;
 pub const WS_POPUP: u32 = 0x80000000;
-pub const WS_CAPTION: u32 = 0x00C00000;
+pub const WS_CLIPCHILDREN: u32 = 0x02000000;
 pub const WS_THICKFRAME: u32 = 0x00040000;
+pub const WS_CAPTION: u32 = 0x00C00000;
 
 // Extended window styles
 pub const WS_EX_LAYERED: u32 = 0x00080000;
 pub const WS_EX_TOOLWINDOW: u32 = 0x00000080;
-
-// Layered window flags
+pub const WS_EX_NOREDIRECTIONBITMAP: u32 = 0x00200000;
 pub const LWA_ALPHA: u32 = 0x00000002;
 
 // Window long indices
@@ -105,7 +105,9 @@ pub const GWL_EXSTYLE: i32 = -20;
 pub const SWP_NOSIZE: u32 = 0x0001;
 pub const SWP_NOMOVE: u32 = 0x0002;
 pub const SWP_NOZORDER: u32 = 0x0004;
+pub const SWP_NOOWNERZORDER: u32 = 0x0200;
 pub const SWP_FRAMECHANGED: u32 = 0x0020;
+pub const SWP_HIDEWINDOW: u32 = 0x0080;
 
 // MonitorFromWindow flags
 pub const MONITOR_DEFAULTTONEAREST: u32 = 0x00000002;
@@ -132,6 +134,7 @@ pub const SIZE_RESTORED: usize = 0;
 pub const SIZE_MINIMIZED: usize = 1;
 pub const SIZE_MAXIMIZED: usize = 2;
 pub const WM_MOVE: u32 = 0x0003;
+pub const WM_WINDOWPOSCHANGED: u32 = 0x0047;
 pub const WM_SETFOCUS: u32 = 0x0007;
 pub const WM_KILLFOCUS: u32 = 0x0008;
 pub const WM_GETOBJECT: u32 = 0x003D;
@@ -142,8 +145,10 @@ pub const WM_GETOBJECT: u32 = 0x003D;
 /// Typed as isize so it compares cleanly with the LPARAM the WindowProc
 /// receives.
 pub const OBJID_CLIENT: isize = -4;
+pub const WM_DWMCOMPOSITIONCHANGED: u32 = 0x031E;
 pub const WM_ERASEBKGND: u32 = 0x0014;
 pub const WM_PAINT: u32 = 0x000F;
+pub const WM_NCHITTEST: u32 = 0x0084;
 pub const WM_TIMER: u32 = 0x0113;
 pub const WM_ENTERSIZEMOVE: u32 = 0x0231;
 pub const WM_EXITSIZEMOVE: u32 = 0x0232;
@@ -175,6 +180,7 @@ pub const WM_DPICHANGED: u32 = 0x02E0;
 
 // WM_SETCURSOR hit-test values
 pub const HTCLIENT: u16 = 1;
+pub const HTTRANSPARENT: i16 = -1;
 
 // IME messages
 pub const WM_IME_STARTCOMPOSITION: u32 = 0x010D;
@@ -316,16 +322,6 @@ pub const IDI_APPLICATION: usize = 32512;
 /// Resource ID of the application icon (matches ID_ICON_GHOSTTY in
 /// dist/windows/ghostty.rc).
 pub const IDI_GHOSTTY: usize = 1;
-
-// SetClassLongPtrW indices (used to swap the class-level background
-// brush after a config or OSC color change).
-pub const GCLP_HBRBACKGROUND: i32 = -10;
-
-pub extern "user32" fn SetClassLongPtrW(
-    hWnd: HWND,
-    nIndex: i32,
-    dwNewLong: isize,
-) callconv(.winapi) isize;
 
 pub extern "user32" fn LoadIconW(
     hInstance: ?HINSTANCE,
@@ -571,10 +567,33 @@ pub extern "user32" fn SetWindowPos(
     uFlags: u32,
 ) callconv(.winapi) i32;
 
+pub const HDWP = *opaque {};
+pub extern "user32" fn BeginDeferWindowPos(count: i32) callconv(.winapi) ?HDWP;
+pub extern "user32" fn DeferWindowPos(batch: HDWP, hwnd: HWND, after: ?HWND, x: i32, y: i32, width: i32, height: i32, flags: u32) callconv(.winapi) ?HDWP;
+pub extern "user32" fn EndDeferWindowPos(batch: HDWP) callconv(.winapi) i32;
+
+pub extern "user32" fn SetLayeredWindowAttributes(
+    hwnd: HWND,
+    color_key: u32,
+    alpha: u8,
+    flags: u32,
+) callconv(.winapi) i32;
+
 pub extern "user32" fn GetWindowRect(
     hWnd: HWND,
     lpRect: *RECT,
 ) callconv(.winapi) i32;
+pub const GW_HWNDPREV: u32 = 3;
+pub extern "user32" fn GetWindow(hwnd: HWND, command: u32) callconv(.winapi) ?HWND;
+pub const WINDOWPOS = extern struct {
+    hwnd: HWND,
+    hwndInsertAfter: ?HWND,
+    x: i32,
+    y: i32,
+    cx: i32,
+    cy: i32,
+    flags: u32,
+};
 
 pub extern "user32" fn MonitorFromWindow(
     hwnd: HWND,
@@ -672,26 +691,6 @@ pub extern "shell32" fn ShellExecuteW(
     nShowCmd: i32,
 ) callconv(.winapi) isize;
 
-pub extern "user32" fn SetLayeredWindowAttributes(
-    hwnd: HWND,
-    crKey: u32,
-    bAlpha: u8,
-    dwFlags: u32,
-) callconv(.winapi) i32;
-
-// RedrawWindow — needed after clearing WS_EX_LAYERED: the style change is
-// not repainted automatically (see "Layered Windows" in the Win32 docs).
-pub const RDW_INVALIDATE: u32 = 0x0001;
-pub const RDW_ERASE: u32 = 0x0004;
-pub const RDW_ALLCHILDREN: u32 = 0x0080;
-pub const RDW_FRAME: u32 = 0x0400;
-pub extern "user32" fn RedrawWindow(
-    hWnd: ?HWND,
-    lprcUpdate: ?*const RECT,
-    hrgnUpdate: ?*anyopaque,
-    flags: u32,
-) callconv(.winapi) i32;
-
 pub extern "user32" fn SetTimer(
     hWnd: ?HWND,
     nIDEvent: usize,
@@ -732,6 +731,7 @@ pub extern "kernel32" fn WaitForSingleObject(
     hHandle: HANDLE,
     dwMilliseconds: u32,
 ) callconv(.winapi) u32;
+pub extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 
 pub extern "kernel32" fn CloseHandle(
     hObject: HANDLE,
@@ -1166,12 +1166,43 @@ pub extern "dwmapi" fn DwmSetWindowAttribute(
     cbAttribute: u32,
 ) callconv(.winapi) i32;
 
+pub const DWMWA_SYSTEMBACKDROP_TYPE: u32 = 38;
+pub const DWMSBT_NONE: u32 = 1;
+pub const DWMSBT_TRANSIENTWINDOW: u32 = 3;
+
+pub const HRGN = *opaque {};
+pub extern "dwmapi" fn DwmIsCompositionEnabled(enabled: *BOOL) callconv(.winapi) HRESULT;
+pub extern "gdi32" fn CreateRectRgn(left: i32, top: i32, right: i32, bottom: i32) callconv(.winapi) ?HRGN;
+pub const RGN_OR: i32 = 2;
+pub const RGN_DIFF: i32 = 4;
+pub extern "gdi32" fn CombineRgn(dest: HRGN, src1: HRGN, src2: HRGN, mode: i32) callconv(.winapi) i32;
+pub extern "user32" fn SetWindowRgn(hwnd: HWND, region: ?HRGN, redraw: i32) callconv(.winapi) i32;
+pub extern "user32" fn MapWindowPoints(from: ?HWND, to: ?HWND, points: *POINT, count: u32) callconv(.winapi) i32;
+pub extern "kernel32" fn SetLastError(code: u32) callconv(.winapi) void;
+pub extern "gdi32" fn GdiFlush() callconv(.winapi) i32;
+pub extern "gdi32" fn StretchDIBits(
+    hdc: HDC,
+    xDest: i32,
+    yDest: i32,
+    destWidth: i32,
+    destHeight: i32,
+    xSrc: i32,
+    ySrc: i32,
+    srcWidth: i32,
+    srcHeight: i32,
+    bits: *const anyopaque,
+    info: *const BITMAPINFO,
+    usage: u32,
+    rop: u32,
+) callconv(.winapi) i32;
+
 // -----------------------------------------------------------------------
 // GDI double-buffered painting API
 // -----------------------------------------------------------------------
 
 pub extern "gdi32" fn CreateCompatibleDC(hdc: ?HDC) callconv(.winapi) ?HDC;
-pub extern "gdi32" fn CreateCompatibleBitmap(hdc: HDC, cx: i32, cy: i32) callconv(.winapi) ?*anyopaque;
+pub extern "gdi32" fn CreateCompatibleBitmap(hdc: HDC, width: i32, height: i32) callconv(.winapi) ?*anyopaque;
+
 pub extern "gdi32" fn SelectObject(hdc: HDC, h: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 pub extern "gdi32" fn DeleteDC(hdc: HDC) callconv(.winapi) i32;
 pub extern "gdi32" fn BitBlt(hdcDest: HDC, x: i32, y: i32, cx: i32, cy: i32, hdcSrc: HDC, x1: i32, y1: i32, rop: u32) callconv(.winapi) i32;
@@ -1179,9 +1210,6 @@ pub extern "gdi32" fn BitBlt(hdcDest: HDC, x: i32, y: i32, cx: i32, cy: i32, hdc
 // declaration on gdi32 worked only because user32 was linked anyway.
 pub extern "user32" fn DrawTextW(hdc: HDC, lpchText: [*]const u16, cchText: i32, lprc: *RECT, format: u32) callconv(.winapi) i32;
 pub extern "gdi32" fn SetBkMode(hdc: HDC, mode: i32) callconv(.winapi) i32;
-pub extern "gdi32" fn CreatePen(iStyle: i32, cWidth: i32, color: u32) callconv(.winapi) ?*anyopaque;
-pub extern "gdi32" fn MoveToEx(hdc: HDC, x: i32, y: i32, lppt: ?*anyopaque) callconv(.winapi) i32;
-pub extern "gdi32" fn LineTo(hdc: HDC, x: i32, y: i32) callconv(.winapi) i32;
 
 pub extern "user32" fn BeginPaint(hwnd: HWND, lpPaint: *PAINTSTRUCT) callconv(.winapi) ?HDC;
 pub extern "user32" fn EndPaint(hwnd: HWND, lpPaint: *const PAINTSTRUCT) callconv(.winapi) i32;
@@ -1209,6 +1237,14 @@ pub extern "gdi32" fn ChoosePixelFormat(
     ppfd: *const PIXELFORMATDESCRIPTOR,
 ) callconv(.winapi) i32;
 
+pub extern "gdi32" fn GetPixelFormat(hdc: HDC) callconv(.winapi) i32;
+
+pub extern "gdi32" fn DescribePixelFormat(
+    hdc: HDC,
+    format: i32,
+    bytes: u32,
+    pfd: ?*PIXELFORMATDESCRIPTOR,
+) callconv(.winapi) i32;
 pub extern "gdi32" fn SetPixelFormat(
     hdc: HDC,
     format: i32,
