@@ -130,8 +130,8 @@ PowerShell prompt injection, and hidden-window visibility. See the
 - Drag a file from Explorer onto the terminal to paste its path
 - Visual bell (taskbar flash) when BEL fires on an unfocused window
 - Taskbar flash when a command exits non-zero in an unfocused window
-- Confirm-close dialog when a programmatic close hits a tab with a
-  running command
+- Confirm-close dialogs for running commands, including tab-strip X and
+  middle-click closes; a tab close checks every split and confirms once
 - Auto-update check against GitHub releases (rate-limited to once per
   hour); clicking the "Update available" balloon opens the releases
   page in your browser
@@ -311,6 +311,7 @@ All keybindings are configurable via the `keybind` config option. These are the 
 | Move tab left | `Ctrl+Shift+Page Up` |
 | Move tab right | `Ctrl+Shift+Page Down` |
 | Drag reorder | Mouse drag on tab |
+| Close tab and its splits | Middle-click tab or click its X button |
 | Rename tab | Double-click tab |
 | Tab context menu | Right-click tab |
 

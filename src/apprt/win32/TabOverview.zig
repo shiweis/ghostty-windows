@@ -331,7 +331,7 @@ fn closeSelection(self: *TabOverview) void {
     self.hide(true);
     // Confirmation pumps messages and may destroy owner/self. Do not access
     // either after handing off; Window re-resolves the surface after a dialog.
-    owner.requestCloseOverviewTab(id);
+    owner.requestCloseTab(id);
 }
 
 pub fn ownsInput(self: *const TabOverview, hwnd: w32.HWND) bool {

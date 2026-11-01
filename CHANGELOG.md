@@ -30,6 +30,9 @@ The README compatibility table and roadmap track the remaining gaps.
 
 ### Windows Fixes and Adaptations
 
+- Close a tab and all its splits with a middle-button press on the tab strip,
+  without selecting inactive tabs first. Use the existing split-aware close
+  confirmation for both middle-click and the tab's X button.
 - Restyle the standalone tab strip with equal-width tabs, centered Segoe UI
   titles, theme-derived selection colors, and right-side hover close buttons.
   Keep the native Windows caption and separate tab row.
