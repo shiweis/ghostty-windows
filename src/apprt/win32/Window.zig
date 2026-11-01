@@ -518,7 +518,8 @@ pub fn requestToggleTabOverview(self: *Window) bool {
 }
 
 /// Close every split in the selected tab, confirming once if any needs it.
-pub fn requestCloseOverviewTab(self: *Window, id: u64) void {
+pub fn requestCloseTab(self: *Window, id: u64) void {
+    if (self.closing) return;
     const index = TabOverview.findTab(self, id) orelse return;
     var it = self.tab_trees[index].iterator();
     var needs_confirmation = false;
@@ -1804,7 +1805,9 @@ fn handleTabBarClick(self: *Window, x: i16, y: i16) void {
         if (x >= rect.left and x < rect.right) {
             const close_rect = self.tabCloseRect(rect);
             if (x >= close_rect.left and x < close_rect.right and y >= close_rect.top and y < close_rect.bottom) {
-                self.closeTabByIndex(i);
+                const surface = self.tab_active_surface[i];
+                if (!surface.core_surface_ready) return;
+                self.requestCloseTab(surface.core_surface.id);
             } else {
                 self.selectTabIndex(i);
                 // Start tracking potential tab drag
@@ -1814,6 +1817,21 @@ fn handleTabBarClick(self: *Window, x: i16, y: i16) void {
                 if (self.hwnd) |h| _ = w32.SetCapture(h);
                 self.invalidateTabBar();
             }
+            return;
+        }
+    }
+}
+
+fn handleTabBarMiddleClick(self: *Window, x: i16, y: i16) void {
+    if (self.closing or !self.tab_bar_visible or y < 0 or y >= self.tabBarHeight()) return;
+    const new_tab = self.new_tab_rect;
+    if (x >= new_tab.left and x < new_tab.right and y >= new_tab.top and y < new_tab.bottom) return;
+
+    for (self.tab_rects[0..self.tab_count], 0..) |rect, i| {
+        if (x >= rect.left and x < rect.right and y >= rect.top and y < rect.bottom) {
+            const surface = self.tab_active_surface[i];
+            if (!surface.core_surface_ready) return;
+            self.requestCloseTab(surface.core_surface.id);
             return;
         }
     }
@@ -2497,6 +2515,15 @@ pub fn windowWndProc(
             return 0;
         },
         w32.WM_ERASEBKGND => return 1,
+        w32.WM_MBUTTONDOWN => {
+            const x: i16 = @truncate(lparam & 0xFFFF);
+            const y: i16 = @truncate((lparam >> 16) & 0xFFFF);
+            if (window.tab_bar_visible and y >= 0 and y < window.tabBarHeight()) {
+                window.handleTabBarMiddleClick(x, y);
+                return 0;
+            }
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
         w32.WM_LBUTTONDOWN => {
             const x: i32 = @as(i16, @truncate(lparam & 0xFFFF));
             const y: i32 = @as(i16, @truncate((lparam >> 16) & 0xFFFF));
