@@ -3129,6 +3129,10 @@ fn writeWin32InputSequence(
         seq,
     ) catch return;
     self.core_surface.io.queueMessage(msg, .unlocked);
+
+    // keyCallback's encoder yields nothing in this mode, so it never
+    // reaches its scroll-to-bottom handling; apply it for key-downs here.
+    if (kd == 1 and !isModifierVk(vk)) self.core_surface.scrollToBottomOnKeystroke();
 }
 
 test "Win32 Input Mode preserves translated text without replaying physical keys" {
@@ -3193,6 +3197,7 @@ test "Win32 Input Mode preserves translated text without replaying physical keys
     defer testing.allocator.destroy(surface);
     surface.* = .{ .app = &app };
     surface.core_surface.readonly = false;
+    surface.core_surface.config.scroll_to_bottom = .{ .keystroke = false };
     surface.core_surface.io.mailbox = try termio.Mailbox.initSPSC(testing.allocator);
     defer surface.core_surface.io.mailbox.deinit(testing.allocator);
     const single: isize = (53 << 16) | 1;
@@ -3723,6 +3728,7 @@ test "read-only blocks native keyboard character and IME input" {
     surface.* = .{ .app = &app, .core_surface_ready = true };
     const core_surface = &surface.core_surface;
     core_surface.mouse = .{};
+    core_surface.config.scroll_to_bottom = .{ .keystroke = false };
     core_surface.io.terminal = try terminal.Terminal.init(global.io(), testing.allocator, .{ .cols = 8, .rows = 2 });
     defer core_surface.io.terminal.deinit(testing.allocator);
     core_surface.io.terminal.modes.set(.win32_input, true);
@@ -3761,5 +3767,59 @@ test "read-only blocks native keyboard character and IME input" {
         const extra = core_surface.io.mailbox.spsc.queue.pop(global.io());
         defer if (extra) |msg| msg.deinit();
         try testing.expect(extra == null);
+    }
+}
+
+test "Win32 Input Mode key-downs honor scroll-to-bottom keystroke" {
+    const testing = std.testing;
+    const Native = struct {
+        extern "user32" fn SetKeyboardState(state: *const [256]u8) callconv(.winapi) i32;
+    };
+    var saved_keys: [256]u8 = undefined;
+    if (w32.GetKeyboardState(&saved_keys) == 0) return error.Win32Error;
+    defer _ = Native.SetKeyboardState(&saved_keys);
+    const keys: [256]u8 = @splat(0);
+    if (Native.SetKeyboardState(&keys) == 0) return error.Win32Error;
+
+    var core_app: @import("../../App.zig") = undefined;
+    core_app.alloc = testing.allocator;
+    var app: App = undefined;
+    app.core_app = &core_app;
+    const surface = try testing.allocator.create(Surface);
+    defer testing.allocator.destroy(surface);
+    surface.* = .{ .app = &app, .core_surface_ready = true };
+    const core_surface = &surface.core_surface;
+    core_surface.mouse = .{};
+    core_surface.readonly = false;
+    core_surface.io.terminal = try terminal.Terminal.init(global.io(), testing.allocator, .{ .cols = 8, .rows = 2 });
+    defer core_surface.io.terminal.deinit(testing.allocator);
+    const term = &core_surface.io.terminal;
+    term.modes.set(.win32_input, true);
+    try term.printString("1\r\n2\r\n3\r\n4\r\n5");
+    var mutex: std.Io.Mutex = .init;
+    core_surface.renderer_state.mutex = &mutex;
+    core_surface.renderer_thread.wakeup = try global.xev.Async.init();
+    defer core_surface.renderer_thread.wakeup.deinit();
+    core_surface.io.mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+    defer core_surface.io.mailbox.deinit(testing.allocator);
+    defer while (core_surface.io.mailbox.spsc.queue.pop(global.io())) |msg| msg.deinit();
+
+    const pages = &term.screens.active.pages;
+    for ([_]bool{ false, true }) |keystroke| {
+        core_surface.config.scroll_to_bottom = .{ .keystroke = keystroke };
+
+        // Releases and modifier key-downs never move the viewport.
+        term.scrollViewport(.top);
+        surface.sendWin32InputEvent(w32.VK_RETURN, (28 << 16) | 1, .release);
+        surface.sendWin32InputEvent(w32.VK_SHIFT, (42 << 16) | 1, .press);
+        try testing.expect(pages.viewport != .active);
+
+        surface.sendWin32InputEvent(w32.VK_RETURN, (28 << 16) | 1, .press);
+        try testing.expectEqual(keystroke, pages.viewport == .active);
+
+        // Standalone WM_CHAR / IME text follows the same rule.
+        term.scrollViewport(.top);
+        surface.sendWin32CharEvent('x');
+        try testing.expectEqual(keystroke, pages.viewport == .active);
     }
 }
