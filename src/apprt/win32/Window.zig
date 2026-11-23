@@ -769,6 +769,7 @@ pub fn closeSplitSurface(self: *Window, surface: *Surface) void {
     };
     log.debug("closeSplitSurface: remove returned, new_tree nodes={}", .{new_tree.nodes.len});
 
+    const was_pending = self.pending_tab_reveal != null and self.pending_tab_reveal == surface.hwnd;
     var old_tree = self.tab_trees[tab];
     old_tree.deinit();
     self.tab_trees[tab] = new_tree;
@@ -776,8 +777,9 @@ pub fn closeSplitSurface(self: *Window, surface: *Surface) void {
     if (next_surface) |ns| {
         log.debug("closeSplitSurface: focusing next surface", .{});
         self.tab_active_surface[tab] = ns;
+        if (was_pending) self.pending_tab_reveal = ns.hwnd;
         self.layoutSplits();
-        if (!self.tab_overview.active) {
+        if (tab == self.active_tab and !self.tab_overview.active) {
             if (ns.hwnd) |h| _ = w32.SetFocus(h);
         }
         self.invalidateTabBar();
