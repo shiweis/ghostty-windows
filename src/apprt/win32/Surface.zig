@@ -3069,7 +3069,7 @@ fn recordDeadKeyTranslation(self: *Surface, result: i32) void {
 /// A physical key can produce a spacing dead character plus text, a ligature,
 /// or a surrogate pair. Preserve the text without replaying the physical VK
 /// or its modifiers for every UTF-16 unit. Only the final scalar carries the
-/// real key-down; all other units are synthetic text, like WM_CHAR/IME input.
+/// real key-down. All other units are synthetic text, like committed IME input.
 fn writeWin32TranslatedKey(self: *Surface, vk: u16, sc: u16, cs: u32, text: []const u16) void {
     if (text.len == 0) {
         self.writeWin32InputSequence(vk, sc, 0, 1, cs, 1);
@@ -3090,9 +3090,8 @@ fn writeWin32TranslatedKey(self: *Surface, vk: u16, sc: u16, cs: u32, text: []co
     }
 }
 
-/// Send a Win32 Input Mode event for a WM_CHAR character (IME, PostMessage, etc.)
-/// These are characters without a corresponding WM_KEYDOWN, so we send a
-/// synthetic key event with vk=0, sc=0.
+/// Send a UTF-16 code unit from an IME commit or keyboard translation as
+/// a synthetic key press and release with no physical key or scan code.
 pub fn sendWin32CharEvent(self: *Surface, char_code: u16) void {
     // Key-down event with the Unicode character
     self.writeWin32InputSequence(0, 0, char_code, 1, 0, 1);
@@ -3113,7 +3112,7 @@ fn writeWin32InputSequence(
     cs: u32,
     rc: u16,
 ) void {
-    // Keyboard, standalone WM_CHAR, and IME input all share this emitter.
+    // Keyboard input and IME commits share this emitter.
     // These writes bypass the core's queueIo filter, so apply its read-only
     // policy here while allowing keybindings to run before emission.
     if (self.core_surface.readonly) return;
@@ -3130,8 +3129,7 @@ fn writeWin32InputSequence(
     ) catch return;
     self.core_surface.io.queueMessage(msg, .unlocked);
 
-    // keyCallback's encoder yields nothing in this mode, so it never
-    // reaches its scroll-to-bottom handling; apply it for key-downs here.
+    // These native PTY writes bypass keyCallback's scroll-to-bottom handling.
     if (kd == 1 and !isModifierVk(vk)) self.core_surface.scrollToBottomOnKeystroke();
 }
 
@@ -3770,7 +3768,7 @@ test "read-only blocks native keyboard character and IME input" {
     }
 }
 
-test "Win32 Input Mode key-downs honor scroll-to-bottom keystroke" {
+test "Win32 Input Mode key-downs and IME commits honor scroll-to-bottom keystroke" {
     const testing = std.testing;
     const Native = struct {
         extern "user32" fn SetKeyboardState(state: *const [256]u8) callconv(.winapi) i32;
@@ -3790,6 +3788,11 @@ test "Win32 Input Mode key-downs honor scroll-to-bottom keystroke" {
     surface.* = .{ .app = &app, .core_surface_ready = true };
     const core_surface = &surface.core_surface;
     core_surface.mouse = .{};
+    core_surface.keyboard = .{};
+    core_surface.pressed_key = null;
+    core_surface.inspector = null;
+    core_surface.config = try .init(testing.allocator, &.{});
+    defer core_surface.config.deinit();
     core_surface.readonly = false;
     core_surface.io.terminal = try terminal.Terminal.init(global.io(), testing.allocator, .{ .cols = 8, .rows = 2 });
     defer core_surface.io.terminal.deinit(testing.allocator);
@@ -3810,16 +3813,15 @@ test "Win32 Input Mode key-downs honor scroll-to-bottom keystroke" {
 
         // Releases and modifier key-downs never move the viewport.
         term.scrollViewport(.top);
-        surface.sendWin32InputEvent(w32.VK_RETURN, (28 << 16) | 1, .release);
-        surface.sendWin32InputEvent(w32.VK_SHIFT, (42 << 16) | 1, .press);
+        surface.handleKeyEvent(w32.VK_RETURN, (28 << 16) | 1, .release);
+        surface.handleKeyEvent(w32.VK_SHIFT, (42 << 16) | 1, .press);
         try testing.expect(pages.viewport != .active);
 
-        surface.sendWin32InputEvent(w32.VK_RETURN, (28 << 16) | 1, .press);
+        surface.handleKeyEvent(w32.VK_RETURN, (28 << 16) | 1, .press);
         try testing.expectEqual(keystroke, pages.viewport == .active);
 
-        // Standalone WM_CHAR / IME text follows the same rule.
         term.scrollViewport(.top);
-        surface.sendWin32CharEvent('x');
+        surface.sendImeText(&.{0x4E2D});
         try testing.expectEqual(keystroke, pages.viewport == .active);
     }
 }
