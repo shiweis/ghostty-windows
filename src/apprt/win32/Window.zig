@@ -832,9 +832,11 @@ pub fn selectTabIndex(self: *Window, idx: usize) void {
         self.drag_active = false;
         _ = w32.ReleaseCapture();
     }
-    const previous = self.displayedTabIndex() orelse self.active_tab;
+    // Only wait for the incoming frame while a different tab is on screen.
+    // Closing the displayed tab leaves nothing visible during that wait.
+    const previous = self.displayedTabIndex() orelse idx;
     self.active_tab = idx;
-    if (self.tab_active_surface[idx].hwnd != null and !self.prepareTabReveal(idx)) {
+    if (previous != idx and self.tab_active_surface[idx].hwnd != null and !self.prepareTabReveal(idx)) {
         if (self.hwnd) |hwnd| {
             if (w32.SetTimer(hwnd, TAB_REVEAL_TIMER_ID, 10, null) != 0) {
                 self.pending_tab_reveal = self.tab_active_surface[idx].hwnd;
@@ -919,6 +921,39 @@ test "tab reveal completes on input or timeout when no frame arrives" {
     try testing.expect(w32.GetWindowLongW(second, w32.GWL_STYLE) & w32.WS_VISIBLE_STYLE == 0);
 }
 
+test "tab reveal shows the surviving tab immediately after the displayed tab closes" {
+    const testing = std.testing;
+    const class = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+    const title = std.unicode.utf8ToUtf16LeStringLiteral("");
+    const parent = w32.CreateWindowExW(0, class, title, 0, 0, 0, 120, 80, null, null, null, null) orelse return error.Win32Error;
+    defer _ = w32.DestroyWindow(parent);
+
+    var app: App = undefined;
+    app.config.@"window-show-tab-bar" = .never;
+    var window: Window = .{ .app = &app, .hwnd = parent };
+    defer for (window.tab_trees[0..window.tab_count]) |*tree| tree.deinit();
+    for (0..2) |i| {
+        const child = w32.CreateWindowExW(0, class, title, w32.WS_CHILD, 0, 0, 120, 80, parent, null, null, null) orelse return error.Win32Error;
+        const surface = try testing.allocator.create(Surface);
+        errdefer testing.allocator.destroy(surface);
+        surface.* = .{ .app = &app, .hwnd = child, .parent_window = &window };
+        window.tab_trees[i] = try .init(testing.allocator, surface);
+        window.tab_active_surface[i] = surface;
+        window.tab_title_lens[i] = 0;
+        window.tab_count += 1;
+    }
+    const outgoing = window.tab_active_surface[0].hwnd.?;
+    const survivor = window.tab_active_surface[1].hwnd.?;
+    _ = w32.ShowWindow(outgoing, w32.SW_SHOW);
+    window.displayed_tab = outgoing;
+
+    window.closeTabByIndex(0);
+    try testing.expectEqual(@as(usize, 1), window.tab_count);
+    try testing.expect(window.pending_tab_reveal == null);
+    try testing.expectEqual(survivor, window.displayed_tab.?);
+    try testing.expect(w32.GetWindowLongW(survivor, w32.GWL_STYLE) & w32.WS_VISIBLE_STYLE != 0);
+}
+
 fn tabIndexForHwnd(self: *const Window, handle: ?w32.HWND) ?usize {
     const hwnd = handle orelse return null;
     for (0..self.tab_count) |idx| {
@@ -931,7 +966,9 @@ fn tabIndexForHwnd(self: *const Window, handle: ?w32.HWND) ?usize {
 }
 
 fn displayedTabIndex(self: *Window) ?usize {
-    if (self.tabIndexForHwnd(self.displayed_tab)) |idx| return idx;
+    if (self.tabIndexForHwnd(self.displayed_tab)) |idx| {
+        if (w32.GetWindowLongW(self.displayed_tab.?, w32.GWL_STYLE) & w32.WS_VISIBLE_STYLE != 0) return idx;
+    }
     // A split pane can exit while another pane still displays this tab.
     for (0..self.tab_count) |idx| {
         var it = self.tab_trees[idx].iterator();
