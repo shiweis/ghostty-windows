@@ -197,8 +197,45 @@ pub fn deinit(self: *Thread) void {
         self.compression.deinit();
     self.loop.deinit();
 
-    // Nothing can possibly access the mailbox anymore, destroy it.
+    // A surface can stop (or fail to start) before we adopt a queued grid.
+    // The surface owns the latest reference; each queued change owns its
+    // predecessor, just as it would in drainMailbox.
+    while (self.mailbox.pop(global.io())) |message| switch (message) {
+        .font_grid => |grid| grid.set.deref(grid.old_key),
+        .search_viewport_matches => |matches| matches.arena.deinit(),
+        .search_selected_match => |match| if (match) |v| v.arena.deinit(),
+        else => message.deinit(),
+    };
     self.mailbox.destroy(self.alloc);
+}
+
+test "renderer shutdown releases superseded font grids before the first draw" {
+    const font = @import("../font/main.zig");
+    const testing = std.testing;
+
+    var config = try configpkg.Config.default(testing.allocator);
+    defer config.deinit();
+    var font_config = try font.SharedGridSet.DerivedConfig.init(testing.allocator, &config);
+    defer font_config.deinit();
+    var set = try font.SharedGridSet.init(testing.allocator);
+    defer set.deinit();
+
+    const original, _ = try set.ref(&font_config, .{ .points = 12 });
+    const current, const grid = try set.ref(&font_config, .{ .points = 14 });
+    {
+        // No renderer thread is running: shutdown must discard the message.
+        var thread = try Thread.init(testing.allocator, &config, undefined, undefined, undefined);
+        defer thread.deinit();
+        try testing.expect(thread.mailbox.push(global.io(), .{ .font_grid = .{
+            .grid = grid,
+            .set = &set,
+            .old_key = original,
+            .new_key = current,
+        } }, .instant) > 0);
+    }
+    try testing.expectEqual(@as(usize, 1), set.count());
+    set.deref(current);
+    try testing.expectEqual(@as(usize, 0), set.count());
 }
 
 /// The main entrypoint for the thread.
@@ -413,8 +450,9 @@ fn drainMailbox(self: *Thread) !void {
             },
 
             .presentation_health => |v| self.renderer.setPresentationHealth(v),
-
             .resize => |v| self.renderer.setScreenSize(v),
+
+            .background_opacity_override => |v| self.renderer.setBackgroundOpacityOverride(v),
 
             .change_config => |config| {
                 defer config.alloc.destroy(config.thread);
@@ -473,6 +511,25 @@ fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
 /// Trigger a draw. This will not update frame data or anything, it will
 /// just trigger a draw/paint.
 fn drawFrame(self: *Thread, now: bool) void {
+    if (comptime @hasDecl(apprt.Surface, "postOpaquePresentationFallback")) {
+        switch (self.surface.opaque_fallback.load(.acquire)) {
+            .waiting_for_ui, .replacing, .cancelled => return,
+            .ready => {
+                if (self.surface.opaque_fallback.cmpxchgStrong(.ready, .idle, .acq_rel, .acquire) == null)
+                    self.rebuildContext();
+                return;
+            },
+            .failed => {
+                if (self.context_recoveries < MAX_CONTEXT_RECOVERIES) {
+                    self.context_recoveries += 1;
+                    self.surface.postOpaquePresentationFallback(.failed);
+                }
+                return;
+            },
+            .idle, .requested => {},
+        }
+    }
+
     // If we're invisible, we do not draw.
     if (!self.flags.visible) return;
 
@@ -494,6 +551,9 @@ fn drawFrame(self: *Thread, now: bool) void {
         // GL frame completion is synchronous: it was set on this thread
         // during the drawFrame above.
         if (comptime @hasDecl(apprt.Surface, "recreateGLContext")) {
+            // An unavailable interop extension cannot recover by drawing
+            // again. An unfocused, idle surface may never get another wake.
+            if (self.startOpaqueFallback()) return;
             if (errored or self.renderer.health.load(.seq_cst) == .unhealthy) {
                 self.unhealthy_frames +|= 1;
                 if (self.unhealthy_frames >= UNHEALTHY_FRAMES_BEFORE_RECOVERY and
@@ -507,13 +567,6 @@ fn drawFrame(self: *Thread, now: bool) void {
                 self.unhealthy_frames = 0;
             }
         }
-    }
-
-    // Signal the apprt that a frame has been presented. On Win32
-    // this wakes the main thread if it's blocking in handleResize
-    // during live window resize.
-    if (comptime @hasDecl(apprt.Surface, "signalFrameDrawn")) {
-        self.surface.signalFrameDrawn();
     }
 }
 
@@ -531,6 +584,11 @@ fn recoverContext(self: *Thread) void {
     // current, so the GL deletes are no-ops or harmless errors.
     self.renderer.threadExit();
 
+    self.rebuildContext();
+}
+
+/// Rebind WGL after a driver reset or the UI thread's window replacement.
+fn rebuildContext(self: *Thread) void {
     // Recreate the GL context and make it current on this thread.
     self.surface.recreateGLContext() catch |err| {
         log.warn("error recreating GL context err={}", .{err});
@@ -553,11 +611,22 @@ fn recoverContext(self: *Thread) void {
         return;
     };
 
+    // Hidden surfaces rebuild their first frame when they become visible.
+    if (!self.flags.visible) return;
     // Draw immediately; a healthy frame flips the health atomic back
     // and notifies the surface.
     self.renderer.drawFrame(true) catch |err| {
         log.warn("error drawing after context recovery err={}", .{err});
     };
+    _ = self.startOpaqueFallback();
+}
+
+fn startOpaqueFallback(self: *Thread) bool {
+    if (self.surface.opaque_fallback.load(.acquire) != .requested) return false;
+    self.unhealthy_frames = 0;
+    self.renderer.threadExit();
+    self.surface.postOpaquePresentationFallback(.requested);
+    return true;
 }
 
 fn wakeupCallback(

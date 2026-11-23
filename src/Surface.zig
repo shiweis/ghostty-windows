@@ -559,7 +559,10 @@ pub fn init(
         &derived_config.font,
         font_size,
     );
-    errdefer app.font_grid_set.deref(font_grid_key);
+    // A startup callback can change the font and transfer the previous key
+    // to the renderer mailbox. Release the reference the surface still owns.
+    var owned_font_grid_key = &font_grid_key;
+    errdefer app.font_grid_set.deref(owned_font_grid_key.*);
 
     // Build our size struct which has all the sizes we need.
     const size: rendererpkg.Size = size: {
@@ -677,6 +680,7 @@ pub fn init(
         // lets us get the most likely correct color theme and so on.
         .config_conditional_state = app.config_conditional_state,
     };
+    owned_font_grid_key = &self.font_grid_key;
 
     log.debug("state stored, initializing IO...", .{});
 
@@ -2793,6 +2797,19 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
 
     // Schedule render which also drains our mailbox
     self.queueRender() catch unreachable;
+}
+
+pub fn setBackgroundOpacityOverride(self: *Surface, value: ?f64) !void {
+    if (self.renderer_thread.mailbox.push(
+        global.io(),
+        .{ .background_opacity_override = value },
+        .{ .ns = mailbox_timeout_ns },
+    ) == 0) {
+        self.queueRender() catch {};
+        return error.RendererMailboxFull;
+    }
+
+    try self.queueRender();
 }
 
 /// This queues a render operation with the renderer thread. The render

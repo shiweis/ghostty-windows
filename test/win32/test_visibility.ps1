@@ -46,6 +46,18 @@ public class VisibilityTest {
         else EnumChildWindows(Check(parent), callback, IntPtr.Zero);
         return result.ToArray();
     }
+    public static int VisibleOwnedChrome(IntPtr owner) {
+        Check(owner);
+        int count = 0;
+        EnumProc callback = delegate(IntPtr h, IntPtr data) {
+            uint pid; GetWindowThreadProcessId(h, out pid);
+            if (pid == ProcessId && Class(h) == "GhosttyChrome" &&
+                GetWindowLongPtr(h, -8) == owner && IsWindowVisible(h)) count++;
+            return true;
+        };
+        EnumWindows(callback, IntPtr.Zero);
+        return count;
+    }
     public static bool Visible(IntPtr h) { return IsWindowVisible(Check(h)); }
     public static bool Minimized(IntPtr h) { return IsIconic(Check(h)); }
     public static void Show(IntPtr h, int command) {
@@ -144,7 +156,7 @@ finally:
 $childScript = $childScript.Replace('__ROOT__', ($linuxDir.Trim() | ConvertTo-Json -Compress))
 $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($childScript))
 $bootstrap = "exec(__import__('base64').b64decode('$encoded'))"
-$arguments = '--config-default-files=false --auto-update=off --shell-integration=none --resize-overlay=never' +
+$arguments = '--config-default-files=false --auto-update=off --shell-integration=none --resize-overlay=never --window-show-tab-bar=always' +
     ' --quick-terminal-autohide=false --quick-terminal-animation-duration=0.05' +
     ' --keybind=f9=new_tab --keybind=f8=new_split:right --keybind=f7=toggle_split_zoom' +
     ' --keybind=f6=toggle_visibility --keybind=f5=toggle_quick_terminal' +
@@ -185,8 +197,10 @@ try {
     [VisibilityTest]::Show($window, 0) # SW_HIDE
     Wait-For { -not [VisibilityTest]::Visible($window) } 'top-level hide'
     Query-States @{ $first = 2 } 'hidden parent reports not visible'
+    Assert-True ([VisibilityTest]::VisibleOwnedChrome($window) -eq 0) 'hiding the parent leaves no floating tab strip'
     [VisibilityTest]::Resize($window)
     Query-States @{ $first = 2 } 'layout while parent is hidden stays occluded'
+    Assert-True ([VisibilityTest]::VisibleOwnedChrome($window) -eq 0) 'hidden-parent layout does not reveal the tab strip'
     [VisibilityTest]::Show($window, 4) # SW_SHOWNOACTIVATE
     Wait-For { [VisibilityTest]::Visible($window) } 'top-level show'
     Query-States @{ $first = 1 } 'showing parent resumes visibility'
@@ -208,12 +222,14 @@ try {
     [VisibilityTest]::Show($window, 0)
     Wait-For { -not [VisibilityTest]::Visible($window) } 'zoomed parent hide'
     Query-States @{ $first = 2; $second = 2; $third = 2 } 'hide occludes every pane'
+    Assert-True ([VisibilityTest]::VisibleOwnedChrome($window) -eq 0) 'hiding a zoomed window also hides its tab strip'
     [VisibilityTest]::Show($window, 4)
     Wait-For { [VisibilityTest]::Visible($window) } 'zoomed parent show'
     Query-States @{ $first = 2; $second = 2; $third = 1 } 'show restores only the zoomed pane'
     [VisibilityTest]::Show($window, 7) # SW_SHOWMINNOACTIVE
     Wait-For { [VisibilityTest]::Minimized($window) } 'minimize'
     Query-States @{ $first = 2; $second = 2; $third = 2 } 'minimize occludes every pane'
+    Assert-True ([VisibilityTest]::VisibleOwnedChrome($window) -eq 0) 'minimizing the window hides its tab strip'
     [VisibilityTest]::Show($window, 4)
     Wait-For { -not [VisibilityTest]::Minimized($window) } 'restore without activation'
     Query-States @{ $first = 2; $second = 2; $third = 1 } 'restore respects split zoom'
@@ -226,6 +242,7 @@ try {
     [VisibilityTest]::Key($thirdSurface, 0x75) # F6: toggle_visibility
     Wait-For { -not [VisibilityTest]::Visible($window) } 'toggle_visibility hide'
     Query-States @{ $first = 2; $second = 2; $third = 2 } 'toggle_visibility publishes hidden state'
+    Assert-True ([VisibilityTest]::VisibleOwnedChrome($window) -eq 0) 'toggle_visibility leaves no floating tab strip'
     [VisibilityTest]::Key($thirdSurface, 0x75)
     Wait-For { [VisibilityTest]::Visible($window) } 'toggle_visibility show'
     Query-States @{ $first = 2; $second = 1; $third = 1 } 'toggle_visibility restores active panes only'

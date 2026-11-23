@@ -118,6 +118,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// The configuration we need derived from the main config.
         config: DerivedConfig,
 
+        /// A runtime opacity override, kept separately from configured opacity.
+        background_opacity_override: ?f64 = null,
+
         /// The mailbox for communicating with the window.
         surface_mailbox: apprt.surface.Mailbox,
 
@@ -720,6 +723,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             );
             errdefer api.deinit();
 
+            const background_opacity_override: ?f64 = if (comptime apprt.runtime == apprt.win32)
+                options.rt_surface.backgroundOpacityOverride()
+            else
+                null;
             const has_custom_shaders = options.config.custom_shaders.value.items.len > 0;
 
             // Create the font shaper.
@@ -745,6 +752,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .config = options.config,
                 .surface_mailbox = options.surface_mailbox,
                 .grid_metrics = font_critical.metrics,
+                .background_opacity_override = background_opacity_override,
+
                 .size = options.size,
                 .focused = true,
                 .visible = true,
@@ -772,11 +781,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         options.config.background.r,
                         options.config.background.g,
                         options.config.background.b,
-                        // Note that if we're on macOS with glass effects
-                        // we'll disable background opacity but we handle
-                        // that in updateFrame.
-                        @intFromFloat(@round(options.config.background_opacity * 255.0)),
+                        undefined,
                     },
+
                     .bools = .{
                         .cursor_wide = false,
                         .use_display_p3 = options.config.colorspace == .@"display-p3",
@@ -828,6 +835,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Shaders are initialized lazily on the render thread.
                 .shaders = .uninit,
             };
+            result.uniforms.bg_color[3] = @intFromFloat(@round(result.effectiveBackgroundOpacity() * 255.0));
 
             // Ensure our undefined values above are correctly initialized.
             result.updateFontGridUniforms();
@@ -1106,10 +1114,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.terminal_state.dirty = .full;
         }
 
-        /// Called when the window moves to a different display, with
-        /// the CGDirectDisplayID of the new one. The display link is
-        /// bound to that display so that it follows its refresh rate.
-        ///
+        pub fn setBackgroundOpacityOverride(self: *Self, value: ?f64) void {
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
+
+            self.background_opacity_override = value;
+            self.markDirty();
+        }
+
+        fn effectiveBackgroundOpacity(self: *const Self) f64 {
+            return @max(0, @min(
+                1,
+                self.background_opacity_override orelse self.config.background_opacity,
+            ));
+        }
+        /// Called when the window moves to a different display.
         /// Must be called on the render thread.
         pub fn setMacOSDisplayID(
             self: *Self,
@@ -1268,6 +1287,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Release the shaders as well if we're unrealized.
             if (!self.display_realized) {
                 self.shaders.deinit(self.alloc);
+            }
+            if (@hasDecl(GraphicsAPI, "gpuResourcesReleased")) {
+                self.api.gpuResourcesReleased();
             }
         }
 
@@ -1688,12 +1710,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.scrollbar_dirty = true;
                 }
 
-                // Update our background color
                 self.uniforms.bg_color = .{
                     self.terminal_state.colors.background.r,
                     self.terminal_state.colors.background.g,
                     self.terminal_state.colors.background.b,
-                    @intFromFloat(@round(self.config.background_opacity * 255.0)),
+                    @intFromFloat(@round(self.effectiveBackgroundOpacity() * 255.0)),
                 };
 
                 // If we're on macOS and have glass styles, we remove
@@ -3228,7 +3249,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         // If the user requested to have opacity on all cells, apply it.
                         if (self.config.background_opacity_cells and bg_style != null) {
                             var opacity: f64 = @floatFromInt(default);
-                            opacity *= self.config.background_opacity;
+                            opacity *= self.effectiveBackgroundOpacity();
                             break :bg_alpha @intFromFloat(opacity);
                         }
 

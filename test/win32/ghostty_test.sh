@@ -12,11 +12,11 @@ set -uo pipefail
 # Most legacy cases use desktop-global keyboard/mouse injection. Refuse them
 # before launching or cleaning up anything on a developer's shared desktop.
 case "${1:-all}" in
-    list|resize|window_properties|program_window_resize|tab_overview|reply_feedback|mouse_reporting|visibility) ;;
+    list|resize|window_properties|program_window_resize|tab_overview|reply_feedback|mouse_reporting|visibility|toggle_opacity) ;;
     *)
         if [ "${GHOSTTY_TEST_ISOLATED_DESKTOP:-}" != "1" ]; then
             echo "Input tests require a dedicated desktop and GHOSTTY_TEST_ISOLATED_DESKTOP=1." >&2
-            echo "Safe cases: program_window_resize, tab_overview, reply_feedback, mouse_reporting, visibility, resize, window_properties." >&2
+            echo "Safe cases: program_window_resize, tab_overview, reply_feedback, mouse_reporting, visibility, resize, window_properties, toggle_opacity." >&2
             exit 2
         fi
         ;;
@@ -1174,48 +1174,19 @@ test_tab_close() {
 test_toggle_opacity() {
     echo "▶ test_toggle_opacity"
 
-    # Create config with background-opacity
-    local config_dir_wsl
-    config_dir_wsl="$(wslpath "$WIN_TEMP")/ghostty-test-config/ghostty"
-    mkdir -p "$config_dir_wsl"
-    cat > "$config_dir_wsl/config" << 'CFGEOF'
-background-opacity = 0.8
-CFGEOF
-
-    local config_dir_win
-    config_dir_win="$(wslpath -w "$(wslpath "$WIN_TEMP")/ghostty-test-config")"
-    export XDG_CONFIG_HOME="$config_dir_win"
-    export WSLENV="XDG_CONFIG_HOME/w"
-
-    local output
-    GHOSTTY_HWND=0
-    launch_and_set_hwnd 5000
-    output="$LAUNCH_OUTPUT"
-    local pid window_found
-    pid="$(get_val "$output" PID)"
-    window_found="$(get_val "$output" WINDOW_FOUND)"
-
-    unset XDG_CONFIG_HOME WSLENV
-
-    if [ "$window_found" != "true" ]; then
-        echo "  ✗ Window did not appear"
+    local script resources output
+    script="$(wslpath -w "$SCRIPT_DIR/test_composition.ps1")"
+    resources="$(wslpath -w "$REPO_DIR/zig-out/share/ghostty")"
+    output="${WIN_TEMP}\\ghostty-composition-proof"
+    if pwsh.exe -NoLogo -NoProfile -File "$script" \
+        -ExePath "$GHOSTTY_EXE" -ResourcesPath "$resources" \
+        -OutputDirectory "$output" -Case opacity; then
+        PASS=$((PASS + 1))
+        echo "  ● PASSED"
+    else
         FAIL=$((FAIL + 1))
-        ps -Action kill -ProcessId "$pid" 2>/dev/null || true
-        rm -rf "$(wslpath "$WIN_TEMP")/ghostty-test-config"
-        return
+        echo "  ✗ Composition check failed or capture was invalid: $output"
     fi
-
-    screenshot "opacity_before" "$pid"
-    echo "  ✓ Window launched with 0.8 opacity"
-
-    # The toggle_background_opacity keybinding isn't set by default,
-    # but the action handler is implemented. Just verify launch works
-    # with opacity config without crashing.
-
-    ps -Action kill -ProcessId "$pid" 2>/dev/null || true
-    rm -rf "$(wslpath "$WIN_TEMP")/ghostty-test-config"
-    PASS=$((PASS + 1))
-    echo "  ● PASSED"
 }
 
 test_command_palette() {

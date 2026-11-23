@@ -226,6 +226,7 @@ pub fn onWindowDestroyed(self: *QuickTerminal) void {
 /// Update cached config values after a config reload.
 pub fn onConfigChange(self: *QuickTerminal, config: *const configpkg.Config) void {
     self.animation_duration = config.@"quick-terminal-animation-duration";
+    self.window.onConfigChange();
 }
 
 // -----------------------------------------------------------------------

@@ -4,6 +4,7 @@ const Self = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const gl = @import("opengl");
+const apprt = @import("../../apprt.zig");
 
 const global = @import("../../global.zig");
 const Renderer = @import("../generic.zig").Renderer(OpenGL);
@@ -60,9 +61,8 @@ pub fn complete(self: *const Self, sync: bool) void {
     // If there are any GL errors, consider the frame unhealthy.
     var health: Health = if (gl.errors.getError()) .healthy else |_| .unhealthy;
 
-    // If the frame is healthy, draw it to an ExportedFrame
-    // Then sync before exporting and pushing to the present queue.
-    // The apprt pulls from this queue in its snapshot handler.
+    // Present healthy frames. EGL exports need GL completion before handoff;
+    // WGL/D3D synchronization is provided by the shared-resource lock.
     const presented_frame: ?OpenGL.ExportedFrame = if (health == .healthy) frame: {
         const frame = self.renderer.api.present(
             self.target.*,
@@ -75,9 +75,7 @@ pub fn complete(self: *const Self, sync: bool) void {
         break :frame frame;
     } else null;
 
-    // Sync after frame draw AND frame present GL calls.
-    gl.finish();
-
+    if (comptime apprt.runtime != apprt.win32) gl.finish();
     // At this point the ExportedFrame is finished and can be shared
     if (comptime OpenGL.ExportedFrame != void) if (presented_frame) |frame| {
         self.renderer.pushFrame(frame);

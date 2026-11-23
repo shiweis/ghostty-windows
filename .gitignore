@@ -13,6 +13,7 @@ zig-cache/
 .zig-cache.lock
 zig-pkg/
 zig-out/
+/zig-out-composition*/
 zig-pkg/
 build-cmake/
 CMakeCache.txt
