@@ -3069,7 +3069,7 @@ fn recordDeadKeyTranslation(self: *Surface, result: i32) void {
 /// A physical key can produce a spacing dead character plus text, a ligature,
 /// or a surrogate pair. Preserve the text without replaying the physical VK
 /// or its modifiers for every UTF-16 unit. Only the final scalar carries the
-/// real key-down; all other units are synthetic text, like WM_CHAR/IME input.
+/// real key-down. All other units are synthetic text, like committed IME input.
 fn writeWin32TranslatedKey(self: *Surface, vk: u16, sc: u16, cs: u32, text: []const u16) void {
     if (text.len == 0) {
         self.writeWin32InputSequence(vk, sc, 0, 1, cs, 1);
@@ -3090,9 +3090,8 @@ fn writeWin32TranslatedKey(self: *Surface, vk: u16, sc: u16, cs: u32, text: []co
     }
 }
 
-/// Send a Win32 Input Mode event for a WM_CHAR character (IME, PostMessage, etc.)
-/// These are characters without a corresponding WM_KEYDOWN, so we send a
-/// synthetic key event with vk=0, sc=0.
+/// Send a UTF-16 code unit from an IME commit or keyboard translation as
+/// a synthetic key press and release with no physical key or scan code.
 pub fn sendWin32CharEvent(self: *Surface, char_code: u16) void {
     // Key-down event with the Unicode character
     self.writeWin32InputSequence(0, 0, char_code, 1, 0, 1);
@@ -3113,7 +3112,7 @@ fn writeWin32InputSequence(
     cs: u32,
     rc: u16,
 ) void {
-    // Keyboard, standalone WM_CHAR, and IME input all share this emitter.
+    // Keyboard input and IME commits share this emitter.
     // These writes bypass the core's queueIo filter, so apply its read-only
     // policy here while allowing keybindings to run before emission.
     if (self.core_surface.readonly) return;
@@ -3129,6 +3128,9 @@ fn writeWin32InputSequence(
         seq,
     ) catch return;
     self.core_surface.io.queueMessage(msg, .unlocked);
+
+    // These native PTY writes bypass keyCallback's scroll-to-bottom handling.
+    if (kd == 1 and !isModifierVk(vk)) self.core_surface.scrollToBottomOnKeystroke();
 }
 
 test "Win32 Input Mode preserves translated text without replaying physical keys" {
@@ -3193,6 +3195,7 @@ test "Win32 Input Mode preserves translated text without replaying physical keys
     defer testing.allocator.destroy(surface);
     surface.* = .{ .app = &app };
     surface.core_surface.readonly = false;
+    surface.core_surface.config.scroll_to_bottom = .{ .keystroke = false };
     surface.core_surface.io.mailbox = try termio.Mailbox.initSPSC(testing.allocator);
     defer surface.core_surface.io.mailbox.deinit(testing.allocator);
     const single: isize = (53 << 16) | 1;
@@ -3723,6 +3726,7 @@ test "read-only blocks native keyboard character and IME input" {
     surface.* = .{ .app = &app, .core_surface_ready = true };
     const core_surface = &surface.core_surface;
     core_surface.mouse = .{};
+    core_surface.config.scroll_to_bottom = .{ .keystroke = false };
     core_surface.io.terminal = try terminal.Terminal.init(global.io(), testing.allocator, .{ .cols = 8, .rows = 2 });
     defer core_surface.io.terminal.deinit(testing.allocator);
     core_surface.io.terminal.modes.set(.win32_input, true);
@@ -3761,5 +3765,63 @@ test "read-only blocks native keyboard character and IME input" {
         const extra = core_surface.io.mailbox.spsc.queue.pop(global.io());
         defer if (extra) |msg| msg.deinit();
         try testing.expect(extra == null);
+    }
+}
+
+test "Win32 Input Mode key-downs and IME commits honor scroll-to-bottom keystroke" {
+    const testing = std.testing;
+    const Native = struct {
+        extern "user32" fn SetKeyboardState(state: *const [256]u8) callconv(.winapi) i32;
+    };
+    var saved_keys: [256]u8 = undefined;
+    if (w32.GetKeyboardState(&saved_keys) == 0) return error.Win32Error;
+    defer _ = Native.SetKeyboardState(&saved_keys);
+    const keys: [256]u8 = @splat(0);
+    if (Native.SetKeyboardState(&keys) == 0) return error.Win32Error;
+
+    var core_app: @import("../../App.zig") = undefined;
+    core_app.alloc = testing.allocator;
+    var app: App = undefined;
+    app.core_app = &core_app;
+    const surface = try testing.allocator.create(Surface);
+    defer testing.allocator.destroy(surface);
+    surface.* = .{ .app = &app, .core_surface_ready = true };
+    const core_surface = &surface.core_surface;
+    core_surface.mouse = .{};
+    core_surface.keyboard = .{};
+    core_surface.pressed_key = null;
+    core_surface.inspector = null;
+    core_surface.config = try .init(testing.allocator, &.{});
+    defer core_surface.config.deinit();
+    core_surface.readonly = false;
+    core_surface.io.terminal = try terminal.Terminal.init(global.io(), testing.allocator, .{ .cols = 8, .rows = 2 });
+    defer core_surface.io.terminal.deinit(testing.allocator);
+    const term = &core_surface.io.terminal;
+    term.modes.set(.win32_input, true);
+    try term.printString("1\r\n2\r\n3\r\n4\r\n5");
+    var mutex: std.Io.Mutex = .init;
+    core_surface.renderer_state.mutex = &mutex;
+    core_surface.renderer_thread.wakeup = try global.xev.Async.init();
+    defer core_surface.renderer_thread.wakeup.deinit();
+    core_surface.io.mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+    defer core_surface.io.mailbox.deinit(testing.allocator);
+    defer while (core_surface.io.mailbox.spsc.queue.pop(global.io())) |msg| msg.deinit();
+
+    const pages = &term.screens.active.pages;
+    for ([_]bool{ false, true }) |keystroke| {
+        core_surface.config.scroll_to_bottom = .{ .keystroke = keystroke };
+
+        // Releases and modifier key-downs never move the viewport.
+        term.scrollViewport(.top);
+        surface.handleKeyEvent(w32.VK_RETURN, (28 << 16) | 1, .release);
+        surface.handleKeyEvent(w32.VK_SHIFT, (42 << 16) | 1, .press);
+        try testing.expect(pages.viewport != .active);
+
+        surface.handleKeyEvent(w32.VK_RETURN, (28 << 16) | 1, .press);
+        try testing.expectEqual(keystroke, pages.viewport == .active);
+
+        term.scrollViewport(.top);
+        surface.sendImeText(&.{0x4E2D});
+        try testing.expectEqual(keystroke, pages.viewport == .active);
     }
 }

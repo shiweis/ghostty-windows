@@ -3168,6 +3168,21 @@ pub fn keyCallback(
     return .consumed;
 }
 
+/// Apply `scroll-to-bottom = keystroke` for input an apprt wrote to the
+/// pty directly instead of through keyCallback's encoder (for example the
+/// Win32 apprt's Win32 Input Mode sequences).
+pub fn scrollToBottomOnKeystroke(self: *Surface) void {
+    if (!self.config.scroll_to_bottom.keystroke) return;
+    {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        self.io.terminal.scrollViewport(.bottom);
+    }
+    self.queueRender() catch |err| {
+        log.warn("failed to queue render after keystroke scroll err={}", .{err});
+    };
+}
+
 /// Maybe handles a binding for a given event and if so returns the effect.
 /// Returns null if the event is not handled in any way and processing should
 /// continue.
