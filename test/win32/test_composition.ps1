@@ -638,8 +638,8 @@ try {
         Send-Key $run.Child 0x53
         $s=Capture-Proof $run 'blur-live-typing-scrolling'
         try {
-            $typed=[CompositionNative]::Roi($s.Client.X+20,$s.Client.Y+290,240,60)
-            $script:record.LiveInput=@{Key='s';Roi=$typed;Marker=[CompositionNative]::FindColor($s.Bitmap,$s.Rect,$typed,255,255,0)}
+            # Only the input acknowledgement is yellow. Its pixel row depends on font metrics and DPI.
+            $script:record.LiveInput=@{Key='s';Roi=$s.Client;Marker=[CompositionNative]::FindColor($s.Bitmap,$s.Rect,$s.Client,255,255,0)}
             Assert-Foreground $s $script:reference 'blur-live-typing-scrolling'
             $contrast=[CompositionNative]::StripeContrast($s.Bitmap,$s.Rect,$stripe)
             Assert-Proof ($contrast -le .7*$contrasts[0]) 'Blur remains active while typing and scrolling' @{Contrast=$contrast;OffContrast=$contrasts[0];Roi=$stripe}
