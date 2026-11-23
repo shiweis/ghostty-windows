@@ -22,6 +22,16 @@ const log = std.log.scoped(.win32);
 
 pub const WM_OPAQUE_PRESENTATION_FALLBACK = w32.WM_APP + 20;
 
+pub const OpaqueFallback = enum(u8) {
+    idle,
+    requested,
+    waiting_for_ui,
+    replacing,
+    ready,
+    failed,
+    cancelled,
+};
+
 /// The Win32 window handle.
 hwnd: ?w32.HWND = null,
 
@@ -102,10 +112,7 @@ frame_event: ?w32.HANDLE = null,
 
 /// Renderer-to-UI handshake for switching an unsupported compositor to an
 /// opaque child window after the renderer has released its WGL context.
-opaque_transition_event: ?w32.HANDLE = null,
-opaque_fallback_requested: std.atomic.Value(bool) = .init(false),
-opaque_transition_succeeded: std.atomic.Value(bool) = .init(false),
-opaque_transition_cancelled: std.atomic.Value(bool) = .init(false),
+opaque_fallback: std.atomic.Value(OpaqueFallback) = .init(.idle),
 
 /// Last successfully presented client extent, published by the renderer.
 presented_size: std.atomic.Value(u64) = .init(0),
@@ -258,12 +265,6 @@ pub fn initWithOptions(
         _ = w32.CloseHandle(event);
         self.frame_event = null;
     };
-    self.opaque_transition_event = w32.CreateEventW(null, 1, 0, null);
-    if (self.opaque_transition_event == null) return error.Win32Error;
-    errdefer if (self.opaque_transition_event) |event| {
-        _ = w32.CloseHandle(event);
-        self.opaque_transition_event = null;
-    };
 
     // Create a WS_CHILD window inside the parent Window container.
     const parent_hwnd = parent.hwnd orelse return error.Win32Error;
@@ -383,31 +384,108 @@ pub fn initWithOptions(
     self.core_surface_ready = true;
     self.core_surface_initialized = true;
 }
-/// Queue the UI transition for context recovery after it releases WGL.
+/// The presenter runs on the renderer thread. Once it returns, the thread
+/// can safely release the context and start the native-window transition.
 pub fn requestOpaquePresentation(self: *Surface) void {
-    self.opaque_fallback_requested.store(true, .release);
-}
-pub fn cancelOpaquePresentationFallback(self: *Surface) void {
-    self.opaque_fallback_requested.store(false, .release);
-    self.opaque_transition_succeeded.store(false, .release);
-    self.opaque_transition_cancelled.store(true, .release);
-    if (self.opaque_transition_event) |event| _ = w32.SetEvent(event);
+    _ = self.opaque_fallback.cmpxchgStrong(.idle, .requested, .acq_rel, .acquire);
 }
 
-/// Complete the fallback request on the UI thread, then release the renderer.
+pub fn cancelOpaquePresentationFallback(self: *Surface) void {
+    self.opaque_fallback.store(.cancelled, .release);
+}
+
+/// Called only after the renderer has unbound WGL. Posting never waits for
+/// the UI thread, which may itself be waiting for the renderer to stop.
+pub fn postOpaquePresentationFallback(self: *Surface, from: OpaqueFallback) void {
+    if (self.opaque_fallback.cmpxchgStrong(from, .waiting_for_ui, .acq_rel, .acquire) != null) return;
+    if (self.hwnd) |hwnd| {
+        if (w32.PostMessageW(hwnd, WM_OPAQUE_PRESENTATION_FALLBACK, 0, 0) != 0) return;
+    }
+    log.warn("failed to post opaque presentation fallback", .{});
+    self.finishOpaquePresentationFallback(.waiting_for_ui, .failed);
+}
+
+fn finishOpaquePresentationFallback(self: *Surface, from: OpaqueFallback, result: OpaqueFallback) void {
+    if (self.opaque_fallback.cmpxchgStrong(from, result, .acq_rel, .acquire) != null) return;
+    self.core_surface.renderer_thread.draw_now.notify() catch |err| {
+        log.err("failed to wake renderer after opaque presentation fallback: {}", .{err});
+    };
+}
+
+/// Complete a single pending request, even if other messages were dispatched
+/// during HWND replacement. Teardown cancels both requests and acknowledgments.
 pub fn completeOpaquePresentationFallback(self: *Surface) void {
-    self.opaque_transition_succeeded.store(false, .release);
+    if (self.opaque_fallback.cmpxchgStrong(.waiting_for_ui, .replacing, .acq_rel, .acquire) != null) return;
     self.parent_window.native_composition_failed = true;
     self.parent_window.transparency_supported = false;
     self.prepareOpaquePresentation() catch |err| {
         log.err("opaque presentation fallback failed: {}", .{err});
         self.parent_window.refreshOpacity();
-        if (self.opaque_transition_event) |event| _ = w32.SetEvent(event);
+        self.finishOpaquePresentationFallback(.replacing, .failed);
         return;
     };
     self.parent_window.refreshOpacity();
-    self.opaque_transition_succeeded.store(true, .release);
-    if (self.opaque_transition_event) |event| _ = w32.SetEvent(event);
+    self.finishOpaquePresentationFallback(.replacing, .ready);
+}
+
+test "opaque presentation fallback handles post failure, duplicate messages and teardown" {
+    const testing = std.testing;
+    const surface = try testing.allocator.create(Surface);
+    defer testing.allocator.destroy(surface);
+    surface.* = .{ .app = undefined };
+    surface.core_surface.renderer_thread.draw_now = try global.xev.Async.init();
+    defer surface.core_surface.renderer_thread.draw_now.deinit();
+
+    // A hidden native window receives one request, even across repeated wakes.
+    const hwnd = w32.CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("STATIC"),
+        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        0,
+        0,
+        0,
+        0,
+        0,
+        null,
+        null,
+        null,
+        null,
+    ) orelse return error.Win32Error;
+    var retired = false;
+    defer if (!retired) {
+        _ = w32.DestroyWindow(hwnd);
+    };
+    surface.hwnd = hwnd;
+    surface.requestOpaquePresentation();
+    surface.postOpaquePresentationFallback(.requested);
+    try testing.expectEqual(.waiting_for_ui, surface.opaque_fallback.load(.acquire));
+    var msg: w32.MSG = undefined;
+    try testing.expect(w32.PeekMessageW(&msg, hwnd, WM_OPAQUE_PRESENTATION_FALLBACK, WM_OPAQUE_PRESENTATION_FALLBACK, w32.PM_REMOVE) != 0);
+    surface.postOpaquePresentationFallback(.requested);
+    try testing.expect(w32.PeekMessageW(&msg, hwnd, WM_OPAQUE_PRESENTATION_FALLBACK, WM_OPAQUE_PRESENTATION_FALLBACK, w32.PM_REMOVE) == 0);
+    try testing.expect(w32.DestroyWindow(hwnd) != 0);
+    retired = true;
+
+    // Posting to the retired HWND must acknowledge failure without waiting.
+    surface.opaque_fallback.store(.failed, .release);
+    surface.postOpaquePresentationFallback(.failed);
+    try testing.expectEqual(.failed, surface.opaque_fallback.load(.acquire));
+    surface.completeOpaquePresentationFallback();
+    try testing.expectEqual(.failed, surface.opaque_fallback.load(.acquire));
+
+    // A successful acknowledgment is accepted once even after a slow UI turn.
+    surface.opaque_fallback.store(.replacing, .release);
+    surface.finishOpaquePresentationFallback(.replacing, .ready);
+    surface.completeOpaquePresentationFallback();
+    try testing.expectEqual(.ready, surface.opaque_fallback.load(.acquire));
+
+    // Closing a surface wins over both a queued request and a late UI reply.
+    surface.opaque_fallback.store(.waiting_for_ui, .release);
+    surface.cancelOpaquePresentationFallback();
+    surface.completeOpaquePresentationFallback();
+    surface.finishOpaquePresentationFallback(.replacing, .ready);
+    surface.requestOpaquePresentation();
+    try testing.expectEqual(.cancelled, surface.opaque_fallback.load(.acquire));
 }
 
 /// Replace the child HWND with a redirected one while the renderer is unbound.
@@ -520,10 +598,6 @@ pub fn deinit(self: *Surface) void {
     if (self.frame_event) |event| {
         _ = w32.CloseHandle(event);
         self.frame_event = null;
-    }
-    if (self.opaque_transition_event) |event| {
-        _ = w32.CloseHandle(event);
-        self.opaque_transition_event = null;
     }
     log.debug("surface deinit: frame_event closed", .{});
 
@@ -661,21 +735,6 @@ pub fn renderDeviceOptions(_: *Surface) !@import("../../renderer.zig").Device.Op
 /// Recreate the WGL context after context loss. The renderer thread owns this
 /// call; fallback HWND replacement is acknowledged by the UI before HDC reuse.
 pub fn recreateGLContext(self: *Surface) !void {
-    if (self.opaque_fallback_requested.swap(false, .acq_rel)) {
-        const hwnd = self.hwnd orelse return error.Win32Error;
-        const event = self.opaque_transition_event orelse return error.Win32Error;
-        _ = w32.ResetEvent(event);
-        if (self.opaque_transition_cancelled.load(.acquire))
-            return error.OpaquePresentationFallbackCancelled;
-        self.opaque_transition_succeeded.store(false, .release);
-        if (w32.PostMessageW(hwnd, WM_OPAQUE_PRESENTATION_FALLBACK, 0, 0) == 0)
-            return error.Win32Error;
-        if (w32.WaitForSingleObject(event, 5000) != w32.WAIT_OBJECT_0)
-            return error.OpaquePresentationFallbackTimeout;
-        if (!self.opaque_transition_succeeded.load(.acquire))
-            return error.OpaquePresentationFallbackFailed;
-    }
-
     const hdc = self.hdc orelse return error.Win32Error;
     const new = w32.wglCreateContext(hdc) orelse return error.Win32Error;
     _ = w32.wglMakeCurrent(null, null);

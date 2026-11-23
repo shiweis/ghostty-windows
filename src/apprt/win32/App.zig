@@ -2147,7 +2147,7 @@ fn surfaceWndProc(
 
     switch (msg) {
         Surface.WM_OPAQUE_PRESENTATION_FALLBACK => {
-            surface.completeOpaquePresentationFallback();
+            if (is_surface_window) surface.completeOpaquePresentationFallback();
             return 0;
         },
         w32.WM_ENTERSIZEMOVE => {
@@ -2203,6 +2203,7 @@ fn surfaceWndProc(
             if (is_surface_window) {
                 // Only terminal destruction ends the core surface's native
                 // lifetime. Its owned popups can be destroyed independently.
+                surface.cancelOpaquePresentationFallback();
                 surface.hwnd = null;
                 surface.core_surface_ready = false;
             } else {
