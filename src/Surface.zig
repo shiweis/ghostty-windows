@@ -559,8 +559,11 @@ pub fn init(
         &derived_config.font,
         font_size,
     );
-    var font_grid_transferred = false;
-    errdefer if (!font_grid_transferred) app.font_grid_set.deref(font_grid_key);
+    // A startup callback can change the font and transfer the previous key
+    // to the renderer mailbox. Release the reference the surface still owns.
+    var owned_font_grid_key = &font_grid_key;
+    errdefer app.font_grid_set.deref(owned_font_grid_key.*);
+
     // Build our size struct which has all the sizes we need.
     const size: rendererpkg.Size = size: {
         var size: rendererpkg.Size = .{
@@ -677,7 +680,7 @@ pub fn init(
         // lets us get the most likely correct color theme and so on.
         .config_conditional_state = app.config_conditional_state,
     };
-    font_grid_transferred = true;
+    owned_font_grid_key = &self.font_grid_key;
 
     log.debug("state stored, initializing IO...", .{});
 

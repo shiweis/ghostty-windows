@@ -197,8 +197,45 @@ pub fn deinit(self: *Thread) void {
         self.compression.deinit();
     self.loop.deinit();
 
-    // Nothing can possibly access the mailbox anymore, destroy it.
+    // A surface can stop (or fail to start) before we adopt a queued grid.
+    // The surface owns the latest reference; each queued change owns its
+    // predecessor, just as it would in drainMailbox.
+    while (self.mailbox.pop(global.io())) |message| switch (message) {
+        .font_grid => |grid| grid.set.deref(grid.old_key),
+        .search_viewport_matches => |matches| matches.arena.deinit(),
+        .search_selected_match => |match| if (match) |v| v.arena.deinit(),
+        else => message.deinit(),
+    };
     self.mailbox.destroy(self.alloc);
+}
+
+test "renderer shutdown releases superseded font grids before the first draw" {
+    const font = @import("../font/main.zig");
+    const testing = std.testing;
+
+    var config = try configpkg.Config.default(testing.allocator);
+    defer config.deinit();
+    var font_config = try font.SharedGridSet.DerivedConfig.init(testing.allocator, &config);
+    defer font_config.deinit();
+    var set = try font.SharedGridSet.init(testing.allocator);
+    defer set.deinit();
+
+    const original, _ = try set.ref(&font_config, .{ .points = 12 });
+    const current, const grid = try set.ref(&font_config, .{ .points = 14 });
+    {
+        // No renderer thread is running: shutdown must discard the message.
+        var thread = try Thread.init(testing.allocator, &config, undefined, undefined, undefined);
+        defer thread.deinit();
+        try testing.expect(thread.mailbox.push(global.io(), .{ .font_grid = .{
+            .grid = grid,
+            .set = &set,
+            .old_key = original,
+            .new_key = current,
+        } }, .instant) > 0);
+    }
+    try testing.expectEqual(@as(usize, 1), set.count());
+    set.deref(current);
+    try testing.expectEqual(@as(usize, 0), set.count());
 }
 
 /// The main entrypoint for the thread.
