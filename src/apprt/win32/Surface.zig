@@ -480,6 +480,7 @@ pub fn prepareOpaquePresentation(self: *Surface) !void {
     self.transparency_supported = false;
     _ = w32.SetWindowLongPtrW(old_hwnd, w32.GWLP_USERDATA, 0);
     _ = w32.ReleaseDC(old_hwnd, old_hdc);
+    if (w32.GetFocus() == old_hwnd) _ = w32.SetFocus(replacement);
     _ = w32.DestroyWindow(old_hwnd);
 }
 

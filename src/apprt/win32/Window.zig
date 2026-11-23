@@ -79,6 +79,7 @@ drag_active: bool = false,
 
 /// Non-owning HWND resolved against the current trees before each retry.
 pending_tab_reveal: ?w32.HWND = null,
+tab_reveal_deadline_ms: u64 = 0,
 /// Presentation can lag logical selection; input follows active_tab.
 displayed_tab: ?w32.HWND = null,
 
@@ -426,24 +427,7 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
         self.scale = @as(f32, @floatFromInt(dpi)) / 96.0;
     }
 
-    // Use the Windows UI font while keeping the compact macOS-like tab density.
-    const font_height: i32 = -@as(i32, @intFromFloat(14.0 * self.scale));
-    self.tab_font = w32.CreateFontW(
-        font_height, // cHeight (negative = character height)
-        0, // cWidth
-        0, // cEscapement
-        0, // cOrientation
-        w32.FW_NORMAL, // cWeight
-        0, // bItalic
-        0, // bUnderline
-        0, // bStrikeOut
-        w32.DEFAULT_CHARSET, // iCharSet
-        0, // iOutPrecision
-        0, // iClipPrecision
-        4, // Grayscale antialiasing remains valid over a translucent background.
-        0, // iPitchAndFamily
-        std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
-    );
+    self.updateTabFont();
 
     // Don't show the window yet — addTab() will show the child
     // surface which triggers ShowWindow on the parent as needed.
@@ -451,14 +435,9 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
     // timing issues with ConPTY.
 }
 
-fn handleDpiChange(self: *Window) void {
-    const hwnd = self.hwnd orelse return;
-    const dpi = w32.GetDpiForWindow(hwnd);
-    if (dpi == 0) return;
-    self.scale = @as(f32, @floatFromInt(dpi)) / 96.0;
-    if (self.tab_font) |font| _ = w32.DeleteObject(font);
-    self.tab_font = w32.CreateFontW(
-        -@as(i32, @intFromFloat(16.0 * self.scale)),
+fn updateTabFont(self: *Window) void {
+    const font = w32.CreateFontW(
+        -@as(i32, @intFromFloat(@round(14.0 * self.scale))),
         0,
         0,
         0,
@@ -469,9 +448,27 @@ fn handleDpiChange(self: *Window) void {
         w32.DEFAULT_CHARSET,
         0,
         0,
-        4,
+        4, // Grayscale antialiasing works over translucent backgrounds.
         0,
         std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
+    ) orelse return;
+    if (self.tab_font) |previous| _ = w32.DeleteObject(previous);
+    self.tab_font = font;
+}
+
+fn handleDpiChange(self: *Window, dpi: u16, suggested: *const w32.RECT) void {
+    if (dpi == 0) return;
+    const hwnd = self.hwnd orelse return;
+    self.scale = @as(f32, @floatFromInt(dpi)) / 96.0;
+    self.updateTabFont();
+    _ = w32.SetWindowPos(
+        hwnd,
+        null,
+        suggested.left,
+        suggested.top,
+        suggested.right - suggested.left,
+        suggested.bottom - suggested.top,
+        w32.SWP_NOACTIVATE | w32.SWP_NOZORDER,
     );
     self.handleResize();
 }
@@ -835,18 +832,23 @@ pub fn selectTabIndex(self: *Window, idx: usize) void {
     }
     const previous = self.displayedTabIndex() orelse self.active_tab;
     self.active_tab = idx;
-    if (!self.prepareTabReveal(idx)) {
-        self.pending_tab_reveal = self.tab_active_surface[idx].hwnd;
-        if (self.hwnd) |h| {
-            if (w32.SetTimer(h, TAB_REVEAL_TIMER_ID, 10, null) == 0) {
-                self.cancelPendingTabReveal(null);
-                log.warn("could not schedule incoming tab reveal", .{});
+    if (self.tab_active_surface[idx].hwnd != null and !self.prepareTabReveal(idx)) {
+        if (self.hwnd) |hwnd| {
+            if (w32.SetTimer(hwnd, TAB_REVEAL_TIMER_ID, 10, null) != 0) {
+                self.pending_tab_reveal = self.tab_active_surface[idx].hwnd;
+                self.tab_reveal_deadline_ms = w32.GetTickCount64() + 250;
+                if (self.pending_tab_reveal) |target| _ = w32.SetFocus(target);
+                self.updateWindowTitle();
+                return;
             }
         }
-        if (self.tab_active_surface[idx].hwnd) |h| _ = w32.SetFocus(h);
-        self.updateWindowTitle();
-        return;
+        // The first frame can still arrive after the child window is shown.
     }
+    self.showSelectedTab(previous, idx);
+}
+
+fn showSelectedTab(self: *Window, previous: usize, idx: usize) void {
+    self.cancelPendingTabReveal(idx);
     if (previous < self.tab_count and previous != idx) {
         var it = self.tab_trees[previous].iterator();
         while (it.next()) |entry| entry.view.setVisible(false);
@@ -874,6 +876,46 @@ pub fn selectTabIndex(self: *Window, idx: usize) void {
 }
 
 const TAB_REVEAL_TIMER_ID: usize = 0x5452;
+
+test "tab reveal completes on input or timeout when no frame arrives" {
+    const testing = std.testing;
+    const class = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+    const title = std.unicode.utf8ToUtf16LeStringLiteral("");
+    // Real child windows under a hidden parent. No renderer will ever signal a frame.
+    const parent = w32.CreateWindowExW(0, class, title, 0, 0, 0, 120, 80, null, null, null, null) orelse return error.Win32Error;
+    defer _ = w32.DestroyWindow(parent);
+    var window: Window = .{ .app = undefined, .hwnd = parent, .tab_count = 2 };
+    _ = w32.SetWindowLongPtrW(parent, w32.GWLP_USERDATA, @bitCast(@intFromPtr(&window)));
+    const surfaces = try testing.allocator.alloc(Surface, 2);
+    defer testing.allocator.free(surfaces);
+    var leaves: [2]SplitTree(Surface).Node = undefined;
+    for (surfaces, 0..) |*surface, i| {
+        const child = w32.CreateWindowExW(0, class, title, w32.WS_CHILD, 0, 0, 120, 80, parent, null, null, null) orelse return error.Win32Error;
+        surface.* = .{ .app = undefined, .hwnd = child };
+        leaves[i] = .{ .leaf = surface };
+        window.tab_trees[i] = .{ .arena = undefined, .nodes = leaves[i .. i + 1], .zoomed = null };
+        window.tab_active_surface[i] = surface;
+        window.tab_title_lens[i] = 0;
+    }
+    const first = surfaces[0].hwnd.?;
+    const second = surfaces[1].hwnd.?;
+    _ = w32.ShowWindow(first, w32.SW_SHOW);
+    window.displayed_tab = first;
+    window.selectTabIndex(1);
+    try testing.expectEqual(second, window.pending_tab_reveal.?);
+    window.revealBeforeInput(second);
+    try testing.expect(window.pending_tab_reveal == null);
+    try testing.expect(w32.GetWindowLongW(second, w32.GWL_STYLE) & w32.WS_VISIBLE_STYLE != 0);
+    try testing.expect(w32.GetWindowLongW(first, w32.GWL_STYLE) & w32.WS_VISIBLE_STYLE == 0);
+
+    window.selectTabIndex(0);
+    try testing.expectEqual(first, window.pending_tab_reveal.?);
+    window.tab_reveal_deadline_ms = 0;
+    _ = windowWndProc(parent, w32.WM_TIMER, TAB_REVEAL_TIMER_ID, 0);
+    try testing.expect(window.pending_tab_reveal == null);
+    try testing.expect(w32.GetWindowLongW(first, w32.GWL_STYLE) & w32.WS_VISIBLE_STYLE != 0);
+    try testing.expect(w32.GetWindowLongW(second, w32.GWL_STYLE) & w32.WS_VISIBLE_STYLE == 0);
+}
 
 fn tabIndexForHwnd(self: *const Window, handle: ?w32.HWND) ?usize {
     const hwnd = handle orelse return null;
@@ -903,6 +945,15 @@ fn displayedTabIndex(self: *Window) ?usize {
 
 fn pendingTabIndex(self: *const Window) ?usize {
     return self.tabIndexForHwnd(self.pending_tab_reveal);
+}
+
+/// Deliver keyboard input only once its target is visible. Keep the ordinary
+/// frame handoff when the renderer is ready within one more refresh interval.
+pub fn revealBeforeInput(self: *Window, hwnd: w32.HWND) void {
+    if (self.pending_tab_reveal != hwnd) return;
+    const idx = self.pendingTabIndex() orelse return;
+    _ = self.prepareTabReveal(idx);
+    self.showSelectedTab(self.displayedTabIndex() orelse idx, idx);
 }
 
 fn cancelPendingTabReveal(self: *Window, next: ?usize) void {
@@ -2780,7 +2831,8 @@ pub fn windowWndProc(
             return result;
         },
         w32.WM_DPICHANGED => {
-            window.handleDpiChange();
+            const suggested: *const w32.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            window.handleDpiChange(@truncate(wparam), suggested);
             return 0;
         },
         w32.WM_GETOBJECT => {
@@ -2799,7 +2851,17 @@ pub fn windowWndProc(
                     window.cancelPendingTabReveal(null);
                     return 0;
                 };
-                if (window.tabFramesReady(idx)) window.selectTabIndex(idx);
+                if (window.tabFramesReady(idx) or w32.GetTickCount64() >= window.tab_reveal_deadline_ms) {
+                    window.showSelectedTab(window.displayedTabIndex() orelse idx, idx);
+                } else {
+                    // Retry a visibility notification that could not enter the renderer mailbox.
+                    const tree = window.tab_trees[idx];
+                    var panes = tree.iterator();
+                    while (panes.next()) |entry| {
+                        if (tree.zoomed) |zoomed| if (entry.handle != zoomed) continue;
+                        entry.view.setVisible(true);
+                    }
+                }
                 return 0;
             }
             if (wparam == RESIZE_OVERLAY_TIMER_ID) {

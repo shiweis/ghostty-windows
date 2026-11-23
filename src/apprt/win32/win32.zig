@@ -858,6 +858,8 @@ pub const WS_CHILD: u32 = 0x40000000;
 pub const WS_VISIBLE_STYLE: u32 = 0x10000000;
 pub const WS_BORDER: u32 = 0x00800000;
 
+pub extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
+
 pub extern "user32" fn SetFocus(
     hWnd: ?HWND,
 ) callconv(.winapi) ?HWND;

@@ -2133,6 +2133,18 @@ fn surfaceWndProc(
     if (!is_surface_window and !is_search_popup and !is_palette_popup)
         return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
 
+    if (is_surface_window and surface.core_surface_ready) switch (msg) {
+        w32.WM_KEYDOWN,
+        w32.WM_SYSKEYDOWN,
+        w32.WM_KEYUP,
+        w32.WM_SYSKEYUP,
+        w32.WM_CHAR,
+        w32.WM_IME_STARTCOMPOSITION,
+        w32.WM_IME_COMPOSITION,
+        => surface.parent_window.revealBeforeInput(hwnd),
+        else => {},
+    };
+
     switch (msg) {
         Surface.WM_OPAQUE_PRESENTATION_FALLBACK => {
             surface.completeOpaquePresentationFallback();
