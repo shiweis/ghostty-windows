@@ -536,6 +536,19 @@ pub fn requestCloseTab(self: *Window, id: u64) void {
 
     const core_app = self.app.core_app;
     const owner_hwnd = self.hwnd;
+    // The representative pane can exit while the dialog is open. Any
+    // surviving pane from this tab can identify it after indices shift.
+    var pane_ids: std.ArrayList(u64) = .empty;
+    defer pane_ids.deinit(core_app.alloc);
+    it = self.tab_trees[index].iterator();
+    while (it.next()) |entry| {
+        if (entry.view.core_surface_ready) {
+            pane_ids.append(core_app.alloc, entry.view.core_surface.id) catch |err| {
+                log.err("could not remember tab for close confirmation: {}", .{err});
+                return;
+            };
+        }
+    }
     const result = w32.MessageBoxW(
         owner_hwnd,
         std.unicode.utf8ToUtf16LeStringLiteral("Processes are still running in this tab.\nClose the tab and all its splits?"),
@@ -545,10 +558,14 @@ pub fn requestCloseTab(self: *Window, id: u64) void {
     if (result != w32.IDOK) return;
     // The modal loop may have processed child exits or destroyed this
     // window. Resolve identity again; never dereference the old self.
-    const surface = core_app.findSurfaceByID(id) orelse return;
-    const owner = surface.rt_surface.parent_window;
-    if (owner.closing or owner.hwnd != owner_hwnd) return;
-    owner.closeTabByIndex(TabOverview.findTab(owner, id) orelse return);
+    for (pane_ids.items) |pane_id| {
+        const surface = core_app.findSurfaceByID(pane_id) orelse continue;
+        const owner = surface.rt_surface.parent_window;
+        if (owner.closing or owner.hwnd != owner_hwnd) continue;
+        const tab = TabOverview.findTab(owner, pane_id) orelse continue;
+        owner.closeTabByIndex(tab);
+        return;
+    }
 }
 
 /// Close a tab by surface pointer. Removes from the tab list,
@@ -1823,6 +1840,9 @@ fn handleTabBarClick(self: *Window, x: i16, y: i16) void {
 }
 
 fn handleTabBarMiddleClick(self: *Window, x: i16, y: i16) void {
+    // Mouse capture can deliver a middle press while a divider still holds
+    // a handle into the active tab's split tree.
+    if (self.dragging_split) return;
     if (self.closing or !self.tab_bar_visible or y < 0 or y >= self.tabBarHeight()) return;
     const new_tab = self.new_tab_rect;
     if (x >= new_tab.left and x < new_tab.right and y >= new_tab.top and y < new_tab.bottom) return;

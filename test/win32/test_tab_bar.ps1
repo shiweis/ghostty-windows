@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory)][string]$ExePath,
     [Parameter(Mandatory)][string]$ResourcesPath,
     [Parameter(Mandatory)][string]$OutputDirectory,
-    [ValidateSet('opaque','transparent','light','close','all')][string]$Case='all'
+    [ValidateSet('opaque','transparent','light','close','close-splits','all')][string]$Case='all'
 )
 $ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Drawing
@@ -66,6 +66,17 @@ public static class TabBarTestNative {
     public static void MiddleBelow(IntPtr top){double scale=GetDpiForWindow(Check(top))/96.0;Post(top,0x207,0,Coordinates(100,(int)Math.Ceiling(32*scale)));}
     public static void MiddleCloseRegion(IntPtr top,int index,int count){var rect=Client(top);double scale=GetDpiForWindow(Check(top))/96.0;double width=(rect.Width-Math.Round(36*scale))/count;Post(top,0x207,0,Coordinates((int)Math.Round((index+1)*width-16*scale),TabY(top)));}
     public static void TerminalMiddle(IntPtr child){long point=Coordinates(2,2);Post(child,0x207,0x10,point);Post(child,0x208,0,point);}
+    public static int Width(IntPtr hwnd){return Client(hwnd).Width;}
+    public static void MiddleDuringDividerDrag(IntPtr top,int index,int count){
+        var client=Client(top);
+        int y=client.Bottom/2;
+        Post(top,0x201,1,Coordinates(client.Width/2,y));
+        Post(top,0x200,1,Coordinates(2*client.Width/3,y));
+        long tab=Coordinates(TabX(top,index,count),TabY(top));
+        Post(top,0x207,0x11,tab);
+        Post(top,0x208,1,tab);
+        Post(top,0x202,0,tab);
+    }
     public static void Capture(IntPtr top,string path){
         Rect rect;if(!GetWindowRect(Check(top),out rect))throw new Exception("GetWindowRect failed");
         using(var bitmap=new Bitmap(rect.Width,rect.Bottom-rect.Top)){
@@ -389,6 +400,45 @@ function Run-TerminalMiddleBoundary{
     Check (@(Children $run $false).Count -eq 1 -and (Shell-Pid $run) -eq $pidValue -and (Child-ProcessAlive $pidValue)) 'close: terminal child middle down/up leaves tab identity intact' @{Pid=$pidValue}
     Stop-RunCleanly $run
 }
+function Run-DividerDragMiddle{
+    $run=Start-Run 1.0 'close-divider-drag' $false
+    $tabs=@(Add-Tabs $run 2)
+    [TabBarTestNative]::Key((Children $run)[0],0x77)
+    Wait-For $run 'active tab has two panes' {@(Children $run).Count -eq 2 -and @(Child-Pids $run).Count -eq 3}
+    [TabBarTestNative]::Paint($run.Top)
+    [TabBarTestNative]::MiddleDuringDividerDrag($run.Top,1,2)
+    Wait-For $run 'divider moved and both panes remain visible after middle-click' {
+        $panes=@(Children $run)
+        $width=[TabBarTestNative]::Width($run.Top)
+        $panes.Count -eq 2 -and @($panes|Where-Object{[TabBarTestNative]::Width($_) -gt $width*0.6}).Count -eq 1
+    }
+    Check (@(Children $run $false).Count -eq 3 -and (Child-ProcessAlive $tabs[0])) 'close: middle-click during divider drag preserves both tabs' @{}
+    Stop-RunCleanly $run
+}
+function Run-RepresentativeExit{
+    $run=Start-Run 1.0 'close-representative-exit' $true
+    $survivorHwnd=@(Children $run)[0]
+    $survivor,$sibling=@(Add-Tabs $run 2)
+    [TabBarTestNative]::Key((Children $run)[0],0x77)
+    Wait-For $run 'new split is the active representative' {
+        $active=Shell-Pid $run
+        @(Child-Pids $run).Count -eq 3 -and @(Children $run).Count -eq 2 -and $active -ne 0 -and $active -notin @($survivor,$sibling)
+    }
+    $representative=Shell-Pid $run
+    [TabBarTestNative]::Paint($run.Top)
+    Close-ByGesture $run 'middle' 1 2
+    Wait-For $run 'split tab opens one confirmation' {@(Dialogs $run).Count -eq 1}
+    Request-Exit $run $representative
+    Wait-For $run 'representative exits before confirmation is answered' {
+        -not (Child-ProcessAlive $representative) -and @(Children $run $false).Count -eq 2 -and @(Dialogs $run).Count -eq 1
+    }
+    Answer-Dialog $run 1
+    Wait-For $run 'approval closes the surviving sibling only' {
+        -not (Child-ProcessAlive $sibling) -and @(Children $run $false).Count -eq 1 -and @(Children $run)[0] -eq $survivorHwnd
+    }
+    Check ((Child-ProcessAlive $survivor) -and (Shell-Pid $run) -eq $survivor) 'close: confirmed tab still closes after its representative exits' @{Survivor=$survivor}
+    Stop-RunCleanly $run
+}
 function Invoke-CloseScenarios{
     Run-MiddleActive
     Run-MiddleActiveNonRightmost
@@ -414,10 +464,17 @@ function Invoke-CloseScenarios{
     Run-FinalTab 'middle' $true
     Run-MiddleBoundaries
     Run-TerminalMiddleBoundary
+    Run-DividerDragMiddle
+    Run-RepresentativeExit
 }
 try{
     $modes=if($Case -eq 'all'){@(@{Name='opaque';Opacity=1.0},@{Name='transparent';Opacity=0.8},@{Name='light';Opacity=1.0},@{Name='close';Opacity=1.0})}elseif($Case -eq 'close'){@(@{Name='close';Opacity=1.0})}elseif($Case -eq 'transparent'){@(@{Name='transparent';Opacity=0.8})}else{@(@{Name=$Case;Opacity=1.0})}
     foreach($mode in $modes){
+        if($mode.Name -eq 'close-splits'){
+            Run-DividerDragMiddle
+            Run-RepresentativeExit
+            continue
+        }
         if($mode.Name -eq 'close'){
             $current=Start-Run 1.0 'close-x-cancel' $true
             $active=@(Children $current)[0];$activePid=Shell-Pid $current
