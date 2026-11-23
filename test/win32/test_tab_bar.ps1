@@ -189,28 +189,61 @@ function Start-Run([double]$opacity,[string]$name,[bool]$confirm=$false,[string]
     [TabBarTestNative]::ProcessId=$run.Process.Id
     Wait-For $run 'initial native window' {$tops=@([TabBarTestNative]::Find('GhosttyWindow',[IntPtr]::Zero,$true));if($tops.Count -eq 1){$run.Top=$tops[0];return @(Children $run).Count -eq 1};return $false}
     [TabBarTestNative]::Position($run.Top)
-    Wait-For $run 'initial terminal fixture' {(Shell-Pid $run) -ne 0}
+    $run.Panes=@{}
+    Wait-For $run 'initial terminal fixture' {
+        $shell=Shell-Pid $run
+        $visible=@(Children $run)
+        if($visible.Count -ne 1 -or $shell -notin @(Child-Pids $run)){return $false}
+        $run.Panes[$shell]=$visible[0]
+        return $true
+    }
     [TabBarTestNative]::Paint($run.Top)
     return $run
 }
 function Child-Pids($run){return @((Get-ChildItem -LiteralPath $run.State -Filter 'live-*' -ErrorAction SilentlyContinue)|ForEach-Object{[int]$_.Name.Substring(5)})}
 function Child-ProcessAlive([int]$pidValue){return [bool](Get-Process -Id $pidValue -ErrorAction SilentlyContinue)}
+function Visible-Tab($run,[int]$pidValue){
+    $visible=@(Children $run)
+    return $visible.Count -eq 1 -and $visible[0] -eq $run.Panes[$pidValue] -and (Shell-Pid $run) -eq $pidValue
+}
 function Select-Pid($run,[int]$pidValue){
-    for($attempt=0;$attempt -lt 4 -and (Shell-Pid $run) -ne $pidValue;$attempt++){
+    for($attempt=0;$attempt -lt $run.Panes.Count -and -not (Visible-Tab $run $pidValue);$attempt++){
         $prior=Shell-Pid $run
-        [TabBarTestNative]::Key((Children $run)[0],0x73)
-        Wait-For $run "select tab for child $pidValue" {$next=Shell-Pid $run;return $next -ne 0 -and $next -ne $prior}
+        [TabBarTestNative]::Key($run.Panes[$prior],0x73)
+        Wait-For $run "select tab for child $pidValue" {
+            $next=Shell-Pid $run
+            return $next -ne $prior -and $run.Panes.ContainsKey($next) -and (Visible-Tab $run $next)
+        }
     }
-    if((Shell-Pid $run) -ne $pidValue){throw "Could not select tab for child $pidValue; active child is $(Shell-Pid $run)"}
+    if(-not (Visible-Tab $run $pidValue)){throw "Could not select tab for child $pidValue; active child is $(Shell-Pid $run)"}
+}
+function Add-Pane($run,[int]$sourcePid,[switch]$Split){
+    $priorVisible=@(Children $run)
+    $key=if($Split){0x77}else{0x78}
+    [TabBarTestNative]::Key($run.Panes[$sourcePid],$key)
+    Wait-For $run "new pane from child $sourcePid" {
+        $allHwnds=@(Children $run $false)
+        $allPids=@(Child-Pids $run)
+        if($allHwnds.Count -ne $run.Panes.Count+1 -or $allPids.Count -ne $run.Panes.Count+1){return $false}
+        $newHwnds=@($allHwnds | Where-Object {$_ -notin $run.Panes.Values})
+        $newPids=@($allPids | Where-Object {-not $run.Panes.ContainsKey($_)})
+        if($newHwnds.Count -ne 1 -or $newPids.Count -ne 1 -or (Shell-Pid $run) -ne $newPids[0]){return $false}
+        # The new title can arrive while the outgoing tab is still visible.
+        $visible=@(Children $run)
+        if($newHwnds[0] -notin $visible){return $false}
+        if($Split){
+            if($visible.Count -ne $priorVisible.Count+1 -or @($priorVisible | Where-Object {$_ -notin $visible}).Count -ne 0){return $false}
+        }elseif($visible.Count -ne 1){return $false}
+        $run.Panes[$newPids[0]]=$newHwnds[0]
+        return $true
+    }
+    return (Shell-Pid $run)
 }
 function Add-Tabs($run,[int]$count){
     $ids=[Collections.Generic.List[int]]::new()
     $ids.Add((Shell-Pid $run))
     while($ids.Count -lt $count){
-        $prior=Shell-Pid $run
-        [TabBarTestNative]::Key((Children $run)[0],0x78)
-        Wait-For $run "new controlled tab $($ids.Count+1)" {@(Children $run $false).Count -eq $ids.Count+1 -and (Shell-Pid $run) -ne 0 -and (Shell-Pid $run) -ne $prior}
-        $ids.Add((Shell-Pid $run))
+        $ids.Add((Add-Pane $run $ids[-1]))
     }
     [TabBarTestNative]::Paint($run.Top)
     return $ids.ToArray()
@@ -233,7 +266,7 @@ function Run-MiddleActive{
     $ids=@(Add-Tabs $run 2);$prior=$ids[0];$target=$ids[1]
     Close-ByGesture $run 'middle' 1 2
     Wait-For $run 'middle press closes active non-final tab and selects predecessor' {@(Children $run $false).Count -eq 1 -and (Shell-Pid $run) -eq $prior -and -not (Child-ProcessAlive $target)}
-    Check ((Children $run).Count -eq 1 -and (Shell-Pid $run) -eq $prior) 'close: active middle-close selects preceding tab' @{Previous=$prior;Closed=$target}
+    Check (Visible-Tab $run $prior) 'close: active middle-close selects preceding tab' @{Previous=$prior;Closed=$target}
     Stop-RunCleanly $run
     Check ($run.Process.ExitCode -eq 0) 'close: active-tab fixture exits cleanly' @{ExitCode=$run.Process.ExitCode}
 }
@@ -243,7 +276,7 @@ function Run-MiddleActiveNonRightmost{
     Select-Pid $run $target
     Close-ByGesture $run 'middle' 1 3
     Wait-For $run 'middle press closes active middle tab and selects successor' {@(Children $run $false).Count -eq 2 -and (Shell-Pid $run) -eq $successor -and -not (Child-ProcessAlive $target)}
-    Check ((Children $run).Count -eq 1 -and (Shell-Pid $run) -eq $successor) 'close: active middle-tab close selects its successor' @{Closed=$target;Successor=$successor}
+    Check (Visible-Tab $run $successor) 'close: active middle-tab close selects its successor' @{Closed=$target;Successor=$successor}
     Stop-RunCleanly $run
     Check ($run.Process.ExitCode -eq 0) 'close: active middle-tab fixture exits cleanly' @{ExitCode=$run.Process.ExitCode}
 }
@@ -251,7 +284,7 @@ function Run-InactiveIdentity([string]$gesture,[int]$index){
     $run=Start-Run 1.0 "close-$gesture-inactive-$index" $false
     $ids=@(Add-Tabs $run 3);$active=$ids[1];$target=$ids[$index]
     Select-Pid $run $active
-    $activeHwnd=@(Children $run)[0]
+    $activeHwnd=$run.Panes[$active]
     Close-ByGesture $run $gesture $index 3
     Wait-For $run "$gesture closes only inactive tab $index" {@(Children $run $false).Count -eq 2 -and -not (Child-ProcessAlive $target)}
     Check ((Shell-Pid $run) -eq $active -and @(Children $run)[0] -eq $activeHwnd) "close: $gesture inactive close preserves active HWND/PID" @{Target=$target;Active=$active}
@@ -269,7 +302,7 @@ function Run-Confirm([string]$gesture,[bool]$approve,[bool]$promptOnly=$false){
     if($promptOnly){Request-Prompt $run $target;Wait-For $run 'prompt title acknowledgment' {[TabBarTestNative]::Text($run.Top) -eq "tab-probe-$target-prompt"}}
     else{[TabBarTestNative]::Key(@(Children $run)[0],0x58);Wait-For $run 'target child records running input' {$s=State $run $target;return $s -and (@($s.Keys)-join ',') -eq 'x'}}
     Select-Pid $run $active
-    $activeHwnd=@(Children $run)[0]
+    $activeHwnd=$run.Panes[$active]
     Close-ByGesture $run $gesture 0 2
     if($promptOnly){
         Wait-For $run "$gesture idle prompt closes without confirmation" {@(Dialogs $run).Count -eq 0 -and @(Children $run $false).Count -eq 1}
@@ -291,16 +324,14 @@ function Run-Confirm([string]$gesture,[bool]$approve,[bool]$promptOnly=$false){
 function Run-SplitProtection([string]$gesture,[bool]$approve){
     $run=Start-Run 1.0 "close-split-$gesture-$approve" $true
     $original=Shell-Pid $run
-    [TabBarTestNative]::Key((Children $run)[0],0x77)
-    Wait-For $run 'split fixture creates second controlled child' {@(Children $run $false).Count -eq 2 -and @(Child-Pids $run).Count -eq 2}
-    $splitPids=@(Child-Pids $run);$target=@($splitPids|Where-Object{$_ -ne $original})[0];$other=$original
-    Wait-For $run 'new split becomes the focused representative' {(Shell-Pid $run) -eq $target}
+    $target=Add-Pane $run $original -Split
+    $other=$original
+    $splitHwnds=@($run.Panes[$original],$run.Panes[$target])
     Request-Prompt $run $target
     Wait-For $run 'focused split emits prompt title acknowledgment' {[TabBarTestNative]::Text($run.Top) -eq "tab-probe-$target-prompt"}
-    [TabBarTestNative]::Key((Children $run)[0],0x78)
-    Wait-For $run 'unrelated tab becomes active' {@(Children $run $false).Count -eq 3 -and @(Child-Pids $run).Count -eq 3 -and (Shell-Pid $run) -ne $target}
+    $survivor=Add-Pane $run $target
+    $survivorHwnd=$run.Panes[$survivor]
     [TabBarTestNative]::Paint($run.Top)
-    $survivor=Shell-Pid $run;$survivorHwnd=@(Children $run)[0];$splitHwnds=@(Children $run $false)
     Close-ByGesture $run $gesture 0 2
     Wait-For $run "$gesture split close prompts for non-focused running split" {@(Dialogs $run).Count -eq 1}
     Capture-Dialog $run "$gesture-split-$approve"
@@ -310,7 +341,7 @@ function Run-SplitProtection([string]$gesture,[bool]$approve){
         Wait-For $run "$gesture OK closes both target splits only" {@(Children $run $false).Count -eq 1 -and (Shell-Pid $run) -eq $survivor -and -not (Child-ProcessAlive $target) -and -not (Child-ProcessAlive $other) -and @(Children $run)[0] -eq $survivorHwnd}
     }else{
         Wait-For $run "$gesture Cancel retains unrelated tab and both splits" {@(Children $run $false).Count -eq 3 -and (Shell-Pid $run) -eq $survivor}
-        Check ((Child-ProcessAlive $target) -and (Child-ProcessAlive $other) -and (Child-ProcessAlive $survivor) -and @($splitHwnds|Where-Object{$_ -notin @(Children $run $false)}).Count -eq 0) "close: $gesture split Cancel preserves both split HWNDs and active identity" @{Representative=$target;OtherSplit=$other;Survivor=$survivor}
+        Check ((Child-ProcessAlive $target) -and (Child-ProcessAlive $other) -and (Visible-Tab $run $survivor) -and (Child-ProcessAlive $survivor) -and @($splitHwnds|Where-Object{$_ -notin @(Children $run $false)}).Count -eq 0) "close: $gesture split Cancel preserves both split HWNDs and active identity" @{Representative=$target;OtherSplit=$other;Survivor=$survivor}
     }
     Stop-RunCleanly $run
 }
@@ -321,7 +352,7 @@ function Run-ModalExit([bool]$allChildren){
     [TabBarTestNative]::Key((Children $run)[0],0x58)
     Wait-For $run 'modal target child records running input' {$s=State $run $target;return $s -and (@($s.Keys)-join ',') -eq 'x'}
     Select-Pid $run $survivor
-    $survivorHwnd=@(Children $run)[0]
+    $survivorHwnd=$run.Panes[$survivor]
     Close-ByGesture $run 'middle' 0 2
     Wait-For $run 'modal reentrancy opens aggregate confirmation' {@(Dialogs $run).Count -eq 1}
     Capture-Dialog $run "modal-exit-$allChildren"
@@ -364,7 +395,7 @@ function Run-MiddleBoundaries{
     $run=Start-Run 1.0 'close-middle-boundaries' $false
     $ids=@(Add-Tabs $run 3);$active=$ids[1]
     Select-Pid $run $active
-    $activeHwnd=@(Children $run)[0]
+    $activeHwnd=$run.Panes[$active]
     [TabBarTestNative]::MiddlePlus($run.Top)
     [TabBarTestNative]::MiddleNegative($run.Top)
     [TabBarTestNative]::MiddleBelow($run.Top)
@@ -403,8 +434,7 @@ function Run-TerminalMiddleBoundary{
 function Run-DividerDragMiddle{
     $run=Start-Run 1.0 'close-divider-drag' $false
     $tabs=@(Add-Tabs $run 2)
-    [TabBarTestNative]::Key((Children $run)[0],0x77)
-    Wait-For $run 'active tab has two panes' {@(Children $run).Count -eq 2 -and @(Child-Pids $run).Count -eq 3}
+    [void](Add-Pane $run $tabs[1] -Split)
     [TabBarTestNative]::Paint($run.Top)
     [TabBarTestNative]::MiddleDuringDividerDrag($run.Top,1,2)
     Wait-For $run 'divider moved and both panes remain visible after middle-click' {
@@ -417,14 +447,9 @@ function Run-DividerDragMiddle{
 }
 function Run-RepresentativeExit{
     $run=Start-Run 1.0 'close-representative-exit' $true
-    $survivorHwnd=@(Children $run)[0]
     $survivor,$sibling=@(Add-Tabs $run 2)
-    [TabBarTestNative]::Key((Children $run)[0],0x77)
-    Wait-For $run 'new split is the active representative' {
-        $active=Shell-Pid $run
-        @(Child-Pids $run).Count -eq 3 -and @(Children $run).Count -eq 2 -and $active -ne 0 -and $active -notin @($survivor,$sibling)
-    }
-    $representative=Shell-Pid $run
+    $survivorHwnd=$run.Panes[$survivor]
+    $representative=Add-Pane $run $sibling -Split
     [TabBarTestNative]::Paint($run.Top)
     Close-ByGesture $run 'middle' 1 2
     Wait-For $run 'split tab opens one confirmation' {@(Dialogs $run).Count -eq 1}
