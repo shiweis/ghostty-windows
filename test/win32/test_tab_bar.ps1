@@ -510,7 +510,16 @@ function Run-Indicators {
     Select-Pid $run $first
     Wait-For $run 'return restores read-only status' {'Read-only' -in @(StatusLabels)}
     Request-Exit $run $first
-    Wait-For $run 'closing selected pane clears its status' {(Shell-Pid $run) -eq $second -and 'Read-only' -notin @(StatusLabels)}
+    Wait-For $run 'read-only pane requires confirmation after child exit' {@(Dialogs $run).Count -eq 1}
+    $dialog=@(Dialogs $run)[0]
+    $message=@([TabBarTestNative]::Find('Static',$dialog,$true) | ForEach-Object{[TabBarTestNative]::Text($_)})
+    Check (([TabBarTestNative]::Text($dialog) -eq 'Ghostty') -and ($message -like '*Close anyway?*') -and
+        (Visible-Tab $run $first) -and 'Read-only' -in @(StatusLabels)) 'read-only pane retains its status pending close confirmation' @{Target=$first;Survivor=$second}
+    Answer-Dialog $run 1
+    Wait-For $run 'closing selected pane clears its status' {
+        @(Dialogs $run).Count -eq 0 -and @(Children $run $false).Count -eq 1 -and
+            (Visible-Tab $run $second) -and 'Read-only' -notin @(StatusLabels)
+    }
     Stop-RunCleanly $run
 }
 function Run-PaneDrag {

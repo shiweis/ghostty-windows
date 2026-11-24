@@ -7,12 +7,31 @@ security restrictions until a tested replacement is available.
 
 ## 1.4 release audit
 
-The Windows 1.4 release baseline is upstream `v1.4.0` (`83fb95624`).
-Merge `2d858569a` includes upstream `main` through `167acf0c4`
-(November 24, 2026 UTC). Hold the Windows release tag and publication until
-the common features below work on Windows and pass their acceptance checks.
-The [compatibility table](README.md#ghostty-14-compatibility) summarizes
-what users can rely on today.
+The Windows x64 candidate `1.4.0-rc.1+59003a9a6` passed the common
+feature checks below. Its release baseline is upstream `v1.4.0`
+(`83fb95624`). Merge `2d858569a` includes the 456 subsequent upstream
+commits through `167acf0c4`. The
+[compatibility table](README.md#ghostty-14-compatibility) describes the
+supported behavior and the platform-specific work in later phases.
+
+### Candidate verification
+
+- Commit `59003a9a6` built in Debug and ReleaseFast with Zig 0.17.1.
+  The Windows unit suite passed 4,310 tests with 77 skips. The shared
+  libghostty-vt suite passed 7,259 with 74 skips. A separate private
+  window station exercised the clipboard cases skipped on a shared desktop.
+- The extracted portable ZIP passed 108 native UI checks across 48 launches.
+  Lifecycle tests verified directory inheritance, pane focus and quit
+  confirmation. Windows PowerShell 5.1 and PowerShell 7 each passed 39
+  integration checks. Both used the packaged executable for interactive
+  loopback OpenSSH sessions and for the configuration editor tests.
+  [Native UI checks](test/win32/test_tab_bar.ps1) and
+  [shell integration checks](test/win32/test_shell_integration.ps1)
+- The ZIP contained 939 entries and 914 themes. The executable reported
+  `1.4.0-rc.1+59003a9a6` and its PE file and product versions were
+  `1.4.0.0`. ZIP SHA-256 was
+  `46af46f1d66a0b989a3f35c862a416f39c753074564d15658b215554a0dfed2b`.
+  [Package checks](test/win32/test_package.ps1)
 
 ### Clipboard, shell and terminal protocols
 

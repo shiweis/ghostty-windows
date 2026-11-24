@@ -5,10 +5,10 @@ the underlying upstream commit when known.
 
 ## Unreleased
 
-Release target: `win-v1.4.0`, based on upstream Ghostty `v1.4.0` (`83fb95624`,
-released 2026-10-27), with the native Win32 runtime and the Windows fixes below.
-Publication is held until full feature parity is implemented and verified.
-The README compatibility table and roadmap track the remaining gaps.
+The Windows x64 candidate `1.4.0-rc.1+59003a9a6` targets `win-v1.4.0`
+and is based on upstream Ghostty `v1.4.0` (`83fb95624`, released
+2026-10-27). The extracted portable archive passed native UI, shell,
+editor and package checks. [Candidate verification](ROADMAP.md#candidate-verification)
 
 ### Upstream
 
