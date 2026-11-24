@@ -44,17 +44,18 @@ checks below. [Upstream 1.4.0 release notes](https://ghostty.org/docs/install/re
 | Area | Windows status |
 |------|----------------|
 | Terminal parsing, reset, checksums, snapshots, and security fixes | Integrated from 1.4.0; focused core and Windows tests cover the shared behavior. ConPTY can consume some sequences before they reach Ghostty. |
-| Kitty graphics animation and relative placements | Shared implementation and renderer integrated; full protocol conformance through ConPTY has not been independently established. |
-| Scrollback compression and memory reclamation | Enabled with the Windows retained-mapping backend; upstream macOS/Linux benchmark figures are not Windows measurements. |
-| `ghostty +ssh` | Shared wrapper integrated; native OpenSSH CRLF output is handled and Windows does not request Unix socket multiplexing. Remote terminfo installation has not been tested against a live SSH server. |
-| Kitty clipboard (OSC 5522) | Text only. Image, HTML, and mixed-format writes are rejected as unsupported. Paste events (mode 5522), image previews, and remembered authorization UI are unavailable. |
-| Splits | Creation, navigation, divider resizing, zoom, and equalization work. Dragging a pane between splits, tabs, or windows is unavailable. |
-| Window navigation and state indicators | `goto_window` does not switch windows; key-sequence, key-table, and read-only status indicators are unavailable. |
-| Bell and inactive-pane appearance | Windows does not fully honor `bell-features` or the unfocused split opacity/fill settings. |
-| PowerShell shell features | Prompt marks, directory/title reports, and cursor features work. The exported `ssh-env`, `ssh-terminfo`, and `path` feature flags are not implemented by the PowerShell script. |
+| Kitty graphics animation and relative placements | With the bundled ConPTY host, WGL capture tests verified frame selection, automatic animation, and a child image following its parent placement. |
+| Scrollback compression and memory reclamation | Native Windows tests verified pruning, search and rendering. With a 4 MiB history limit and 12,000 Git subjects, nine cold pages compressed from 3.41 MiB to 0.59 MiB. |
+| `ghostty +ssh` | Windows OpenSSH installed a usable `xterm-ghostty` entry on a live loopback server, retried a failed install, and reused the cached result. |
+| Kitty clipboard (OSC 5522) | Reads and writes multiple MIME representations together, including JSON, JPEG and custom binary formats. Plain text, HTML and PNG also interoperate with native Windows text, rich-text and bitmap consumers. Mode 5522 lists clipboard targets and authorizes one follow-up read. Permission dialogs preview the content and can remember a client’s grant. |
+| Splits | Create, resize, zoom or equalize panes. Drag a pane by its grip to another pane, tab or window while its child keeps running. `split-preserve-zoom=navigation` moves zoom to the destination pane. |
+| Window navigation and state indicators | `goto_window:next` and `goto_window:previous` restore each window’s selected pane. `focus-follows-mouse` switches panes within the foreground window. A click-through status control shows active key sequences, key tables and read-only state. |
+| Window sizing and scrolling | Normal windows honor the configured grid, maximize, and fullscreen at launch. Opening another tab or split preserves the window bounds. `scrollbar=system` follows Windows accessibility settings. `scrollbar=never` releases the gutter and keeps keyboard and wheel scrolling available. |
+| Bell and inactive-pane appearance | Inactive panes honor the configured fill and opacity on opaque and transparent windows. `bell-features` controls the system alert, custom audio and volume, taskbar attention, title and pane border. |
+| PowerShell shell features | Prompt marks, directory/title reports, cursor features, `ssh-env`, `ssh-terminfo`, and `path` work in Windows PowerShell 5.1 and PowerShell 7. Interactive OpenSSH keeps the calling console. |
 | Window theme | The `set_window_theme` action accepts `light`, `dark`, `system`, or `config`. Use `config` to restore the configured `window-theme`. |
-| Tab overview and colors | Searchable native title list. Live thumbnails and GTK’s per-tab color picker are unavailable. |
-| Inspector and session undo/redo | Unavailable; tracked in the roadmap. Upstream undo/redo is macOS-only. |
+| Tab overview and colors | The native overview lists searchable titles. Right-click a tab to set or clear its color. The color follows the tab when reordered or moved to a new window. Live thumbnails remain planned. |
+| Inspector and session undo/redo | The native WGL inspector shows shared terminal state, input and PTY events. Windows session undo/redo remains on the roadmap. |
 | Distribution | Portable x64 ZIP; MSI/MSIX installers are unavailable. |
 
 The Windows audit also covers clipboard ownership and malformed text,
@@ -81,6 +82,7 @@ PowerShell prompt injection, and hidden-window visibility. See the
 **Windows & Tabs**
 - Multiple windows, tabbed interface with custom GDI tab bar
 - Standalone theme-colored tab strip with centered titles and hover close buttons on the right
+- Change `window-title-font-family`, `window-show-tab-bar`, and `split-divider-color` on reload
 - Tab drag-and-drop reorder, inline rename (double-click), right-click context menu
 - Close tab modes: current, all others, all to the right
 - Searchable native tab overview with keyboard switching and whole-tab closing
@@ -94,14 +96,17 @@ PowerShell prompt injection, and hidden-window visibility. See the
 **Security**
 - Paste protection: unsafe/multi-line pastes prompt before reaching the
   shell (`clipboard-paste-protection`)
-- OSC 52 clipboard read/write authorization prompts
-  (`clipboard-read` / `clipboard-write = ask`)
+- OSC 52 and Kitty clipboard authorization prompts show the requested formats,
+  a bounded text preview and a thumbnail for images. A Kitty client can ask
+  for a remembered grant for reads or writes. Unsupported formats leave the
+  current clipboard intact.
 
 **Extras**
 - Command palette with filterable actions, keybinding hints, and
   user-defined entries (`command-palette-entry`)
-- Right-click context menu on the terminal (Copy / Paste / Select All /
-  Split / Reset)
+- Right-click a terminal pane to copy, paste, select all, split in any of
+  four directions, close that pane, or reset the terminal. **Close Split**
+  uses the same confirmation policy as the keyboard action.
 - Taskbar progress for OSC 9;4 progress reports (`ITaskbarList3`)
 - Global hotkeys for any `global:`-flagged keybind (not just the quick
   terminal)
@@ -113,7 +118,9 @@ PowerShell prompt injection, and hidden-window visibility. See the
 - Search bar match counter ("3/17")
 - Command-finished notifications (`notify-on-command-finish*`): bell
   and/or a desktop notification with duration and exit code
-- Desktop notifications are click-to-focus (raise the originating tab)
+- Desktop notifications (OSC 9 and OSC 777) raise the originating pane when
+  clicked. Repeated messages replace earlier ones in that pane. Focusing or
+  closing a pane clears its notifications.
 - X1/X2 (back/forward) mouse buttons delivered to the terminal
 - `window-decoration = none` (borderless) and `window-position-x/y`
 - Renderer occlusion: hidden tabs, zoomed-out splits, and minimized
@@ -121,7 +128,6 @@ PowerShell prompt injection, and hidden-window visibility. See the
 - Quick terminal (slide-in/out from screen edge with global hotkey)
 - Find-in-terminal search bar
 - URL detection with Ctrl+click to open in browser
-- Desktop notifications (OSC 9, OSC 777)
 - Background opacity, fullscreen, window decorations toggle
 - Font size zoom with inheritance to new tabs/splits
 - Config hot-reload, scrollbar
@@ -267,6 +273,11 @@ From WSL with Zig 0.17.1 and Windows interop available:
 bash dist/windows/package.sh
 ```
 
+To build a local release candidate from the working tree, pass an explicit
+Semantic Versioning prerelease such as `bash dist/windows/package.sh --candidate 1.4.0-rc.1`.
+The script appends the short Git commit to the build metadata. The executable
+and ZIP use `1.4.0-rc.1+<commit>`, and Explorer reports `1.4.0.0`.
+
 Once the parity gate is satisfied, check out the clean annotated release tag and run
 `bash dist/windows/package.sh --release`. Release packaging checks the exact tag,
 executable version, and numeric/string PE versions. Both development and release
@@ -348,6 +359,25 @@ shows tabs in the current normal window, not the quick terminal.
 | Find previous | `Shift+Enter` (in search bar) |
 | Close search | `Escape` |
 
+Set `copy-on-select=primary` to keep the most recent selection available to
+every pane and window in this Ghostty process. Middle-click and
+`paste_from_selection` paste that selection. The default is
+`copy-on-select=none`. Use `copy-on-select=both` to also copy to Windows.
+OSC 52's selection and primary locations and Kitty's `loc=primary` use the
+same private selection and honor clipboard permissions.
+
+Kitty OSC 5522 exposes MIME-named Windows clipboard formats. Ghostty records
+the byte length of each custom format it writes, preserving empty payloads and
+trailing zero bytes. For data from other applications, Ghostty uses the length
+of an OLE stream when available. A native memory block with no length metadata
+exposes its full allocation, which can include alignment padding.
+
+A transaction can contain up to 128 representations and 256 MiB of data.
+Windows keeps registered format names for the lifetime of its window station.
+Ghostty creates up to 64 new MIME names per process and stops creating names
+when the station reaches 4,096 registered formats. Existing names remain usable.
+An invalid or over-limit write leaves the previous clipboard contents intact.
+
 ### Font Size
 
 | Action | Shortcut |
@@ -375,7 +405,8 @@ The quick terminal requires a keybinding in your config:
 keybind = global:ctrl+grave_accent=toggle_quick_terminal
 ```
 
-The `global:` prefix makes it work system-wide, even when Ghostty isn't focused.
+The `global:` prefix makes the shortcut work when another application has focus.
+Shells in the quick terminal and its splits receive `GHOSTTY_QUICK_TERMINAL=1`.
 
 ## Configuration
 
@@ -383,6 +414,12 @@ The preferred config file is `%LOCALAPPDATA%\ghostty\config.ghostty`.
 If `XDG_CONFIG_HOME` is set, use `%XDG_CONFIG_HOME%\ghostty\config.ghostty`
 instead. The legacy filename `config` is also supported. When both files
 exist, Ghostty loads `config` first, then `config.ghostty`.
+
+Run `ghostty +edit-config` to open the preferred config file. Set
+`VISUAL` or `EDITOR` to the editor command, quoting an executable path
+that contains spaces. Ghostty uses `VISUAL` first, passes any editor options
+before the config path, and returns the editor's exit code. If neither
+variable has a value, it prints the config path.
 
 Example:
 
@@ -603,6 +640,9 @@ It validates every target HWND against its own app process before sending
 messages, without global input injection or foreground requests. Dark opaque,
 dark translucent, and light fixtures exercise tab creation, keyboard and mouse
 selection, independent PTY input, right-side closing, and inline title editing.
+Use `-Case native-settings` to check scrollbar reload, wheel and keyboard
+scrolling, tab font rendering, divider color, and split focus. On a shared
+desktop the focus check uses whichever window Windows already put in front.
 JSON results, app logs, and native window captures are saved in the output
 directory. Blur is disabled in these fixtures; this is not a compositing test.
 The native composition regression uses PowerShell 7 and an idle interactive
@@ -627,6 +667,25 @@ editing, dark/light reloads, and live tab-strip blur. Creation traces cover the
 incoming frame's actual reveal, with terminal-edge, interior, stable tab-chrome,
 and independent-session input assertions.
 PNG/JSON evidence and app logs are saved in the output directory.
+
+The clipboard regression tests run against a private Windows window station.
+Build a focused test executable and stage it together with the ConPTY runtime
+files in a local Windows directory as described above. From the repository
+root, run the harness with the path to that staged executable.
+
+```bash
+bash dist/windows/build.sh test-build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Demit-test-exe=true '-Dtest-filter=Windows clipboard'
+```
+
+```powershell
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File test/win32/test_clipboard.ps1 -TestExe (Join-Path $testDir 'ghostty-unit.exe')
+```
+
+The harness checks native text, HTML and bitmap formats, MIME-named formats
+with exact binary lengths, Kitty paste events, and the permission dialog’s
+three responses. It also checks one-time and persistent read grants and
+cross-window selection pastes with the system clipboard held separately.
+The normal test suite skips the private-station case on the working desktop.
 
 The PowerShell integration regression test captures VT output in memory and
 needs neither a GUI nor the app binary. Run from the repository root in Windows:

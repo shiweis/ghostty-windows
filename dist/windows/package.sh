@@ -39,8 +39,8 @@ cd "$REPO_DIR"
 valid_candidate() {
     local LC_ALL=C
     local number='(0|[1-9][0-9]*)'
-    # A numeric prerelease identifier may contain zero or start with 1–9.
-    local identifier='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+    # Numeric prerelease identifiers follow the core's leading-zero rule.
+    local identifier="($number|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
     local metadata='([+][0-9A-Za-z-]+([.][0-9A-Za-z-]+)*)?'
     local pattern="^${number}[.]${number}[.]${number}-${identifier}([.]${identifier})*${metadata}$"
     [[ "$1" =~ $pattern ]]
@@ -48,7 +48,7 @@ valid_candidate() {
 
 RELEASE_VERSION=""
 CANDIDATE_VERSION=""
-VERSION_ARGS=()
+BUILD_ARGS=(-Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu "-Doptimize=$OPTIMIZE")
 if [ -n "$CANDIDATE" ]; then
     if [ "$RELEASE" = true ]; then usage; fi
     if ! valid_candidate "$CANDIDATE"; then
@@ -61,7 +61,7 @@ if [ -n "$CANDIDATE" ]; then
     else
         CANDIDATE_VERSION="$CANDIDATE+$COMMIT"
     fi
-    VERSION_ARGS+=("-Dversion-string=$CANDIDATE_VERSION")
+    BUILD_ARGS+=("-Dversion-string=$CANDIDATE_VERSION")
 fi
 if [ "$RELEASE" = true ]; then
     if [ "$OPTIMIZE" != fast ]; then
@@ -96,7 +96,7 @@ windows_path() {
 }
 
 echo "Building ghostty (optimize=$OPTIMIZE)..."
-bash "$SCRIPT_DIR/build.sh" -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize="$OPTIMIZE" "${VERSION_ARGS[@]}"
+bash "$SCRIPT_DIR/build.sh" "${BUILD_ARGS[@]}"
 
 for resource in bin/ghostty.exe bin/conpty.dll bin/OpenConsole.exe share/terminfo/ghostty.terminfo share/licenses/conpty/LICENSE.txt share/ghostty/shell-integration/powershell/ghostty-shell-integration.ps1; do
     if [ ! -f "zig-out/$resource" ]; then

@@ -36,6 +36,40 @@ The README compatibility table and roadmap track the remaining gaps.
 
 ### Windows Fixes and Adaptations
 
+- Open the config file in a native Windows editor with `ghostty +edit-config`.
+  Honor `VISUAL` and `EDITOR`, preserve quoted arguments, and return the
+  editor process's exit code.
+
+- Route notification clicks to the pane that sent the message. Replace
+  repeats within each pane and withdraw its notifications on focus or close.
+
+- Honor bell settings for system and custom audio, per-pane volume, taskbar
+  attention, titles and borders. Clear visual alerts on focus and input.
+
+- Set or clear a tab color from its context menu. Colored tabs keep their
+  indicator across reordering, detaching and changes of theme.
+
+- Add Split Left, Split Up, and Close Split to the terminal pane context
+  menu. Closing a pane follows its running-process and read-only policy.
+
+- Add a native WGL window for the shared terminal inspector, including
+  input, redraw, DPI changes and terminal shutdown.
+- Populate the command palette from each pane's configured entries and
+  searchable live sessions. Edit and clear pane, tab and window titles
+  independently.
+- Apply the configured fill and opacity to inactive split panes in the
+  Windows presenter, including transparent windows.
+- Honor the configured grid and initial fullscreen or maximized state on
+  new windows. Keep the outer window size when adding a tab or split.
+- Center partial-width and partial-height quick terminals on their selected
+  monitor edge. Set `GHOSTTY_QUICK_TERMINAL=1` in their child shells.
+  Honor `scrollbar=never` at startup and on reload.
+- Restore the selected pane when cycling normal windows. Honor split zoom
+  during navigation, and confirm app-wide quit across running sessions.
+- Forward SSH environment variables, install remote terminfo, and add the
+  Ghostty binary directory to PATH when the corresponding PowerShell shell
+  integration features are enabled. Preserve console attachment and exit
+  codes when invoking CLI actions from the GUI subsystem build.
 - Switch the session appearance from the command palette or a
   `set_window_theme` key binding. The override applies to existing and new
   windows and survives configuration reloads until reset with `config`.
@@ -48,9 +82,15 @@ The README compatibility table and roadmap track the remaining gaps.
 - Restyle the standalone tab strip with equal-width tabs, centered Segoe UI
   titles, theme-derived selection colors, and right-side hover close buttons.
   Keep the native Windows caption and separate tab row.
-- Use the stable application window as clipboard owner, propagate native
-  write failures, and reject unsupported Kitty clipboard representations
-  instead of acknowledging data that was not written.
+- Publish Unicode text, CF_HTML and PNG together with MIME-named formats
+  such as JSON, JPEG and custom binary data. Preserve exact byte lengths,
+  including trailing zero bytes, and supply a bitmap for native image consumers.
+  Rejected transactions preserve the previous clipboard.
+- Share primary selection across the app's panes and windows. Selection
+  paste, middle-click and explicit OSC selection requests use this buffer.
+- Enable Kitty mode 5522 paste events with one-time reads. Clipboard
+  permission dialogs show text previews and image thumbnails and support
+  remembered grants for applications that supply a session password.
 - Bound Unicode clipboard reads to the allocation size and reject malformed
   or unterminated text before converting it.
 - Resolve surface identity again after close confirmation so a child exit
