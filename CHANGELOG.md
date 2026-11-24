@@ -12,6 +12,12 @@ The README compatibility table and roadmap track the remaining gaps.
 
 ### Upstream
 
+- Merge 456 commits from upstream `main` through `167acf0c4` after the
+  1.4.0 release. The development tree now tracks `1.4.1-dev` and requires
+  Zig 0.17.1.
+- Add DEC column insertion/deletion and horizontal index operations. Pull in
+  fixes for soft wraps, prompt marks, Kitty graphics and snapshot restoration,
+  plus the independently versioned libghostty-vt C API.
 - Merge the final 73 upstream commits after `f54340ad7`, including fixes for
   zero-sized and oversized tmux panes, scrollback cursor style/hyperlink
   lifetime, erased-history image placements, C1 sequence continuations,
@@ -30,6 +36,12 @@ The README compatibility table and roadmap track the remaining gaps.
 
 ### Windows Fixes and Adaptations
 
+- Switch the session appearance from the command palette or a
+  `set_window_theme` key binding. The override applies to existing and new
+  windows and survives configuration reloads until reset with `config`.
+- Include the updated upstream themes on Windows. Use the displayed names
+  without a colon for Analog Heartbeat Phosphor, Neon Raincheck After Hours,
+  and Paper Crane Midnight Ink.
 - Close a tab and all its splits with a middle-button press on the tab strip,
   without selecting inactive tabs first. Use the existing split-aware close
   confirmation for both middle-click and the tab's X button.

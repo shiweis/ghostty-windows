@@ -43,7 +43,7 @@ fn run(init: std.process.Init) !u8 {
 }
 
 fn maintain(io: Io, allocator: Allocator, cache_path: []const u8) !void {
-    if (!std.mem.eql(u8, builtin.zig_version_string, "0.17.0"))
+    if (!std.mem.eql(u8, builtin.zig_version_string, "0.17.1"))
         return error.UnsupportedCacheCompilerVersion;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();

@@ -107,16 +107,20 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
     }
 
     // Themes
-    if (cfg.emit_themes) {
-        if (b.lazyDependency("iterm2_themes", .{})) |upstream| {
-            const install_step = b.addInstallDirectory(.{
-                .source_dir = upstream.path(""),
-                .install_dir = .{ .custom = "share" },
-                .install_subdir = b.pathJoin(&.{ "ghostty", "themes" }),
-                .exclude_extensions = &.{".md"},
-            });
-            try steps.append(b.allocator, &install_step.step);
-        }
+    if (cfg.emit_themes) themes: {
+        const source = if (cfg.target.result.os.tag == .windows)
+            (try windowsThemes(b)) orelse break :themes
+        else if (b.lazyDependency("iterm2_themes", .{})) |upstream|
+            upstream.path("")
+        else
+            break :themes;
+        const install_step = b.addInstallDirectory(.{
+            .source_dir = source,
+            .install_dir = .{ .custom = "share" },
+            .install_subdir = b.pathJoin(&.{ "ghostty", "themes" }),
+            .exclude_extensions = &.{".md"},
+        });
+        try steps.append(b.allocator, &install_step.step);
     }
 
     // Fish shell completions
@@ -420,6 +424,34 @@ fn addLinuxAppResources(
         b.path("images/gnome/512.png"),
         "share/icons/hicolor/256x256@2/apps/com.mitchellh.ghostty.png",
     ).step);
+}
+
+fn windowsThemes(b: *std.Build) !?std.Build.LazyPath {
+    const helper = b.addExecutable(.{
+        .name = "prepare-windows-themes",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/build/windows_themes.zig"),
+            .target = b.graph.host,
+            .optimize = .fast,
+        }),
+    });
+    const run = b.addRunArtifact(helper);
+    if (b.graph.host.result.os.tag == .windows) {
+        // Zig cannot unpack an archive containing ':' on Windows. Use the same
+        // archive as other hosts and verify it against the packagers' manifest.
+        const packages = try std.json.parseFromSliceLeaky(
+            std.json.ArrayHashMap(struct { hash: []const u8 }),
+            b.allocator,
+            @embedFile("../../deps/packages.json"),
+            .{ .ignore_unknown_fields = true },
+        );
+        const dep = @import("../../build.zig.zon").dependencies.iterm2_themes;
+        const archive = packages.map.get(dep.hash) orelse return error.MissingThemeArchiveChecksum;
+        run.addArgs(&.{ dep.url, archive.hash });
+    } else if (b.lazyDependency("iterm2_themes", .{})) |dep| {
+        run.addDirectoryArg(dep.path(""));
+    } else return null;
+    return run.addOutputDirectoryArg("themes");
 }
 
 pub fn install(self: *const GhosttyResources) void {

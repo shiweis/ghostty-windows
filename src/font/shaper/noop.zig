@@ -26,8 +26,8 @@ pub const Shaper = struct {
     /// The shared memory used for shaping results.
     cell_buf: CellBuf,
 
-    const CellBuf = std.ArrayListUnmanaged(font.shape.Cell);
-    const CodepointList = std.ArrayListUnmanaged(Codepoint);
+    const CellBuf = std.ArrayList(font.shape.Cell);
+    const CodepointList = std.ArrayList(Codepoint);
     const Codepoint = struct {
         codepoint: u32,
         cluster: u32,
@@ -70,10 +70,7 @@ pub const Shaper = struct {
         self: *Shaper,
         opts: font.shape.RunOptions,
     ) font.shape.RunIterator {
-        return .{
-            .hooks = .{ .shaper = self },
-            .opts = opts,
-        };
+        return .init(.{ .shaper = self }, opts);
     }
 
     pub fn shape(self: *Shaper, run: font.shape.TextRun) ![]const font.shape.Cell {

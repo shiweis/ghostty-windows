@@ -64,10 +64,7 @@ pub const Shaper = struct {
         self: *Shaper,
         opts: font.shape.RunOptions,
     ) font.shape.RunIterator {
-        return .{
-            .hooks = .{ .shaper = self },
-            .opts = opts,
-        };
+        return .init(.{ .shaper = self }, opts);
     }
 
     /// Shape the given text run. The text run must be the immediately
@@ -128,8 +125,8 @@ pub const Shaper = struct {
                 defer cp1 = cp2;
 
                 break :blk unicode.graphemeBreak(
-                    cp1,
-                    cp2,
+                    unicode.table.get(cp1).grapheme_break,
+                    unicode.table.get(cp2).grapheme_break,
                     &break_state,
                 );
             };

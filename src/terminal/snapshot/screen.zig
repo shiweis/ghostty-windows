@@ -321,6 +321,10 @@ pub const Decoded = struct {
 /// temporary allocations are released and no partially restored Screen escapes.
 /// The returned key selects the ScreenSet slot that owns the decoded screen.
 ///
+/// The last PAGE is restored with extra row capacity when it fits in the
+/// page pool, so output written after the restore continues in that page
+/// instead of starting a new one.
+///
 /// `record_header` is the SCREEN record's header, already read from
 /// `source`. A header for any other kind of record returns
 /// `error.UnexpectedRecordTag`. This function reads the headers of the PAGE
@@ -394,12 +398,23 @@ pub fn decode(
         });
         defer builder.deinit();
 
-        // Allocate each PAGE at its declared capacity and decode directly into
-        // builder-owned storage, avoiding an intermediate page representation.
-        for (0..header.page_count) |_| {
+        // Allocate each PAGE and decode directly into builder-owned storage,
+        // avoiding an intermediate page representation.
+        for (0..header.page_count) |i| {
             var decoder: page.Decoder = undefined;
             try decoder.init(source, try record.nextHeader(source));
-            const native_page = try builder.allocatePage(decoder.capacity());
+
+            // A PAGE header advertises only the rows the page held when it
+            // was encoded. The last page is where new output goes, so give
+            // it the rest of its pool item. Otherwise the first write after
+            // a restore starts a new page (#15192).
+            const capacity = decoder.capacity();
+            const native_page = try builder.allocatePage(
+                if (i == header.page_count - 1)
+                    TerminalPageList.fillPooled(capacity)
+                else
+                    capacity,
+            );
             try decoder.decode(native_page, alloc);
         }
 
@@ -429,8 +444,13 @@ pub fn decode(
                 .x = x,
                 .y = y,
                 .cursor_style = header.cursor_style,
-                .pending_wrap = header.cursor_flags.pending_wrap and
-                    x == row_pin.node.cols() - 1,
+                // Keep a pending wrap at whatever column it was saved. It is
+                // usually the last column, but a terminal can also leave one
+                // at a right margin (DECSLRM), or at any column after the
+                // margins change (DECRC, or turning DECLRMM off). Clearing it
+                // would make the next character overwrite the cursor cell
+                // instead of wrapping to the next row.
+                .pending_wrap = header.cursor_flags.pending_wrap,
                 .protected = header.cursor_flags.protected,
                 .style = header.cursor_pen,
                 .hyperlink_implicit_id = header.hyperlink_implicit_id,
@@ -490,7 +510,10 @@ pub fn decode(
     // `seen` is derived state. Only resident prompt metadata participates
     // because omitted history is outside the restored Screen model.
     result.semantic_prompt.seen = seen: {
-        if (result.cursor.semantic_content == .prompt) break :seen true;
+        // A cursor in prompt or input content counts even when no row is
+        // marked yet, because the next linefeed marks a row as a prompt
+        // continuation. See `SemanticPrompt.seen`.
+        if (result.cursor.semantic_content != .output) break :seen true;
 
         var node = result.pages.getTopLeft(.screen).node;
         while (true) {
@@ -842,7 +865,8 @@ pub const SavedCursor = struct {
             .y = @min(self.y, rows - 1),
             .style = self.pen,
             .protected = self.flags.protected,
-            .pending_wrap = self.flags.pending_wrap and x == cols - 1,
+            // Valid at any column, as for the cursor in decode().
+            .pending_wrap = self.flags.pending_wrap,
             .origin = self.flags.origin,
             .charset = self.charset,
         };
@@ -1190,12 +1214,12 @@ fn testHeader() Header {
         },
         .cursor_pen = .{
             .fg_color = .none,
-            .bg_color = .{ .palette = 0x7f },
-            .underline_color = .{ .rgb = .{
+            .bg_color = .palette(0x7f),
+            .underline_color = .rgb(.{
                 .r = 0x12,
                 .g = 0x34,
                 .b = 0x56,
-            } },
+            }),
             .flags = .{
                 .bold = true,
                 .italic = true,
@@ -1890,9 +1914,17 @@ test "SCREEN encodes the minimal complete-page active suffix" {
     // Mark each native page so the encoded sequence proves both omission and
     // oldest-to-newest ordering. The mixed page's marker is in its incidental
     // history prefix and must survive because complete pages are encoded.
-    historical.page().getRowAndCell(0, 0).cell.* = .init('A');
-    mixed.page().getRowAndCell(0, 0).cell.* = .init('B');
-    newest.page().getRowAndCell(0, 0).cell.* = .init('C');
+    // Rows that scrolling created are marked blank, so writing a cell
+    // directly must clear that like the terminal's own writers do.
+    inline for (.{
+        .{ historical, 'A' },
+        .{ mixed, 'B' },
+        .{ newest, 'C' },
+    }) |marker| {
+        const rac = marker[0].page().getRowAndCell(0, 0);
+        rac.cell.* = .init(marker[1]);
+        rac.row.blank = false;
+    }
 
     var destination: std.Io.Writer.Allocating = .init(
         std.testing.allocator,
@@ -2082,15 +2114,15 @@ test "SCREEN restoration normalizes invalid cursor positions" {
             .expected_y = 1,
             .expected_pending_wrap = true,
         },
-        // Pending wrap away from the final column would trip native printing
-        // assertions, so retain the position and clear only that flag.
+        // A pending wrap away from the last column is valid, for example
+        // at a right margin, so it is kept.
         .{
             .x = 0,
             .y = 0,
             .pending_wrap = true,
             .expected_x = 0,
             .expected_y = 0,
-            .expected_pending_wrap = false,
+            .expected_pending_wrap = true,
         },
     };
 

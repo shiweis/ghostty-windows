@@ -7,7 +7,8 @@ security restrictions until a tested replacement is available.
 
 ## 1.4 release audit
 
-The shared core is merged through upstream `v1.4.0` (`83fb95624`). The Windows
+The release baseline is upstream `v1.4.0` (`83fb95624`). Development has
+merged upstream `main` through `167acf0c4` (November 24, 2026 UTC). The Windows
 1.4 release is held until full feature parity is implemented and verified;
 sharing the core baseline alone does not satisfy the release gate. No release
 tag or publication should happen while the required gaps below remain open.

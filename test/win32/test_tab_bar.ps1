@@ -115,12 +115,18 @@ $fixture=Join-Path $work 'terminal.ps1'
 @'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new()
 $keys=[Collections.Generic.List[string]]::new()
-function Save-State {@{Pid=$PID;Keys=$keys.ToArray()}|ConvertTo-Json -Depth 4|Set-Content -LiteralPath (Join-Path $env:GHOSTTY_TAB_TEST_STATE "$PID.json")}
+function Save-State {
+    # A reader can hold an older snapshot while the next one is published.
+    $statePath=Join-Path $env:GHOSTTY_TAB_TEST_STATE ('{0}-{1:D10}.json' -f $PID,$keys.Count)
+    $json=@{Pid=$PID;Keys=$keys.ToArray()}|ConvertTo-Json -Depth 4
+    [IO.File]::WriteAllText("$statePath.tmp",$json)
+    [IO.File]::Move("$statePath.tmp",$statePath)
+}
 $titleSuffix=''
 if(Test-Path (Join-Path $env:GHOSTTY_TAB_TEST_STATE "prompt-$PID")){$titleSuffix='-prompt'}
+Save-State
 New-Item -ItemType File -Force (Join-Path $env:GHOSTTY_TAB_TEST_STATE "live-$PID")|Out-Null
 [Console]::Write("`e]2;tab-probe-$PID$titleSuffix`a`e[2J`e[Htab-probe-$PID`r`n")
-Save-State
 while($true){
     if(Test-Path (Join-Path $env:GHOSTTY_TAB_TEST_STATE "exit-$PID")){Remove-Item (Join-Path $env:GHOSTTY_TAB_TEST_STATE "live-$PID") -Force -ErrorAction SilentlyContinue;exit 0}
     if(Test-Path (Join-Path $env:GHOSTTY_TAB_TEST_STATE "prompt-$PID")){
@@ -158,7 +164,11 @@ function Wait-Until([string]$name,[scriptblock]$condition){
 }
 function Children($run,[bool]$visible=$true){return @([TabBarTestNative]::Find('GhosttyTerminal',$run.Top,$visible))}
 function Shell-Pid($run){$title=[TabBarTestNative]::Text($run.Top);if($title -match '^tab-probe-(\d+)(?:-prompt|-mouse)?$'){return [int]$Matches[1]};return 0}
-function State($run,[int]$pidValue){try{return Get-Content -Raw -LiteralPath (Join-Path $run.State "$pidValue.json")|ConvertFrom-Json}catch{return $null}}
+function State($run,[int]$pidValue){
+    $latest=Get-ChildItem -LiteralPath $run.State -Filter "$pidValue-*.json" |
+        Sort-Object Name -Descending | Select-Object -First 1
+    if($latest){return [IO.File]::ReadAllText($latest.FullName) | ConvertFrom-Json}
+}
 function Screenshot($run,[string]$name){$path=Join-Path $OutputDirectory ($run.Name+'-'+$name+'.png');[TabBarTestNative]::Capture($run.Top,$path);$record.Captures+=@{Name=$name;Mode=$run.Name;Path=$path}}
 function Request-Exit($run,[int]$pidValue){[IO.File]::WriteAllText((Join-Path $run.State "exit-$pidValue"),'exit')}
 function Request-Prompt($run,[int]$pidValue){[IO.File]::WriteAllText((Join-Path $run.State "prompt-$pidValue"),'prompt')}

@@ -33,7 +33,7 @@ class CacheMaintenance(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if not ZIG:
-            raise RuntimeError("Zig 0.17.0 is required; set ZIG=/path/to/zig")
+            raise RuntimeError("Zig 0.17.1 is required; set ZIG=/path/to/zig")
         cls.compiler = tempfile.TemporaryDirectory(prefix="ghostty-cache-tests-")
         cls.addClassCleanup(cls.compiler.cleanup)
         cls.helper = Path(cls.compiler.name) / ("prune.exe" if os.name == "nt" else "prune")

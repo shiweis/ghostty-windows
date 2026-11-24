@@ -35,11 +35,11 @@ macOS/GTK feature parity.
 
 ### Ghostty 1.4 compatibility
 
-The shared code includes the exact [upstream 1.4.0 release](https://ghostty.org/docs/install/release-notes/1-4-0)
-(`83fb95624`, released October 27, 2026). The planned Windows release uses the
-`win-v1.4.0` tag namespace and is held until full feature parity is verified.
-Matching the core version does not imply that every
-native app feature or upstream performance measurement applies to Windows.
+The Windows release target remains upstream 1.4.0 (`83fb95624`, October 27,
+2026). The development branch includes 456 subsequent upstream commits through
+`167acf0c4` in the upstream `1.4.1-dev` series.
+The planned `win-v1.4.0` release remains on hold pending the Windows parity
+checks below. [Upstream 1.4.0 release notes](https://ghostty.org/docs/install/release-notes/1-4-0)
 
 | Area | Windows status |
 |------|----------------|
@@ -52,7 +52,8 @@ native app feature or upstream performance measurement applies to Windows.
 | Window navigation and state indicators | `goto_window` does not switch windows; key-sequence, key-table, and read-only status indicators are unavailable. |
 | Bell and inactive-pane appearance | Windows does not fully honor `bell-features` or the unfocused split opacity/fill settings. |
 | PowerShell shell features | Prompt marks, directory/title reports, and cursor features work. The exported `ssh-env`, `ssh-terminfo`, and `path` feature flags are not implemented by the PowerShell script. |
-| Tab overview | Searchable native title list; live thumbnails are unavailable. |
+| Window theme | The `set_window_theme` action accepts `light`, `dark`, `system`, or `config`. Use `config` to restore the configured `window-theme`. |
+| Tab overview and colors | Searchable native title list. Live thumbnails and GTK’s per-tab color picker are unavailable. |
 | Inspector and session undo/redo | Unavailable; tracked in the roadmap. Upstream undo/redo is macOS-only. |
 | Distribution | Portable x64 ZIP; MSI/MSIX installers are unavailable. |
 
@@ -156,7 +157,7 @@ PowerShell prompt injection, and hidden-window visibility. See the
 
 ## Building
 
-Requires [Zig](https://ziglang.org/download/) 0.17.0.
+Requires [Zig](https://ziglang.org/download/) 0.17.1.
 
 ### Native build on Windows (recommended)
 
@@ -205,7 +206,7 @@ bash dist/windows/build-desktop.sh
 It builds the current working tree in release mode and, only after a successful
 build, refreshes **Ghostty Dev** on the Windows desktop. Use that shortcut for
 development instead of manually copied executables. Set `ZIG=/path/to/zig` if
-Zig 0.17.0 is not on your `PATH` or under `~/.local/zig-versions`. Pass `debug`,
+Zig 0.17.1 is not on your `PATH` or under `~/.local/zig-versions`. Pass `debug`,
 `safe`, or `small` as the optional argument to select another optimization mode.
 
 The executable, console host, themes, and shell integration are installed together under
@@ -260,7 +261,7 @@ GUI subsystem so the process gets a console attached.
 
 ### Portable packaging
 
-From WSL with Zig 0.17.0 and Windows interop available:
+From WSL with Zig 0.17.1 and Windows interop available:
 
 ```bash
 bash dist/windows/package.sh
@@ -500,18 +501,14 @@ src/shell-integration/powershell/
 
 ## Testing
 
-The October 29, 2026 merge audit passed Windows debug and stripped `fast`
-application builds. The full Windows test executable ran from a local Windows
-directory with its fixtures: 4,099 passed, 71 skipped, zero failed. Focused
-native libghostty-vt tests passed 2,068 cases with 30 skipped. PowerShell shell
-integration passed 20 assertions under each of Windows PowerShell 5.1 and
-PowerShell 7; package/development-installation checks passed under both engines.
-The resize, tab-overview, reply-feedback, and mouse-reporting integration cases
-passed, and the visibility regression passed all 18 assertions under both
-engines. Tracked Zig sources passed formatting checks.
-
-These checks validate this merge and its fixes. They do not clear the feature
-parity release gate or replace the missing end-to-end checks in the roadmap.
+The November 24, 2026 upstream audit used Zig 0.17.1. On Linux, the
+libghostty-vt suite passed 7,259 tests and skipped 74. Both debug and
+stripped fast Windows application builds passed. The Windows
+integration checks passed for program-requested resize, tab overview,
+terminal reply handling, mouse reporting and visibility. The tab-strip suite
+passed 69 checks across 31 test runs. Shell integration,
+portable payload validation and development installation passed under
+Windows PowerShell 5.1 and PowerShell 7.
 
 ### Zig unit tests
 
@@ -668,14 +665,12 @@ powershell.exe -ExecutionPolicy Bypass -File test/win32/test_splits.ps1 -ExePath
 
 This fork tracks `ghostty-org/ghostty` main branch.
 
-Last integrated upstream: `v1.4.0` / `83fb95624` (2026-10-27), including 73
-additional commits after `f54340ad7`. This includes the shared
-terminal fixes, Kitty graphics/render-state and snapshot updates, checksum
-reporting controls, paste protection, and libghostty-vt API updates, plus the
-release fixes for tmux pane validation, scrollback cursor state, canceled APC
-commands, and shell working-directory reports. Windows
-retains WGL/ConPTY; upstream's GTK EGL/DMABUF presentation path is Linux-specific.
-The toolchain and Windows CI now use Zig 0.17.0 (`-Doptimize=fast` for releases).
+The latest merged upstream commit is `167acf0c4` (November 24, 2026 UTC).
+The 456 commits since `v1.4.0` include DEC column and index operations,
+scrollback and snapshot fixes, faster text rendering, SSH terminfo setup
+updates, and independent versioning of libghostty-vt. The app build and
+Windows CI use Zig 0.17.1. See the [libghostty-vt packaging guide](PACKAGING-LIBGHOSTTY.md)
+for the library’s separate version and build instructions.
 
 Configure the `upstream` remote once if it is missing:
 

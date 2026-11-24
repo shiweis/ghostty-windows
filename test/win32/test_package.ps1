@@ -6,6 +6,14 @@ $verify = Join-Path $PSScriptRoot '..\..\dist\windows\verify-build.ps1'
 $BuildDir = (Get-Item -LiteralPath $BuildDir).FullName
 $version = & $verify -BuildDir $BuildDir
 if (-not $version) { throw 'Build validation returned no version.' }
+# Upstream uses a colon between each theme and variant name. Windows build
+# hosts and cross builds must produce the same loadable filenames.
+foreach ($theme in 'Analog Heartbeat Phosphor', 'Neon Raincheck After Hours', 'Paper Crane Midnight Ink') {
+    $path = Join-Path $BuildDir "share\ghostty\themes\$theme"
+    if (-not (Select-String -LiteralPath $path -Pattern '^palette = 0=' -Quiet)) {
+        throw "Bundled theme has no palette: $theme"
+    }
+}
 $testRoot = Join-Path $env:TEMP ('ghostty-package-test-' + [guid]::NewGuid().ToString('N'))
 try {
     New-Item -ItemType Directory -Path $testRoot | Out-Null

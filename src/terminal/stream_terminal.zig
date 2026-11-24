@@ -19,6 +19,7 @@ const osc_color = @import("osc/parsers/color.zig");
 const kitty_clipboard = @import("kitty/clipboard.zig");
 const kitty_color = @import("kitty/color.zig");
 const paste_pkg = @import("paste.zig");
+const dnd = @import("dnd.zig");
 const kitty_dnd = @import("kitty/dnd.zig");
 const lib = @import("lib.zig");
 const size_report = @import("size_report.zig");
@@ -178,14 +179,19 @@ pub const Handler = struct {
         /// valid for the duration of the callback.
         desktop_notification: ?*const fn (*Handler, Action.ShowDesktopNotification) void,
 
-        /// Called when drag and drop protocol state changes in a way the
-        /// embedder may need to act on: the running program registering
-        /// or unregistering to accept drops, answering a drag, or
-        /// concluding a drop. The event says what changed; the details
-        /// are read from `handler.terminal.kitty_dnd` (Kitty's OSC 72 is
-        /// the only drag and drop protocol today). Native drag events
-        /// flow the other way, by calling `kitty.dnd.State` directly.
-        drag_and_drop: ?*const fn (*Handler, kitty_dnd.Event) void,
+        /// Called when the running program changes how it takes drops
+        /// onto the terminal in a way the embedder may need to act on,
+        /// such as registering to accept drops, requesting dropped data,
+        /// or concluding a drop. Kitty's OSC 72 is the only drag and drop
+        /// protocol today. Native drag events flow the other way, by
+        /// calling `kitty.dnd.State` (`handler.terminal.kitty_dnd`)
+        /// directly and writing to the pty (see `ptyWriter`); that may be
+        /// done from within this callback.
+        ///
+        /// When null, drops need an embedder to connect them to the OS,
+        /// so OSC 72 is ignored entirely (including queries) and programs
+        /// fall back to their behavior without the protocol.
+        drop: ?*const fn (*Handler, dnd.DropEvent) void,
 
         /// Called in response to a color scheme DSR query (CSI ? 996 n).
         /// Returns the current color scheme. Return null to silently
@@ -342,7 +348,7 @@ pub const Handler = struct {
             .color_scheme = null,
             .desktop_notification = null,
             .device_attributes = null,
-            .drag_and_drop = null,
+            .drop = null,
             .enquiry = null,
             .progress_report = null,
             .program_status = null,
@@ -606,15 +612,33 @@ pub const Handler = struct {
         };
     }
 
+    /// A writer to the pty for responding to the program outside of
+    /// processing its output, e.g. reporting native drag and drop
+    /// activity with `kitty.dnd.State`. Use it in place (it must not be
+    /// copied after use begins) and flush it when done.
+    pub fn ptyWriter(self: *Handler, buffer: []u8) PtyWriter {
+        return .init(self, buffer);
+    }
+
     pub fn vt(
         self: *Handler,
         comptime action: Action.Tag,
         value: Action.Value(action),
     ) void {
-        self.vtFallible(action, value) catch |err| {
-            self.semantic_failure = true;
-            log.warn("error handling VT action action={} err={}", .{ action, err });
-        };
+        self.vtFallible(action, value) catch |err| self.vtFailed(action, err);
+    }
+
+    /// The stream's hook for runs it knows are printable ASCII.
+    pub fn vtPrintAscii(self: *Handler, bytes: []const u8) void {
+        self.terminal.printSliceAscii(bytes) catch |err| self.vtFailed(.print_slice, err);
+    }
+
+    /// This is noinline to keep failure handling and logging out of the
+    /// hot VT action path.
+    noinline fn vtFailed(self: *Handler, action: Action.Tag, err: anyerror) void {
+        @branchHint(.cold);
+        self.semantic_failure = true;
+        log.warn("error handling VT action action={} err={}", .{ action, err });
     }
 
     fn unknownSequence(self: *Handler, value: UnknownSequence) void {
@@ -640,6 +664,8 @@ pub const Handler = struct {
                 self.terminal.carriageReturn();
             },
             .reverse_index => self.terminal.reverseIndex(),
+            .back_index => self.terminal.backIndex(),
+            .forward_index => self.terminal.forwardIndex(),
             .cursor_up => self.terminal.cursorUp(value.value),
             .cursor_down => self.terminal.cursorDown(value.value),
             .cursor_left => self.terminal.cursorLeft(value.value),
@@ -663,6 +689,8 @@ pub const Handler = struct {
             .erase_chars => self.terminal.eraseChars(value),
             .insert_lines => self.terminal.insertLines(value),
             .insert_blanks => self.terminal.insertBlanks(value),
+            .insert_columns => self.terminal.insertColumns(value),
+            .delete_columns => self.terminal.deleteColumns(value),
             .delete_lines => self.terminal.deleteLines(value),
             .scroll_up => try self.terminal.scrollUp(value),
             .scroll_down => self.terminal.scrollDown(value),
@@ -701,10 +729,7 @@ pub const Handler = struct {
             .restore_cursor => self.terminal.restoreCursor(),
             .invoke_charset => self.terminal.invokeCharset(value.bank, value.charset, value.locking),
             .configure_charset => self.terminal.configureCharset(value.slot, value.charset),
-            .set_attribute => switch (value) {
-                .unknown => {},
-                else => try self.terminal.setAttribute(value),
-            },
+            .set_attributes => try self.terminal.setAttributes(value.parser()),
             .protected_mode_off => self.terminal.setProtectedMode(.off),
             .protected_mode_iso => self.terminal.setProtectedMode(.iso),
             .protected_mode_dec => self.terminal.setProtectedMode(.dec),
@@ -1672,8 +1697,10 @@ pub const Handler = struct {
         self: *Handler,
         v: Action.KittyDnd,
     ) (Allocator.Error || std.Io.Writer.Error)!void {
-        // Responses are usually small (queries, errors) but data
-        // serving can produce many chunks, so fall back to the heap.
+        if (self.effects.drop == null) return;
+
+        // Responses are usually small (queries, errors), so fall back
+        // to the heap only when needed.
         var stack_buf: [512]u8 = undefined;
         var stack: std.heap.BufferFirstAllocator = .init(&stack_buf, self.terminal.gpa());
         const response_alloc = stack.allocator();
@@ -1683,7 +1710,7 @@ pub const Handler = struct {
         // The state is allocated on registration and owned by the
         // terminal, so it uses the terminal's allocator, not the
         // response's.
-        const event = try kitty_dnd.handleCommand(
+        const events = try kitty_dnd.handleCommand(
             &self.terminal.kitty_dnd,
             self.terminal.gpa(),
             &aw.writer,
@@ -1696,9 +1723,14 @@ pub const Handler = struct {
             self.writePty(written);
         }
 
-        if (event) |ev| {
-            const func = self.effects.drag_and_drop orelse return;
-            func(self, ev);
+        // Delivered after the responses are written so the effect may
+        // write its own (e.g. serving a data request immediately). The
+        // details are read from the state as each is delivered, since
+        // an earlier effect call may have changed it.
+        for (events.slice()) |ev| {
+            const func = self.effects.drop orelse continue;
+            const drop_ev = kitty_dnd.dropEvent(self.terminal.kitty_dnd, ev) orelse continue;
+            func(self, drop_ev);
         }
     }
 
@@ -2339,11 +2371,11 @@ pub const Handler = struct {
 /// A writer that delivers everything through the write_pty effect:
 /// the buffer as it fills, and data that doesn't fit it directly.
 /// Never fails, since the effect can't.
-const PtyWriter = struct {
+pub const PtyWriter = struct {
     handler: *Handler,
     writer: std.Io.Writer,
 
-    fn init(handler: *Handler, buffer: []u8) PtyWriter {
+    pub fn init(handler: *Handler, buffer: []u8) PtyWriter {
         return .{
             .handler = handler,
             .writer = .{
@@ -3007,6 +3039,64 @@ test "attributes" {
     try testing.expectEqualStrings("Bold", str);
 }
 
+test "SGR with several attributes interns one style" {
+    const Style = @import("style.zig").Style;
+
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = .init(&t) });
+    defer s.deinit();
+
+    // A styled cell that keeps its style alive.
+    s.nextSlice("\x1B[31mA");
+    const screen = t.screens.active;
+    const page = screen.cursor.page_pin.node.page();
+    try testing.expectEqual(@as(usize, 1), page.styles.count());
+
+    // Reset, then several attributes in one sequence.
+    s.nextSlice("\x1B[0;1;3;4;38;2;10;20;30;48;5;200mBC");
+    try testing.expectEqual(@as(usize, 2), page.styles.count());
+
+    const id = screen.cursor.style_id;
+    const want = page.styles.get(page.memory, id);
+    try testing.expect(want.eql(screen.cursor.style));
+    try testing.expect(want.flags.bold);
+    try testing.expect(want.flags.italic);
+    try testing.expectEqual(.single, want.flags.underline);
+    try testing.expectEqual(
+        Style.Color.rgb(.{ .r = 10, .g = 20, .b = 30 }),
+        want.fg_color,
+    );
+    try testing.expectEqual(Style.Color.palette(200), want.bg_color);
+
+    // Both printed cells reference the new style.
+    for (1..3) |x| {
+        const cell = screen.pages.getCell(.{ .active = .{
+            .x = @intCast(x),
+        } }).?.cell;
+        try testing.expectEqual(id, cell.style_id);
+    }
+
+    // The first cell keeps its own style.
+    const a = screen.pages.getCell(.{ .active = .{} }).?.cell;
+    try testing.expect(a.style_id != id);
+    try testing.expectEqual(
+        Style.Color.palette(1),
+        page.styles.get(page.memory, a.style_id).fg_color,
+    );
+
+    // A sequence that ends where it started changes nothing.
+    s.nextSlice("\x1B[0;1;3;4;38;2;10;20;30;48;5;200m");
+    try testing.expectEqual(id, screen.cursor.style_id);
+    try testing.expectEqual(@as(usize, 2), page.styles.count());
+
+    // A sequence that ends at the default style releases nothing in use.
+    s.nextSlice("\x1B[1;0m");
+    try testing.expectEqual(@as(u16, 0), screen.cursor.style_id);
+    try testing.expectEqual(@as(usize, 2), page.styles.count());
+}
+
 test "DECRQSS responses" {
     var t: Terminal = try .init(
         testing.io,
@@ -3054,6 +3144,11 @@ test "DECRQSS responses" {
     // Overline
     s.nextSlice("\x1B[0;53m\x1BP$qm\x1B\\");
     try S.expectResponse("\x1BP1$r0;53m\x1B\\");
+
+    // Several attributes in one sequence
+    s.nextSlice("\x1B[0;1;3;4:3;38;5;100;48;2;1;2;3m\x1BP$qm\x1B\\");
+    try S.expectResponse("\x1BP1$r0;1;3;4:3;38:5:100;48:2::1:2:3m\x1B\\");
+    s.nextSlice("\x1B[0;53m");
 
     // Requests larger than the parser's fixed request buffer are ignored,
     // and the next DCS command must still be processed normally.
@@ -7103,9 +7198,12 @@ test "continuation reconstructs standard stream without duplicate effects" {
     );
 }
 
-test "kitty dnd: query response" {
+/// A drop effect for tests that only need OSC 72 processed.
+fn testIgnoreDrop(_: *Handler, _: dnd.DropEvent) void {}
+
+test "kitty dnd: ignored without drop effect" {
     const S = struct {
-        var pty: std.ArrayListUnmanaged(u8) = .empty;
+        var pty: std.ArrayList(u8) = .empty;
         fn writePty(_: *Handler, data: []const u8) void {
             pty.appendSlice(testing.allocator, data) catch unreachable;
         }
@@ -7121,13 +7219,18 @@ test "kitty dnd: query response" {
     var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
     defer s.deinit();
 
-    s.nextSlice("\x1B]72;t=q:i=3\x1B\\");
-    try testing.expectEqualStrings("\x1b]72;t=q:i=3\x1b\\", S.pty.items);
+    // Without an embedder to connect the protocol to the OS, queries go
+    // unanswered and registrations are not recorded, so programs fall
+    // back to their behavior without the protocol.
+    s.nextSlice("\x1B]72;t=q\x1B\\");
+    s.nextSlice("\x1B]72;t=a;text/plain\x1B\\");
+    try testing.expectEqualStrings("", S.pty.items);
+    try testing.expect(t.kitty_dnd == null);
 }
 
-test "kitty dnd: register, drop, and serve data" {
+test "kitty dnd: query response" {
     const S = struct {
-        var pty: std.ArrayListUnmanaged(u8) = .empty;
+        var pty: std.ArrayList(u8) = .empty;
         fn writePty(_: *Handler, data: []const u8) void {
             pty.appendSlice(testing.allocator, data) catch unreachable;
         }
@@ -7140,6 +7243,47 @@ test "kitty dnd: register, drop, and serve data" {
 
     var handler: Handler = .init(&t);
     handler.effects.write_pty = &S.writePty;
+    handler.effects.drop = &testIgnoreDrop;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    s.nextSlice("\x1B]72;t=q:i=3\x1B\\");
+    try testing.expectEqualStrings("\x1b]72;t=q:i=3\x1b\\", S.pty.items);
+}
+
+test "kitty dnd: register, drop, and serve data from the effect" {
+    const S = struct {
+        var pty: std.ArrayList(u8) = .empty;
+        fn writePty(_: *Handler, data: []const u8) void {
+            pty.appendSlice(testing.allocator, data) catch unreachable;
+        }
+
+        // Serves data requests immediately, from within the effect,
+        // as an embedder with synchronous access to the data would.
+        fn drop(handler: *Handler, ev: dnd.DropEvent) void {
+            if (ev != .data_request) return;
+            const target = &handler.terminal.kitty_dnd.?.drop;
+            var buf: [64]u8 = undefined;
+            var pty_writer = handler.ptyWriter(&buf);
+            defer pty_writer.writer.flush() catch unreachable;
+            testing.expectEqualStrings("text/plain", ev.data_request.mime) catch unreachable;
+            var id: ?u32 = ev.data_request.id;
+            while (id) |i| {
+                target.respondData(&pty_writer.writer, i, "hello") catch unreachable;
+                const next = target.respondEnd(&pty_writer.writer, i) catch unreachable;
+                id = if (next) |r| r.id else null;
+            }
+        }
+    };
+    S.pty = .empty;
+    defer S.pty.deinit(testing.allocator);
+
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.drop = &S.drop;
     var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
     defer s.deinit();
 
@@ -7153,22 +7297,21 @@ test "kitty dnd: register, drop, and serve data" {
     {
         var aw: std.Io.Writer.Allocating = .init(testing.allocator);
         defer aw.deinit();
-        try t.kitty_dnd.?.dragDrop(testing.allocator, &aw.writer, .{
+        try testing.expect(!try t.kitty_dnd.?.drop.dragDrop(testing.allocator, &aw.writer, .{
             .cell_x = 2,
             .cell_y = 1,
             .pixel_x = 20,
             .pixel_y = 18,
             .operations = .{ .copy = true },
-        }, &.{
-            .{ .mime = "text/plain", .data = "hello" },
-        });
+        }, &.{"text/plain"}));
         try testing.expectEqualStrings(
             "\x1b]72;t=M:x=2:y=1:X=20:Y=18:o=1:m=0;text/plain \x1b\\",
             aw.written(),
         );
     }
 
-    // The client requests the data and concludes.
+    // The client requests the data, which the effect serves, and
+    // concludes.
     s.nextSlice("\x1B]72;t=r:x=1\x1B\\");
     try testing.expectEqualStrings(
         "\x1b]72;t=r:x=1:m=0;aGVsbG8=\x1b\\" ++ "\x1b]72;t=r:x=1\x1b\\",
@@ -7178,14 +7321,17 @@ test "kitty dnd: register, drop, and serve data" {
 
     s.nextSlice("\x1B]72;t=r\x1B\\");
     try testing.expectEqualStrings("", S.pty.items);
-    try testing.expect(t.kitty_dnd.?.drop.items == null);
+    try testing.expect(t.kitty_dnd.?.drop.request() == null);
+    try testing.expect(!t.kitty_dnd.?.drop.dropped);
 }
 
 test "kitty dnd: state updates work without write_pty effect" {
     var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
     defer t.deinit(testing.allocator);
 
-    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = .init(&t) });
+    var handler: Handler = .init(&t);
+    handler.effects.drop = &testIgnoreDrop;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
     defer s.deinit();
 
     // Queries produce no output (nowhere to write) but registration
@@ -7203,7 +7349,7 @@ test "kitty dnd: state updates work without write_pty effect" {
 
 test "kitty dnd: registration survives terminal reset" {
     const S = struct {
-        var pty: std.ArrayListUnmanaged(u8) = .empty;
+        var pty: std.ArrayList(u8) = .empty;
         fn writePty(_: *Handler, data: []const u8) void {
             pty.appendSlice(testing.allocator, data) catch unreachable;
         }
@@ -7216,6 +7362,7 @@ test "kitty dnd: registration survives terminal reset" {
 
     var handler: Handler = .init(&t);
     handler.effects.write_pty = &S.writePty;
+    handler.effects.drop = &testIgnoreDrop;
     var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
     defer s.deinit();
 
@@ -7234,8 +7381,8 @@ test "kitty dnd: registration survives terminal reset" {
 
 test "kitty dnd: effect reports registration, acceptance, and conclusion" {
     const S = struct {
-        var events: std.ArrayListUnmanaged(kitty_dnd.Event) = .empty;
-        var mimes: std.ArrayListUnmanaged(u8) = .empty;
+        var events: std.ArrayList(std.meta.Tag(dnd.DropEvent)) = .empty;
+        var mimes: std.ArrayList(u8) = .empty;
 
         fn clear() void {
             events.deinit(testing.allocator);
@@ -7244,17 +7391,24 @@ test "kitty dnd: effect reports registration, acceptance, and conclusion" {
             mimes = .empty;
         }
 
-        fn dragAndDrop(handler: *Handler, ev: kitty_dnd.Event) void {
+        var operation: dnd.Operation = .none;
+
+        fn drop(_: *Handler, ev: dnd.DropEvent) void {
             events.append(testing.allocator, ev) catch unreachable;
-            // Registration details are read from the terminal state.
-            if (ev == .registration) {
-                mimes.clearRetainingCapacity();
-                const state = handler.terminal.kitty_dnd orelse return;
-                var it = state.registeredMimes();
-                while (it.next()) |m| {
-                    mimes.appendSlice(testing.allocator, m) catch unreachable;
-                    mimes.append(testing.allocator, ',') catch unreachable;
-                }
+            const list = switch (ev) {
+                .registration => |r| r.mimes,
+                .acceptance => |a| a.mimes,
+                .concluded => |op| {
+                    operation = op;
+                    return;
+                },
+                .data_request => return,
+            };
+            mimes.clearRetainingCapacity();
+            var it = list.iterator();
+            while (it.next()) |m| {
+                mimes.appendSlice(testing.allocator, m) catch unreachable;
+                mimes.append(testing.allocator, ',') catch unreachable;
             }
         }
     };
@@ -7265,11 +7419,11 @@ test "kitty dnd: effect reports registration, acceptance, and conclusion" {
     defer t.deinit(testing.allocator);
 
     var handler: Handler = .init(&t);
-    handler.effects.drag_and_drop = &S.dragAndDrop;
+    handler.effects.drop = &S.drop;
     var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
     defer s.deinit();
 
-    // Registration with a MIME list, read back from the state.
+    // Registration with a MIME list.
     s.nextSlice("\x1B]72;t=a;image/png text/plain\x1B\\");
     try testing.expectEqual(@as(usize, 1), S.events.items.len);
     try testing.expect(S.events.items[0] == .registration);
@@ -7279,24 +7433,26 @@ test "kitty dnd: effect reports registration, acceptance, and conclusion" {
     {
         var aw: std.Io.Writer.Allocating = .init(testing.allocator);
         defer aw.deinit();
-        try t.kitty_dnd.?.dragDrop(testing.allocator, &aw.writer, .{
+        _ = try t.kitty_dnd.?.drop.dragDrop(testing.allocator, &aw.writer, .{
             .cell_x = 0,
             .cell_y = 0,
             .pixel_x = 0,
             .pixel_y = 0,
             .operations = .{ .copy = true },
-        }, &.{.{ .mime = "text/plain", .data = "x" }});
+        }, &.{"text/plain"});
     }
     s.nextSlice("\x1B]72;t=m:o=2;text/plain\x1B\\");
     try testing.expectEqual(@as(usize, 2), S.events.items.len);
     try testing.expect(S.events.items[1] == .acceptance);
+    try testing.expectEqualStrings("text/plain,", S.mimes.items);
 
     // Conclusion carries the performed operation.
     s.nextSlice("\x1B]72;t=r:o=2\x1B\\");
     try testing.expectEqual(@as(usize, 3), S.events.items.len);
-    try testing.expectEqual(kitty_dnd.Event.concluded_move, S.events.items[2]);
+    try testing.expect(S.events.items[2] == .concluded);
+    try testing.expectEqual(dnd.Operation.move, S.operation);
 
-    // Unregistration reports with the state gone.
+    // Unregistration reports with no MIME types.
     s.nextSlice("\x1B]72;t=A\x1B\\");
     try testing.expectEqual(@as(usize, 4), S.events.items.len);
     try testing.expect(S.events.items[3] == .registration);

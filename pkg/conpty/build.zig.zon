@@ -1,7 +1,7 @@
 .{
     .name = .conpty,
     .version = "1.25.260930003",
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .fingerprint = 0xc942a1c16a726a48,
     .paths = .{""},
 }

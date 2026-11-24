@@ -71,6 +71,10 @@ core_app: *CoreApp,
 /// updated in response to config_change actions.
 config: Config,
 
+/// A command changes the appearance for this process, including future windows.
+window_theme_override: apprt.action.WindowTheme = .config,
+color_scheme_sync_pending: bool = false,
+
 /// A message-only window used to receive WM_APP_WAKEUP.
 /// This is not a visible window; it just participates in the message loop.
 msg_hwnd: ?w32.HWND = null,
@@ -278,7 +282,125 @@ pub fn init(
     self.startUpdateCheck(false);
 }
 
+pub const ChromeColors = struct {
+    bg: Config.Color,
+    fg: Config.Color,
+
+    pub fn mix(self: ChromeColors, weight: u8) u32 {
+        const bg = self.bg;
+        const fg = self.fg;
+        const foreground: u16 = weight;
+        const background: u16 = 255 - foreground;
+        return w32.RGB(
+            @intCast((@as(u16, bg.r) * background + @as(u16, fg.r) * foreground + 127) / 255),
+            @intCast((@as(u16, bg.g) * background + @as(u16, fg.g) * foreground + 127) / 255),
+            @intCast((@as(u16, bg.b) * background + @as(u16, fg.b) * foreground + 127) / 255),
+        );
+    }
+};
+
+pub fn chromeColors(self: *const App) ChromeColors {
+    // Preserve the configured terminal colors when using the configured chrome.
+    if (self.window_theme_override == .config) return .{ .bg = self.config.background, .fg = self.config.foreground };
+    return if (self.windowThemeIsDark())
+        .{ .bg = .{ .r = 30, .g = 30, .b = 30 }, .fg = .{ .r = 225, .g = 225, .b = 225 } }
+    else
+        .{ .bg = .{ .r = 248, .g = 248, .b = 248 }, .fg = .{ .r = 28, .g = 28, .b = 28 } };
+}
+
+pub fn effectiveWindowTheme(self: *const App) Config.WindowTheme {
+    return switch (self.window_theme_override) {
+        .config => self.config.@"window-theme",
+        .system => .system,
+        .light => .light,
+        .dark => .dark,
+    };
+}
+
+pub fn windowThemeIsDark(self: *const App) bool {
+    return switch (self.effectiveWindowTheme()) {
+        .light => false,
+        .dark => true,
+        .system => !Window.systemUsesLightTheme(),
+        .auto, .ghostty => if (self.config._conditional_set.contains(.theme))
+            // The background itself depends on the scheme in this case.
+            !Window.systemUsesLightTheme()
+        else
+            self.config.background.toTerminalRGB().perceivedLuminance() < 0.5,
+    };
+}
+
+// A scheme change can reload the config, so dispatch it outside Win32
+// callbacks and after any in-progress config or surface initialization.
+pub fn requestColorSchemeSync(self: *App) void {
+    if (self.color_scheme_sync_pending) return;
+    self.color_scheme_sync_pending = true;
+    self.wakeup();
+}
+
+fn syncColorScheme(self: *App) !void {
+    self.color_scheme_sync_pending = false;
+    const scheme: apprt.ColorScheme = if (self.windowThemeIsDark()) .dark else .light;
+    try self.core_app.colorSchemeEvent(self, scheme);
+    for (self.core_app.surfaces.items) |surface| {
+        if (surface.core_surface_ready) try surface.core_surface.colorSchemeCallback(scheme);
+    }
+}
+
+test "window theme session action applies the conditional theme and isolates surface config" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var dir = testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(testing.io, .{ .sub_path = "light", .data = "background = #ffffff" });
+    try dir.dir.writeFile(testing.io, .{ .sub_path = "dark", .data = "background = #111111" });
+    const light = try dir.dir.realPathFileAlloc(testing.io, "light", alloc);
+    defer alloc.free(light);
+    const dark = try dir.dir.realPathFileAlloc(testing.io, "dark", alloc);
+    defer alloc.free(dark);
+    const themes = try std.fmt.allocPrint(alloc, "--theme=light:{s},dark:{s}", .{ light, dark });
+    defer alloc.free(themes);
+
+    var core: CoreApp = undefined;
+    try core.init(alloc);
+    defer core.deinit();
+    var app: App = .{
+        .core_app = &core,
+        .config = try Config.default(alloc),
+        .hinstance = undefined,
+    };
+    defer app.config.deinit();
+    defer if (app.bg_brush) |brush| {
+        _ = w32.DeleteObject(@ptrCast(brush));
+    };
+    var args = @import("../../cli.zig").args.sliceIterator(&.{ themes, "--window-theme=light" });
+    try app.config.loadIter(alloc, &args);
+    try app.config.finalize();
+    try core.performAction(&app, .{ .set_window_theme = .dark });
+    try app.syncColorScheme();
+    try testing.expectEqual(.dark, core.config_conditional_state.theme);
+    try testing.expect(!app.color_scheme_sync_pending);
+    try testing.expectEqual(Config.Color{ .r = 17, .g = 17, .b = 17 }, app.config.background);
+    try testing.expectEqual(.light, app.config.@"window-theme");
+
+    const surface = try alloc.create(Surface);
+    defer alloc.destroy(surface);
+    surface.* = .{ .app = &app };
+    surface.core_surface.rt_surface = surface;
+    var unrelated = try Config.default(alloc);
+    defer unrelated.deinit();
+    unrelated.@"window-theme" = .system;
+    try testing.expect(try app.performAction(.{ .surface = &surface.core_surface }, .config_change, .{ .config = &unrelated }));
+
+    try core.performAction(&app, .{ .set_window_theme = .config });
+    try app.syncColorScheme();
+    try testing.expectEqual(.light, core.config_conditional_state.theme);
+    try testing.expectEqual(Config.Color{ .r = 255, .g = 255, .b = 255 }, app.config.background);
+}
+
 pub fn run(self: *App) !void {
+    try self.syncColorScheme();
+
     // Create the initial Window container with one tab.
     const alloc = self.core_app.alloc;
     const window = blk: {
@@ -294,6 +416,11 @@ pub fn run(self: *App) !void {
     // Enter the Win32 message loop
     var msg: w32.MSG = undefined;
     loop: while (true) {
+        // A nested dialog can consume the wakeup. Keep the pending state on
+        // the app and apply it when control returns to the main message loop.
+        if (self.color_scheme_sync_pending)
+            self.syncColorScheme() catch |err| log.warn("color scheme update failed: {}", .{err});
+
         const result = w32.GetMessageW(&msg, null, 0, 0);
         if (result == 0) {
             // WM_QUIT received. Check if it's still wanted — stopQuitTimer()
@@ -620,7 +747,25 @@ pub fn performAction(
             return true;
         },
 
+        .set_window_theme => {
+            self.window_theme_override = value;
+            for (self.windows.items) |window| window.updateTheme();
+            if (self.quick_terminal) |qt| qt.window.updateTheme();
+            self.requestColorSchemeSync();
+            return true;
+        },
+
         .config_change => {
+            // A surface can have a different effective config. Its reload must
+            // not replace the app config that the core is still iterating.
+            if (target == .surface) {
+                const surface = target.surface.rt_surface;
+                if (surface.scrollbar) |sb| sb.setTheme(
+                    value.config.background.toTerminalRGB(),
+                    value.config.foreground.toTerminalRGB(),
+                );
+                return true;
+            }
             // Update our stored config with the new one.
             if (value.config.clone(self.core_app.alloc)) |new_config| {
                 self.config.deinit();
@@ -932,9 +1077,10 @@ pub fn performAction(
             const alloc = self.core_app.alloc;
             if (value.soft) {
                 // Soft reload: re-apply existing config (for conditional state changes)
-                self.core_app.updateConfig(self, &self.config) catch |err| {
-                    log.err("soft config reload error: {}", .{err});
-                };
+                switch (target) {
+                    .app => try self.core_app.updateConfig(self, &self.config),
+                    .surface => |surface| try surface.updateConfig(&self.config),
+                }
             } else {
                 // Hard reload: read config from disk
                 var new_config = Config.load(alloc) catch |err| {
@@ -944,7 +1090,11 @@ pub fn performAction(
                 defer new_config.deinit();
                 self.core_app.updateConfig(self, &new_config) catch |err| {
                     log.err("config update error: {}", .{err});
+                    return true;
                 };
+                // A hard reload can change window-theme. Do not reschedule
+                // from a soft reload caused by the scheme notification itself.
+                self.requestColorSchemeSync();
             }
             return true;
         },
@@ -2213,8 +2363,16 @@ fn surfaceWndProc(
         },
 
         w32.WM_ERASEBKGND => {
-            // Palette popups and unsupported presentation retain the opaque fill.
-            if (is_palette_popup or !surface.transparency_supported or
+            if (is_search_popup or is_palette_popup) {
+                const hdc: w32.HDC = @ptrFromInt(wparam);
+                var rect: w32.RECT = undefined;
+                if (w32.GetClientRect(hwnd, &rect) != 0) {
+                    _ = w32.SetDCBrushColor(hdc, surface.app.chromeColors().mix(0));
+                    if (w32.GetStockObject(w32.DC_BRUSH)) |brush| _ = w32.FillRect(hdc, &rect, @ptrCast(brush));
+                }
+                return 1;
+            }
+            if (!surface.transparency_supported or
                 !surface.parent_window.transparency_supported)
             {
                 if (surface.app.bg_brush) |brush| {
@@ -2468,29 +2626,14 @@ fn surfaceWndProc(
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
 
-        w32.WM_CTLCOLOREDIT => {
-            // Dark mode colors for search/palette edit controls
-            const hdc_edit: w32.HDC = @ptrFromInt(wparam);
-            _ = w32.SetTextColor(hdc_edit, w32.RGB(220, 220, 220));
-            _ = w32.SetBkColor(hdc_edit, if (is_palette_popup) w32.RGB(30, 30, 30) else w32.RGB(45, 45, 45));
-            if (is_palette_popup) {
-                if (surface.palette_brush) |brush| {
-                    return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(brush))));
-                }
-            }
-            if (surface.app.bg_brush) |brush| {
-                return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(brush))));
-            }
-            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
-        },
-
-        w32.WM_CTLCOLORSTATIC => {
-            // Dark mode colors for the search match-count label.
-            const hdc_static: w32.HDC = @ptrFromInt(wparam);
-            _ = w32.SetTextColor(hdc_static, w32.RGB(160, 160, 160));
-            _ = w32.SetBkColor(hdc_static, w32.RGB(45, 45, 45));
-            if (surface.app.bg_brush) |brush| {
-                return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(brush))));
+        w32.WM_CTLCOLOREDIT, w32.WM_CTLCOLORSTATIC => {
+            if (is_search_popup or is_palette_popup) {
+                const colors = surface.app.chromeColors();
+                const hdc: w32.HDC = @ptrFromInt(wparam);
+                _ = w32.SetTextColor(hdc, colors.mix(if (msg == w32.WM_CTLCOLOREDIT) 255 else 180));
+                _ = w32.SetBkColor(hdc, colors.mix(0));
+                _ = w32.SetDCBrushColor(hdc, colors.mix(0));
+                if (w32.GetStockObject(w32.DC_BRUSH)) |brush| return @bitCast(@intFromPtr(brush));
             }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },

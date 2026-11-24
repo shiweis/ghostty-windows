@@ -1343,6 +1343,129 @@ test "complete snapshot restores a canonical Stream continuation" {
     );
 }
 
+test "complete snapshot restores semantic prompt state for an input cursor" {
+    const testing = std.testing;
+
+    var source_terminal = try Terminal.init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 10, .rows = 15 },
+    );
+    defer source_terminal.deinit(testing.allocator);
+    for (0..10) |_| {
+        try source_terminal.printString("x");
+        source_terminal.carriageReturn();
+        try source_terminal.linefeed();
+    }
+
+    // The shell started input (OSC 133;B) but no row is marked as a
+    // prompt yet, so only the cursor carries the semantic content.
+    try source_terminal.semanticPrompt(.init(.end_prompt_start_input));
+    try source_terminal.printString("echo hi");
+
+    var encoded: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer encoded.deinit();
+    try encode(
+        testing.allocator,
+        &encoded.writer,
+        &source_terminal,
+        test_encode_options,
+    );
+
+    var encoded_source: std.Io.Reader = .fixed(encoded.written());
+    var decoded = try decode(
+        testing.allocator,
+        testing.io,
+        &encoded_source,
+        test_decode_options,
+    );
+    defer decoded.deinit(testing.allocator);
+    var t = decoded.toOwned();
+    defer t.deinit(testing.allocator);
+    try testing.expect(t.screens.active.semantic_prompt.seen);
+
+    // The linefeed marks the next row as a prompt continuation, so a
+    // full erase must scroll before clearing.
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("more");
+    t.setCursorPos(1, 1);
+    t.eraseDisplay(.complete, false);
+    try testing.expect(
+        t.screens.active.pages.total_rows > t.screens.active.pages.rows,
+    );
+}
+
+test "complete snapshot restores a pending wrap away from the last column" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A wrap can be pending at a column other than the last one. Each case
+    // sets up that state in a 24 column terminal and takes a snapshot.
+    // Then it writes the same bytes to the original and the restored
+    // terminal, and both must end up the same. Columns below are 1-based,
+    // as in the escape sequences.
+    //
+    // `margin` sets the left and right margins to columns 3 and 12, moves
+    // to column 3, and prints ten characters. That fills the margins
+    // exactly and leaves a wrap pending at column 12.
+    const margin = "\x1b[?69h\x1b[3;12s\x1b[1;3Hten chars!";
+    const cases = [_]struct { setup: []const u8, after: []const u8 }{
+        // The next character wraps to column 3 of the next row (#15265).
+        .{ .setup = margin, .after = "X" },
+
+        // Save the cursor with its pending wrap (DECSC) and move away. Both
+        // terminals then restore it (DECRC) and print.
+        .{ .setup = margin ++ "\x1b7\r\n", .after = "\x1b8X" },
+
+        // Turn margins off. The wrap stays pending at column 12, which is
+        // no longer a margin.
+        .{ .setup = margin ++ "\x1b[?69l", .after = "X" },
+
+        // Save the cursor, move the right margin to column 20, and restore
+        // the cursor. The wrap is pending at column 12, inside the margins.
+        .{ .setup = margin ++ "\x1b7\x1b[1;20s\x1b8", .after = "X" },
+    };
+
+    for (cases) |case| {
+        var source = try Terminal.init(testing.io, alloc, .{ .cols = 24, .rows = 6 });
+        defer source.deinit(alloc);
+        var source_stream = source.vtStream();
+        defer source_stream.deinit();
+        source_stream.nextSlice(case.setup);
+
+        var encoded: std.Io.Writer.Allocating = .init(alloc);
+        defer encoded.deinit();
+        try encode(alloc, &encoded.writer, &source, test_encode_options);
+        var encoded_source: std.Io.Reader = .fixed(encoded.written());
+        var decoded = try decode(alloc, testing.io, &encoded_source, test_decode_options);
+        defer decoded.deinit(alloc);
+        var restored = decoded.toOwned();
+        defer restored.deinit(alloc);
+
+        const source_cursor = &source.screens.active.cursor;
+        const restored_cursor = &restored.screens.active.cursor;
+        try testing.expectEqual(source_cursor.pending_wrap, restored_cursor.pending_wrap);
+        if (source.screens.active.saved_cursor) |saved| try testing.expectEqual(
+            saved.pending_wrap,
+            restored.screens.active.saved_cursor.?.pending_wrap,
+        );
+
+        var restored_stream = restored.vtStream();
+        defer restored_stream.deinit();
+        source_stream.nextSlice(case.after);
+        restored_stream.nextSlice(case.after);
+        try testing.expectEqual(source_cursor.x, restored_cursor.x);
+        try testing.expectEqual(source_cursor.y, restored_cursor.y);
+        try testing.expectEqual(source_cursor.pending_wrap, restored_cursor.pending_wrap);
+        const source_text = try source.plainString(alloc);
+        defer alloc.free(source_text);
+        const restored_text = try restored.plainString(alloc);
+        defer alloc.free(restored_text);
+        try testing.expectEqualStrings(source_text, restored_text);
+    }
+}
+
 test "complete snapshot validates continuation before writing" {
     const testing = std.testing;
     var t = try Terminal.init(
@@ -2526,4 +2649,54 @@ test "incremental decode failure leaves applied history usable" {
     try testing.expectEqual(@as(u21, 'A'), testTopLeftCodepoint(primary));
     primary.pages.assertIntegrity();
     primary.assertIntegrity();
+}
+
+test "complete snapshot restore keeps writing into its active page" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+        .max_scrollback_bytes = null,
+        .max_scrollback_lines = null,
+    });
+    defer t.deinit(alloc);
+    for (0..40) |_| try t.printString("line\r\n");
+
+    // A fresh terminal has one page with room to spare.
+    const original = t.screens.get(.primary).?;
+    try testing.expectEqual(@as(usize, 1), original.pages.totalPages());
+    const original_last = original.pages.pages.last.?;
+    try testing.expect(original_last.rows() < original_last.capacity().rows);
+
+    // Restore and write several times. Each restore must keep the active
+    // page at its original row capacity, so new output stays in that page
+    // and memory use does not grow (#15192).
+    var current: *Terminal = &t;
+    var restored: [3]Terminal = undefined;
+    var restored_len: usize = 0;
+    defer for (restored[0..restored_len]) |*r| r.deinit(alloc);
+    for (0..restored.len) |_| {
+        var encoded: std.Io.Writer.Allocating = .init(alloc);
+        defer encoded.deinit();
+        try encode(alloc, &encoded.writer, current, test_encode_options);
+
+        var source: std.Io.Reader = .fixed(encoded.written());
+        var decoded = try decode(alloc, testing.io, &source, test_decode_options);
+        defer decoded.deinit(alloc);
+        restored[restored_len] = decoded.toOwned();
+        current = &restored[restored_len];
+        restored_len += 1;
+
+        const primary = current.screens.get(.primary).?;
+        const last = primary.pages.pages.last.?;
+        try testing.expectEqual(@as(usize, 1), primary.pages.totalPages());
+        try testing.expectEqual(original_last.capacity().rows, last.capacity().rows);
+        try testing.expectEqual(original.pages.page_size, primary.pages.page_size);
+
+        try current.printString("more\r\n");
+        try testing.expectEqual(@as(usize, 1), primary.pages.totalPages());
+        try testing.expectEqual(original.pages.page_size, primary.pages.page_size);
+    }
 }

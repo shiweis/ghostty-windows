@@ -13,6 +13,7 @@ pub const Action = enum {
     @"hyperlink-map",
     @"page-compression",
     @"scrollback-compression",
+    @"scrollback-search",
     @"screen-clone",
     @"terminal-formatter",
     @"terminal-parser",
@@ -21,6 +22,7 @@ pub const Action = enum {
     @"terminal-stream",
     @"is-symbol",
     @"osc-parser",
+    @"shaper-rows",
 
     /// Returns the struct associated with the action. The struct
     /// should have a few decls:
@@ -37,6 +39,7 @@ pub const Action = enum {
             .@"screen-clone" => @import("ScreenClone.zig"),
             .@"page-compression" => @import("PageCompression.zig"),
             .@"scrollback-compression" => @import("ScrollbackCompression.zig"),
+            .@"scrollback-search" => @import("ScrollbackSearch.zig"),
             .@"terminal-stream" => @import("TerminalStream.zig"),
             .@"codepoint-width" => @import("CodepointWidth.zig"),
             .@"grapheme-break" => @import("GraphemeBreak.zig"),
@@ -46,6 +49,7 @@ pub const Action = enum {
             .@"terminal-snapshot" => @import("TerminalSnapshot.zig"),
             .@"is-symbol" => @import("IsSymbol.zig"),
             .@"osc-parser" => @import("OscParser.zig"),
+            .@"shaper-rows" => @import("ShaperRows.zig"),
         };
     }
 };

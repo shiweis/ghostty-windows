@@ -6,7 +6,6 @@ const Window = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const apprt = @import("../../apprt.zig");
-const Config = @import("../../config.zig").Config;
 
 const App = @import("App.zig");
 const Surface = @import("Surface.zig");
@@ -180,20 +179,12 @@ pub fn systemUsesLightTheme() bool {
 }
 
 /// Explicit window themes use the OS caption color; auto follows terminal luminance.
-fn applyChromeTheme(hwnd: w32.HWND, theme: anytype, bg: anytype) void {
-    const luminance: f32 = (0.2126 * @as(f32, @floatFromInt(bg.r)) +
-        0.7152 * @as(f32, @floatFromInt(bg.g)) +
-        0.0722 * @as(f32, @floatFromInt(bg.b))) / 255.0;
-    const by_luminance = luminance < 0.5;
-    const dark = switch (theme) {
-        .dark => true,
-        .light => false,
-        .system => !systemUsesLightTheme(),
-        // `ghostty` is a Linux/GTK-only theme; treat it as auto on Windows.
-        .auto, .ghostty => by_luminance,
-    };
-
-    const dark_mode: u32 = if (dark) 1 else 0;
+pub fn updateTheme(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    const theme = self.app.effectiveWindowTheme();
+    const dark = self.app.windowThemeIsDark();
+    const dark_mode: u32 = @intFromBool(dark);
+    _ = w32.SetWindowTheme(hwnd, controlTheme(dark), null);
     _ = w32.DwmSetWindowAttribute(
         hwnd,
         w32.DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -205,6 +196,7 @@ fn applyChromeTheme(hwnd: w32.HWND, theme: anytype, bg: anytype) void {
         .auto, .ghostty => true,
         else => false,
     };
+    const bg = self.app.config.background;
     const caption_color: u32 = if (tint_caption)
         (@as(u32, bg.r)) | (@as(u32, bg.g) << 8) | (@as(u32, bg.b) << 16)
     else
@@ -215,6 +207,18 @@ fn applyChromeTheme(hwnd: w32.HWND, theme: anytype, bg: anytype) void {
         @ptrCast(&caption_color),
         @sizeOf(u32),
     );
+
+    if (self.rename_edit) |edit| _ = w32.SetWindowTheme(edit, controlTheme(dark), null);
+    for (self.tab_trees[0..self.tab_count]) |tree| {
+        var it = tree.iterator();
+        while (it.next()) |entry| entry.view.updatePopupTheme(dark);
+    }
+    self.tab_overview.updateAppearance();
+    self.invalidateTabBar();
+}
+
+pub fn controlTheme(dark: bool) [*:0]const u16 {
+    return if (dark) std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer") else std.unicode.utf8ToUtf16LeStringLiteral("Explorer");
 }
 
 fn applyBackgroundBlur(self: *Window) void {
@@ -253,7 +257,7 @@ fn applyComposition(self: *Window) !void {
 }
 
 pub fn onConfigChange(self: *Window) void {
-    if (self.hwnd) |hwnd| applyChromeTheme(hwnd, self.app.config.@"window-theme", self.app.config.background);
+    self.updateTheme();
     self.applyComposition() catch |err| log.warn("composition setup failed: {}", .{err});
     self.layoutSplits();
     self.invalidateTabBar();
@@ -272,7 +276,6 @@ pub fn refreshOpacity(self: *Window) void {
             };
         }
     }
-    self.tab_overview.updateAppearance();
     self.invalidateTabBar();
 }
 
@@ -411,15 +414,8 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
     _ = w32.SetWindowLongPtrW(tab_bar, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
     self.updateChromeRegion();
 
-    applyChromeTheme(hwnd, app.config.@"window-theme", app.config.background);
+    self.updateTheme();
     self.applyComposition() catch |err| log.warn("composition setup failed: {}", .{err});
-
-    // Apply dark theme to common controls (scrollbar, etc.).
-    _ = w32.SetWindowTheme(
-        hwnd,
-        std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"),
-        null,
-    );
 
     // Query DPI scale.
     const dpi = w32.GetDpiForWindow(hwnd);
@@ -1926,16 +1922,6 @@ test "tab bar drag reorder follows actual nonuniform tab midpoints" {
     try testing.expectEqual(@as(usize, 63), tabDragTarget(&rects, 10000));
 }
 
-fn tabColor(bg: Config.Color, fg: Config.Color, weight: u8) u32 {
-    const foreground: u16 = weight;
-    const background: u16 = 255 - foreground;
-    return w32.RGB(
-        @intCast((@as(u16, bg.r) * background + @as(u16, fg.r) * foreground + 127) / 255),
-        @intCast((@as(u16, bg.g) * background + @as(u16, fg.g) * foreground + 127) / 255),
-        @intCast((@as(u16, bg.b) * background + @as(u16, fg.b) * foreground + 127) / 255),
-    );
-}
-
 fn tabCloseRect(self: *const Window, tab: w32.RECT) w32.RECT {
     const size: i32 = @intFromFloat(@round(24.0 * self.scale));
     const inset: i32 = @intFromFloat(@round(4.0 * self.scale));
@@ -1961,14 +1947,13 @@ fn paintTabBar(self: *Window, hwnd: w32.HWND) void {
         return;
     };
 
-    const bg = self.app.config.background;
-    const fg = self.app.config.foreground;
-    const bar_color = tabColor(bg, fg, 7);
-    const hover_color = tabColor(bg, fg, 16);
-    const active_bg_color = tabColor(bg, fg, 25);
-    const divider_color = tabColor(bg, fg, 40);
-    const active_text_color = w32.RGB(fg.r, fg.g, fg.b);
-    const inactive_text_color = tabColor(bg, fg, 195);
+    const colors = self.app.chromeColors();
+    const bar_color = colors.mix(7);
+    const hover_color = colors.mix(16);
+    const active_bg_color = colors.mix(25);
+    const divider_color = colors.mix(40);
+    const active_text_color = colors.mix(255);
+    const inactive_text_color = colors.mix(195);
     const bar_rect = w32.RECT{ .left = 0, .top = 0, .right = client_w, .bottom = bar_h };
     canvas.fillRect(&bar_rect, bar_color);
 
@@ -2569,19 +2554,7 @@ pub fn startTabRename(self: *Window, tab_idx: usize) void {
         null,
     ) orelse return;
 
-    // Apply dark theme
-    const dark_mode: u32 = 1;
-    _ = w32.DwmSetWindowAttribute(
-        edit,
-        w32.DWMWA_USE_IMMERSIVE_DARK_MODE,
-        @ptrCast(&dark_mode),
-        @sizeOf(u32),
-    );
-    _ = w32.SetWindowTheme(
-        edit,
-        std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"),
-        null,
-    );
+    _ = w32.SetWindowTheme(edit, controlTheme(self.app.windowThemeIsDark()), null);
 
     // Set font — stored for cleanup
     self.rename_font = w32.CreateFontW(
@@ -2893,6 +2866,13 @@ pub fn windowWndProc(
             window.overview_refresh_pending = false;
             window.tab_overview.refresh();
             return 0;
+        },
+        w32.WM_SETTINGCHANGE => {
+            if (window.app.effectiveWindowTheme() == .system or window.app.config._conditional_set.contains(.theme)) {
+                window.updateTheme();
+                window.app.requestColorSchemeSync();
+            }
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_DWMCOMPOSITIONCHANGED => {
             window.applyComposition() catch |err| log.warn("composition setup failed: {}", .{err});

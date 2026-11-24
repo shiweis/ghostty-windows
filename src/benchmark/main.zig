@@ -13,6 +13,8 @@ pub const TerminalSnapshot = @import("TerminalSnapshot.zig");
 pub const IsSymbol = @import("IsSymbol.zig");
 pub const PageCompression = @import("PageCompression.zig");
 pub const ScrollbackCompression = @import("ScrollbackCompression.zig");
+pub const ScrollbackSearch = @import("ScrollbackSearch.zig");
+pub const ShaperRows = @import("ShaperRows.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

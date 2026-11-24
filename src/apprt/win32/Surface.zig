@@ -182,8 +182,6 @@ palette_font: ?*anyopaque = null,
 /// in paintPalette. Cached so we don't allocate a new HFONT on every
 /// keystroke-driven repaint.
 palette_paint_font: ?*anyopaque = null,
-/// Cached brush for palette background (reused in WM_CTLCOLOREDIT).
-palette_brush: ?w32.HBRUSH = null,
 /// Whether the command palette is currently visible.
 palette_active: bool = false,
 /// Currently selected item in the filtered palette list.
@@ -661,10 +659,6 @@ fn deinitGui(self: *Surface) void {
         _ = w32.DeleteObject(f);
         self.palette_font = null;
     }
-    if (self.palette_brush) |b| {
-        _ = w32.DeleteObject(b);
-        self.palette_brush = null;
-    }
     if (self.palette_paint_font) |f| {
         _ = w32.DeleteObject(f);
         self.palette_paint_font = null;
@@ -722,8 +716,6 @@ pub fn popupDestroyed(self: *Surface, hwnd: w32.HWND) void {
         self.palette_font = null;
         if (self.palette_paint_font) |font| _ = w32.DeleteObject(font);
         self.palette_paint_font = null;
-        if (self.palette_brush) |brush| _ = w32.DeleteObject(brush);
-        self.palette_brush = null;
     }
 }
 
@@ -1624,20 +1616,6 @@ fn ensureSearchBar(self: *Surface) void {
         null,
     ) orelse return;
 
-    // Apply dark theme
-    const dark_mode: u32 = 1;
-    _ = w32.DwmSetWindowAttribute(
-        popup,
-        w32.DWMWA_USE_IMMERSIVE_DARK_MODE,
-        @ptrCast(&dark_mode),
-        @sizeOf(u32),
-    );
-    _ = w32.SetWindowTheme(
-        popup,
-        std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"),
-        null,
-    );
-
     // Create the Edit control inside the popup, leaving room on the right
     // for the match-count label ("3/17").
     const count_w: i32 = @intFromFloat(@round(64.0 * s));
@@ -1706,6 +1684,7 @@ fn ensureSearchBar(self: *Surface) void {
 
     self.search_hwnd = popup;
     self.search_edit = edit;
+    self.updatePopupTheme(self.app.windowThemeIsDark());
 }
 
 /// Position the search popup at the top-right corner of the parent window.
@@ -1869,6 +1848,10 @@ const palette_entries = [_]PaletteEntry{
     .{ .name = "Reset Terminal", .action = .reset },
     .{ .name = "Open Config", .action = .{ .open_config = .default } },
     .{ .name = "Reload Config", .action = .reload_config },
+    .{ .name = "Switch to Configured Appearance", .action = .{ .set_window_theme = .config } },
+    .{ .name = "Switch to System Appearance", .action = .{ .set_window_theme = .system } },
+    .{ .name = "Switch to Light Appearance", .action = .{ .set_window_theme = .light } },
+    .{ .name = "Switch to Dark Appearance", .action = .{ .set_window_theme = .dark } },
     .{ .name = "Quit", .action = .quit },
 };
 
@@ -1926,20 +1909,6 @@ fn ensureCommandPalette(self: *Surface) void {
         null,
     ) orelse return;
 
-    // Apply dark theme
-    const dark_mode: u32 = 1;
-    _ = w32.DwmSetWindowAttribute(
-        popup,
-        w32.DWMWA_USE_IMMERSIVE_DARK_MODE,
-        @ptrCast(&dark_mode),
-        @sizeOf(u32),
-    );
-    _ = w32.SetWindowTheme(
-        popup,
-        std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"),
-        null,
-    );
-
     // Create the search edit at the top (DPI-scaled)
     const edit = w32.CreateWindowExW(
         0,
@@ -1980,9 +1949,6 @@ fn ensureCommandPalette(self: *Surface) void {
         _ = w32.SendMessageW(edit, w32.WM_SETFONT, @intFromPtr(f), 1);
     }
 
-    // Create cached brush for WM_CTLCOLOREDIT (avoids leak on every repaint)
-    self.palette_brush = w32.CreateSolidBrush(w32.RGB(30, 30, 30));
-
     // Set placeholder text via EM_SETCUEBANNER
     const placeholder = std.unicode.utf8ToUtf16LeStringLiteral("Type a command...");
     _ = w32.SendMessageW(edit, 0x1501, 1, @bitCast(@intFromPtr(placeholder))); // EM_SETCUEBANNER
@@ -1992,6 +1958,15 @@ fn ensureCommandPalette(self: *Surface) void {
 
     self.palette_hwnd = popup;
     self.palette_edit = edit;
+    self.updatePopupTheme(self.app.windowThemeIsDark());
+}
+
+pub fn updatePopupTheme(self: *Surface, dark: bool) void {
+    for ([_]?w32.HWND{ self.search_hwnd, self.search_edit, self.search_count_label, self.palette_hwnd, self.palette_edit }) |maybe| {
+        const hwnd = maybe orelse continue;
+        _ = w32.SetWindowTheme(hwnd, Window.controlTheme(dark), null);
+        _ = w32.InvalidateRect(hwnd, null, 1);
+    }
 }
 
 /// Position the command palette centered at the top of the parent window.
@@ -2110,14 +2085,10 @@ pub fn paintPalette(self: *Surface, hwnd: w32.HWND) void {
     var client_rect: w32.RECT = undefined;
     if (w32.GetClientRect(hwnd, &client_rect) == 0) return;
 
-    // Fill background. Reuse the cached brush set up by setCommandPaletteActive
-    // — falling back to a one-shot brush only if it's somehow missing.
-    if (self.palette_brush) |b| {
-        _ = w32.FillRect(hdc, &client_rect, b);
-    } else if (w32.CreateSolidBrush(w32.RGB(30, 30, 30))) |b| {
-        _ = w32.FillRect(hdc, &client_rect, b);
-        _ = w32.DeleteObject(b);
-    }
+    const colors = self.app.chromeColors();
+    const brush = w32.GetStockObject(w32.DC_BRUSH) orelse return;
+    _ = w32.SetDCBrushColor(hdc, colors.mix(0));
+    _ = w32.FillRect(hdc, &client_rect, @ptrCast(brush));
 
     // Reuse a cached 14pt font; create on first paint and keep it for
     // the lifetime of this popup. Rebuilt by handleDpiChange.
@@ -2171,23 +2142,21 @@ pub fn paintPalette(self: *Surface, hwnd: w32.HWND) void {
 
         // Draw selection highlight
         if (i == self.palette_selected) {
-            if (w32.CreateSolidBrush(w32.RGB(60, 60, 80))) |sel_brush| {
-                const sel_rect = w32.RECT{
-                    .left = 0,
-                    .top = y,
-                    .right = client_rect.right,
-                    .bottom = y + item_height,
-                };
-                _ = w32.FillRect(hdc, &sel_rect, sel_brush);
-                _ = w32.DeleteObject(sel_brush);
-            }
+            _ = w32.SetDCBrushColor(hdc, colors.mix(36));
+            const sel_rect = w32.RECT{
+                .left = 0,
+                .top = y,
+                .right = client_rect.right,
+                .bottom = y + item_height,
+            };
+            _ = w32.FillRect(hdc, &sel_rect, @ptrCast(brush));
         }
 
         // Draw action name
         const text_pad: i32 = @intFromFloat(@round(12.0 * s));
         const text_top_pad: i32 = @intFromFloat(@round(4.0 * s));
         const kb_area: i32 = @intFromFloat(@round(160.0 * s));
-        _ = w32.SetTextColor(hdc, w32.RGB(220, 220, 220));
+        _ = w32.SetTextColor(hdc, colors.mix(255));
         var name_rect = w32.RECT{
             .left = text_pad,
             .top = y + text_top_pad,
@@ -2206,7 +2175,7 @@ pub fn paintPalette(self: *Surface, hwnd: w32.HWND) void {
         // Draw keybinding hint on the right
         const trigger = if (entry_action) |a| self.app.config.keybind.set.getTrigger(a) else null;
         if (trigger) |t| {
-            _ = w32.SetTextColor(hdc, w32.RGB(140, 140, 140));
+            _ = w32.SetTextColor(hdc, colors.mix(170));
             var kb_buf: [64]u8 = undefined;
             const kb_len = formatTrigger(t, &kb_buf);
             var wkb_buf: [64]u16 = undefined;
@@ -2508,6 +2477,16 @@ pub fn handleDpiChange(self: *Surface) void {
 
 /// Handle WM_KEYDOWN / WM_SYSKEYDOWN / WM_KEYUP / WM_SYSKEYUP.
 pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: input.Action) void {
+    self.handleKeyEventWithNative(wparam, lparam, action, w32);
+}
+
+fn handleKeyEventWithNative(
+    self: *Surface,
+    wparam: usize,
+    lparam: isize,
+    action: input.Action,
+    comptime native: type,
+) void {
     if (!self.core_surface_ready) return;
     const vk: u16 = @intCast(wparam & 0xFFFF);
 
@@ -2529,7 +2508,7 @@ pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: inpu
     const key = mapVirtualKey(vk, extended);
 
     // Build modifier state
-    const mods = getModifiers();
+    const mods = getModifiers(native);
 
     // Win32 Input Mode (mode 9001): encode key events as
     // \x1b[Vk;Sc;Uc;Kd;Cs;Rc_ sequences that ConPTY reconstructs
@@ -2575,7 +2554,7 @@ pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: inpu
         }
 
         // No binding matched — send as Win32 input sequence.
-        self.sendWin32InputEvent(vk, lparam, action);
+        self.sendWin32InputEventWithNative(vk, lparam, action, native);
         return;
     }
 
@@ -2609,13 +2588,13 @@ pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: inpu
         // pending dead key); result<0 means VK is itself a dead key and
         // ToUnicode just stored it for the next call.
         var keyboard_state: [256]u8 = undefined;
-        if (w32.GetKeyboardState(&keyboard_state) != 0) {
+        if (native.GetKeyboardState(&keyboard_state) != 0) {
             // Mask to 8 bits — bit 24 of lparam is the extended-key flag,
             // not part of the scancode. Including it broke ToUnicode for
             // AltGr layouts (German, Polish) and arrow/numpad keys.
             const scancode: u32 = @intCast((lparam >> 16) & 0xFF);
             var utf16_buf: [4]u16 = undefined;
-            const result = w32.ToUnicode(
+            const result = native.ToUnicode(
                 @intCast(vk),
                 scancode,
                 &keyboard_state,
@@ -2742,7 +2721,7 @@ pub fn handleMouseButton(
     const x: f32 = @floatFromInt(@as(i16, @truncate(@as(isize, lparam & 0xFFFF))));
     const y: f32 = @floatFromInt(@as(i16, @truncate(@as(isize, (lparam >> 16) & 0xFFFF))));
 
-    const mods = getModifiers();
+    const mods = getModifiers(w32);
 
     // Capture mouse on the first pressed button; release only when all
     // buttons are up. Otherwise a right-click in the middle of a left-
@@ -2806,7 +2785,7 @@ fn showContextMenu(self: *Surface, lparam: isize) void {
     // WM_RBUTTONUP, so the core would never see the right-button release and
     // would leave click_state[right] stuck at .press (corrupting later mouse
     // motion). Synthesize the release now.
-    _ = self.core_surface.mouseButtonCallback(.release, .right, getModifiers()) catch |err| {
+    _ = self.core_surface.mouseButtonCallback(.release, .right, getModifiers(w32)) catch |err| {
         log.err("mouse button callback error: {}", .{err});
     };
 
@@ -2869,7 +2848,7 @@ pub fn handleMouseMove(self: *Surface, lparam: isize) void {
     const y: f32 = @floatFromInt(@as(i16, @truncate(@as(isize, (lparam >> 16) & 0xFFFF))));
 
     // Pass modifiers so the core can detect Ctrl+hover for link highlighting.
-    const mods = getModifiers();
+    const mods = getModifiers(w32);
 
     self.core_surface.cursorPosCallback(.{ .x = x, .y = y }, mods) catch |err| {
         log.err("cursor pos callback error: {}", .{err});
@@ -2921,7 +2900,7 @@ fn hdropPathsToUtf8(alloc: Allocator, hdrop: w32.HDROP) Allocator.Error!?[]u8 {
     const count = w32.DragQueryFileW(hdrop, 0xFFFFFFFF, null, 0);
     if (count == 0) return null;
 
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(alloc);
 
     var i: u32 = 0;
@@ -3585,46 +3564,46 @@ fn clearPendingKeyboardText(self: *Surface, comptime native: type) void {
 }
 
 /// Get the current keyboard modifier state from Win32.
-fn getModifiers() input.Mods {
+fn getModifiers(comptime native: type) input.Mods {
     var mods: input.Mods = .{};
 
     // GetKeyState returns a value where the high bit indicates the key
     // is currently down.
-    if (w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0) {
+    if (native.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0) {
         mods.shift = true;
         // Determine which shift key is pressed
-        if (w32.GetKeyState(@as(i32, w32.VK_RSHIFT)) < 0) {
+        if (native.GetKeyState(@as(i32, w32.VK_RSHIFT)) < 0) {
             mods.sides.shift = .right;
         }
     }
-    if (w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0) {
+    if (native.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0) {
         mods.ctrl = true;
-        if (w32.GetKeyState(@as(i32, w32.VK_RCONTROL)) < 0) {
+        if (native.GetKeyState(@as(i32, w32.VK_RCONTROL)) < 0) {
             mods.sides.ctrl = .right;
         }
     }
-    if (w32.GetKeyState(@as(i32, w32.VK_MENU)) < 0) {
+    if (native.GetKeyState(@as(i32, w32.VK_MENU)) < 0) {
         mods.alt = true;
-        if (w32.GetKeyState(@as(i32, w32.VK_RMENU)) < 0) {
+        if (native.GetKeyState(@as(i32, w32.VK_RMENU)) < 0) {
             mods.sides.alt = .right;
         }
     }
 
     // Check super (Windows key)
-    if (w32.GetKeyState(@as(i32, w32.VK_LWIN)) < 0 or
-        w32.GetKeyState(@as(i32, w32.VK_RWIN)) < 0)
+    if (native.GetKeyState(@as(i32, w32.VK_LWIN)) < 0 or
+        native.GetKeyState(@as(i32, w32.VK_RWIN)) < 0)
     {
         mods.super = true;
-        if (w32.GetKeyState(@as(i32, w32.VK_RWIN)) < 0) {
+        if (native.GetKeyState(@as(i32, w32.VK_RWIN)) < 0) {
             mods.sides.super = .right;
         }
     }
 
     // Lock keys (low bit indicates toggle state)
-    if (w32.GetKeyState(@as(i32, w32.VK_CAPITAL)) & 1 != 0) {
+    if (native.GetKeyState(@as(i32, w32.VK_CAPITAL)) & 1 != 0) {
         mods.caps_lock = true;
     }
-    if (w32.GetKeyState(@as(i32, w32.VK_NUMLOCK)) & 1 != 0) {
+    if (native.GetKeyState(@as(i32, w32.VK_NUMLOCK)) & 1 != 0) {
         mods.num_lock = true;
     }
 
@@ -3813,15 +3792,28 @@ pub fn rtApp(self: *Surface) *App {
 test "Win32 modifier releases clear link hover without changing selection or input" {
     const testing = std.testing;
     const Native = struct {
-        extern "user32" fn SetKeyboardState(state: *const [256]u8) callconv(.winapi) i32;
         extern "user32" fn GetCursor() callconv(.winapi) ?w32.HCURSOR;
+
+        // Hold the keyboard snapshot for this event independent of the desktop.
+        var mods: input.Mods = .{};
+        fn GetKeyState(vk: i32) i16 {
+            const down = switch (vk) {
+                w32.VK_SHIFT, w32.VK_LSHIFT => mods.shift,
+                w32.VK_CONTROL, w32.VK_LCONTROL => mods.ctrl,
+                else => false,
+            };
+            return if (down) std.math.minInt(i16) else 0;
+        }
+
+        fn GetKeyboardState(_: *[256]u8) i32 {
+            unreachable; // Modifier releases do not translate text.
+        }
+
+        fn ToUnicode(_: u32, _: u32, _: *const [256]u8, _: [*]u16, _: i32, _: u32) i32 {
+            unreachable;
+        }
     };
 
-    // SetKeyboardState affects only this thread's input queue. Never inject
-    // global input or move the real pointer to test a modifier transition.
-    var saved_keys: [256]u8 = undefined;
-    if (w32.GetKeyboardState(&saved_keys) == 0) return error.Win32Error;
-    defer _ = Native.SetKeyboardState(&saved_keys);
     const saved_cursor = Native.GetCursor();
     defer _ = w32.SetCursor(saved_cursor);
 
@@ -3891,18 +3883,9 @@ test "Win32 modifier releases clear link hover without changing selection or inp
         surface.current_cursor = w32.LoadCursorW(null, w32.IDC_HAND);
 
         for (order) |release| {
-            var keys: [256]u8 = @splat(0);
-            if (release.remaining.ctrl) {
-                keys[w32.VK_CONTROL] = 0x80;
-                keys[w32.VK_LCONTROL] = 0x80;
-            }
-            if (release.remaining.shift) {
-                keys[w32.VK_SHIFT] = 0x80;
-                keys[w32.VK_LSHIFT] = 0x80;
-            }
-            if (Native.SetKeyboardState(&keys) == 0) return error.Win32Error;
+            Native.mods = release.remaining;
             const lparam: isize = (@as(isize, release.scancode) << 16) | 1;
-            surface.handleKeyEvent(release.vk, lparam, .release);
+            surface.handleKeyEventWithNative(release.vk, lparam, .release, Native);
 
             // No HWND is needed: losing the link must clear stale hover
             // even when a stationary cursor's position cannot be queried.

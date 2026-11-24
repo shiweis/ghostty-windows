@@ -167,25 +167,18 @@ fn px(self: *const TabOverview, value: f32) i32 {
 pub fn updateAppearance(self: *TabOverview) void {
     const owner = self.owner orelse return;
     const hwnd = self.hwnd orelse return;
-    const config = &owner.app.config;
-    const bg = config.background;
-    const fg = config.foreground;
-    self.background = w32.RGB(bg.r, bg.g, bg.b);
-    self.foreground = w32.RGB(fg.r, fg.g, fg.b);
+    const colors = owner.app.chromeColors();
+    self.background = colors.mix(0);
+    self.foreground = colors.mix(255);
     if (w32.CreateSolidBrush(self.background)) |brush| {
         if (self.brush) |old| _ = w32.DeleteObject(old);
         self.brush = brush;
     }
     const old_font = self.font;
     self.font = w32.CreateFontW(-self.px(16), 0, 0, 0, 400, 0, 0, 0, w32.DEFAULT_CHARSET, 0, 0, 0, 0, std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI")) orelse old_font;
-    const dark: u32 = if (switch (config.@"window-theme") {
-        .dark => true,
-        .light => false,
-        .system => !Window.systemUsesLightTheme(),
-        else => @as(u32, bg.r) * 299 + @as(u32, bg.g) * 587 + @as(u32, bg.b) * 114 < 128_000,
-    }) 1 else 0;
+    const dark: u32 = @intFromBool(owner.app.windowThemeIsDark());
     _ = w32.DwmSetWindowAttribute(hwnd, w32.DWMWA_USE_IMMERSIVE_DARK_MODE, @ptrCast(&dark), @sizeOf(u32));
-    const theme = if (dark != 0) std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer") else std.unicode.utf8ToUtf16LeStringLiteral("Explorer");
+    const theme = Window.controlTheme(dark != 0);
     for ([_]?w32.HWND{ self.label, self.edit, self.list, self.status, self.open_button, self.close_button, self.cancel_button }) |maybe| {
         const child = maybe orelse continue;
         _ = w32.SetWindowTheme(child, theme, null);
@@ -553,4 +546,102 @@ test "tab overview native controls filtering stable selection DPI and teardown" 
     overview.deinit();
     try testing.expectEqual(@as(?w32.HWND, null), overview.hwnd);
     try testing.expectEqual(@as(?*anyopaque, null), overview.font);
+}
+
+test "window theme session action updates existing and new native windows and overview across reload" {
+    const App = @import("App.zig");
+    const CoreApp = @import("../../App.zig");
+    const Config = @import("../../config.zig").Config;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const instance = w32.GetModuleHandleW(null) orelse return error.Win32Error;
+
+    // Only register the classes required by the hidden windows. No shell,
+    // global hotkeys, network checks, or foreground activation are needed.
+    const classes = [_][*:0]const u16{ App.WINDOW_CLASS_NAME, App.CHROME_CLASS_NAME };
+    var registered: usize = 0;
+    defer for (classes[0..registered]) |name| {
+        _ = w32.UnregisterClassW(name, instance);
+    };
+    for (classes) |name| {
+        if (w32.RegisterClassExW(&.{
+            .cbSize = @sizeOf(w32.WNDCLASSEXW),
+            .style = 0,
+            .lpfnWndProc = &w32.DefWindowProcW,
+            .cbClsExtra = 0,
+            .cbWndExtra = 0,
+            .hInstance = instance,
+            .hIcon = null,
+            .hCursor = null,
+            .hbrBackground = null,
+            .lpszMenuName = null,
+            .lpszClassName = name,
+            .hIconSm = null,
+        }) == 0) return error.Win32Error;
+        registered += 1;
+    }
+    _ = try registerClass(instance);
+    defer _ = w32.UnregisterClassW(class_name, instance);
+
+    var core: CoreApp = undefined;
+    try core.init(alloc);
+    defer core.deinit();
+    var app: App = .{ .core_app = &core, .config = try Config.default(alloc), .hinstance = instance };
+    defer app.config.deinit();
+    defer app.windows.deinit(alloc);
+    defer if (app.bg_brush) |brush| {
+        _ = w32.DeleteObject(@ptrCast(brush));
+    };
+    app.config.@"window-theme" = .light;
+    var first: Window = undefined;
+    try first.init(&app, .{});
+    defer first.deinit();
+    try app.windows.append(alloc, &first);
+    try first.tab_overview.create(&first);
+
+    const expectDark = struct {
+        fn check(hwnd: w32.HWND, expected: bool) !void {
+            var dark: u32 = undefined;
+            try testing.expect(w32.DwmGetWindowAttribute(hwnd, w32.DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, @sizeOf(u32)) >= 0);
+            try testing.expectEqual(expected, dark != 0);
+        }
+    }.check;
+    try expectDark(first.hwnd.?, false);
+    try core.performAction(&app, .{ .set_window_theme = .dark });
+    try expectDark(first.hwnd.?, true);
+    try expectDark(first.tab_overview.hwnd.?, true);
+    try testing.expectEqual(app.chromeColors().mix(0), first.tab_overview.background);
+
+    var second: Window = undefined;
+    try second.init(&app, .{});
+    defer second.deinit();
+    try app.windows.append(alloc, &second);
+    try expectDark(second.hwnd.?, true);
+
+    var quick_window: Window = undefined;
+    try quick_window.init(&app, .{ .is_quick_terminal = true });
+    defer quick_window.deinit();
+    var quick: @import("QuickTerminal.zig") = .{ .app = &app, .window = &quick_window };
+    app.quick_terminal = &quick;
+    try expectDark(quick_window.hwnd.?, true);
+
+    var changed = try Config.default(alloc);
+    defer changed.deinit();
+    changed.@"window-theme" = .system;
+    try core.updateConfig(&app, &changed);
+    try testing.expectEqual(.dark, app.effectiveWindowTheme());
+    try expectDark(second.hwnd.?, true);
+    try core.performAction(&app, .{ .set_window_theme = .light });
+    try expectDark(first.tab_overview.hwnd.?, false);
+    try expectDark(second.hwnd.?, false);
+    try expectDark(quick_window.hwnd.?, false);
+    try core.performAction(&app, .{ .set_window_theme = .system });
+    try expectDark(first.hwnd.?, !Window.systemUsesLightTheme());
+    try core.performAction(&app, .{ .set_window_theme = .config });
+    try testing.expectEqual(.system, app.effectiveWindowTheme());
+    changed.@"window-theme" = .dark;
+    try core.updateConfig(&app, &changed);
+    try expectDark(first.hwnd.?, true);
+    try expectDark(second.hwnd.?, true);
+    try expectDark(first.tab_overview.hwnd.?, true);
 }

@@ -1168,6 +1168,13 @@ pub extern "dwmapi" fn DwmSetWindowAttribute(
     cbAttribute: u32,
 ) callconv(.winapi) i32;
 
+pub extern "dwmapi" fn DwmGetWindowAttribute(
+    hwnd: HWND,
+    dwAttribute: u32,
+    pvAttribute: *anyopaque,
+    cbAttribute: u32,
+) callconv(.winapi) i32;
+
 pub const DWMWA_SYSTEMBACKDROP_TYPE: u32 = 38;
 pub const DWMSBT_NONE: u32 = 1;
 pub const DWMSBT_TRANSIENTWINDOW: u32 = 3;
