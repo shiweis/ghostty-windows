@@ -100,6 +100,40 @@ fn kittyWrite(surface: *Surface) !void {
     try surface.core_surface.handleMessage(.{ .kitty_clipboard_write = req });
 }
 
+test "Windows clipboard selection snapshots survive replacement and failed writes" {
+    var selection: Clipboard.Selection = .{};
+    defer selection.deinit();
+    try selection.write(t.allocator, &.{
+        .{ .mime = "text/plain", .data = "first\r\nline" },
+        .{ .mime = "UTF8_STRING", .data = "first\r\nline" },
+        .{ .mime = "application/octet-stream", .data = "\x00\xff\x00" },
+    });
+    var pool: std.heap.ArenaAllocator = .init(t.allocator);
+    defer pool.deinit();
+    const arena = pool.allocator();
+    const paste = try selection.read(arena, .{ .paste = .selection });
+    const listing = try selection.read(arena, .{ .list = .selection });
+    try t.expectEqual(@as(usize, 2), listing.available.items.len);
+    try t.expect(listing.contents.items.len == 0);
+    var req: apprt.ClipboardRequest.KittyRead = undefined;
+    req.mimes = &.{"application/octet-stream"};
+    const binary = try selection.read(arena, .{ .kitty_read = &req });
+    var storage: [1]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&storage);
+    const replacement: []const apprt.ClipboardContent = &.{.{ .mime = "text/plain", .data = "new" }};
+    try t.expectError(error.OutOfMemory, selection.write(fixed.allocator(), replacement));
+    try t.expectEqualStrings("first\r\nline", selection.contents[0].data);
+    try t.expectError(error.UnsupportedClipboardFormat, selection.write(t.allocator, &.{.{ .mime = "bad name", .data = "new" }}));
+    try t.expectError(error.UnsupportedClipboardFormat, selection.write(t.allocator, &.{
+        .{ .mime = "text/plain", .data = "one" }, .{ .mime = "TEXT", .data = "two" },
+    }));
+    try selection.write(t.allocator, replacement);
+    try t.expectEqualStrings("new", selection.contents[0].data);
+    try t.expectEqualStrings("first\nline", paste.contents.items[0].data);
+    try t.expectEqualStrings("application/octet-stream", listing.available.items[1]);
+    try t.expectEqualSlices(u8, "\x00\xff\x00", binary.contents.items[0].data);
+}
+
 test "Windows clipboard private station selection copying, cross-window paste and explicit OSC locations" {
     if (!Clipboard.privateTestStation()) return error.SkipZigTest;
     var pool: std.heap.ArenaAllocator = .init(t.allocator);
@@ -146,8 +180,9 @@ test "Windows clipboard private station selection copying, cross-window paste an
     try t.expect(try reader.performBindingAction(.paste_from_selection));
     const event = try panes[1].output(arena);
     try t.expect(std.mem.indexOf(u8, event, ":loc=primary:pw=") != null);
-    // The mode-5522 targets packet contains "text/plain\ntext/html\n".
-    try t.expect(std.mem.indexOf(u8, event, "dGV4dC9wbGFpbgp0ZXh0L2h0bWwK") != null);
+    var encoded: [64]u8 = undefined;
+    const targets = std.base64.standard.Encoder.encode(&encoded, "text/plain text/html\n");
+    try t.expect(std.mem.indexOf(u8, event, targets) != null);
     reader.io.terminal.modes.set(.kitty_paste_events, false);
     try t.expect(try reader.performBindingAction(.paste_from_clipboard));
     try t.expectEqualStrings("system", try panes[1].output(arena));

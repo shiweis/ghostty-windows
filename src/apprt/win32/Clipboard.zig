@@ -277,12 +277,20 @@ pub const Selection = struct {
     pub fn supported(parts: []const apprt.ClipboardContent) bool {
         if (parts.len > custom.max_parts) return false;
         var total: usize = 0;
-        for (parts) |part| {
+        for (parts, 0..) |part, i| {
             if (!terminal.clipboard.isTextMime(part.mime) and !custom.validName(part.mime)) return false;
             if (part.data.len > custom.max_bytes - total) return false;
             total += part.data.len;
+            for (parts[0..i]) |prev| {
+                if (std.mem.eql(u8, canonicalMime(prev.mime), canonicalMime(part.mime)) and
+                    !std.mem.eql(u8, prev.data, part.data)) return false;
+            }
         }
         return true;
+    }
+
+    fn canonicalMime(name: []const u8) []const u8 {
+        return if (terminal.clipboard.isTextMime(name)) "text/plain" else name;
     }
 
     pub fn write(self: *Selection, alloc: Allocator, parts: []const apprt.ClipboardContent) !void {
@@ -290,13 +298,19 @@ pub const Selection = struct {
         var pool: std.heap.ArenaAllocator = .init(alloc);
         errdefer pool.deinit();
         const arena = pool.allocator();
-        const contents = try arena.alloc(terminal.clipboard.Content, parts.len);
-        for (parts, contents) |part, *content| content.* = .{
-            .mime = try arena.dupe(u8, part.mime),
-            .data = try arena.dupe(u8, part.data),
-        };
+        var contents: std.ArrayList(terminal.clipboard.Content) = .empty;
+        try contents.ensureTotalCapacity(arena, parts.len);
+        for (parts) |part| {
+            const mime = canonicalMime(part.mime);
+            for (contents.items) |prev| {
+                if (std.mem.eql(u8, prev.mime, mime)) break;
+            } else contents.appendAssumeCapacity(.{
+                .mime = try arena.dupe(u8, mime),
+                .data = try arena.dupe(u8, part.data),
+            });
+        }
         self.deinit();
-        self.* = .{ .pool = pool, .contents = contents };
+        self.* = .{ .pool = pool, .contents = contents.items };
     }
 
     /// A second pane can replace the selection while a permission dialog is
