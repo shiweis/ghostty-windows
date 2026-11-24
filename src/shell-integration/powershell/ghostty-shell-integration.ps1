@@ -8,16 +8,39 @@
 #   - Current working directory reporting (OSC 7)
 #   - Window title updates (OSC 2)
 #   - Cursor shape changes at prompt
+#   - Ghostty binary directory on PATH
+#   - SSH environment forwarding and remote terminfo installation
 
 if (-not $env:GHOSTTY_SHELL_FEATURES) { return }
 
 $GhosttyFeatures = $env:GHOSTTY_SHELL_FEATURES -split ','
 
+if ($GhosttyFeatures -contains 'path' -and $env:GHOSTTY_BIN_DIR) {
+    & {
+        $separator = [System.IO.Path]::PathSeparator
+        $binDir = $env:GHOSTTY_BIN_DIR.Replace('/', '\').TrimEnd('\')
+        foreach ($entry in ($env:PATH -split $separator)) {
+            if ($entry.Trim('"').Replace('/', '\').TrimEnd('\') -ieq $binDir) { return }
+        }
+        if ($env:PATH) { $env:PATH += $separator + $env:GHOSTTY_BIN_DIR }
+        else { $env:PATH = $env:GHOSTTY_BIN_DIR }
+    }
+}
+
+if ($env:GHOSTTY_BIN_DIR -and ($GhosttyFeatures -contains 'ssh-env' -or $GhosttyFeatures -contains 'ssh-terminfo')) {
+    # An external script preserves both $? and LASTEXITCODE when SSH fails.
+    if (-not (Test-Path Alias:ssh)) {
+        Set-Alias -Name ssh -Value (Join-Path $PSScriptRoot 'ssh.ps1')
+    }
+}
+
 # Save the original prompt function so we can call it.
-if (Test-Path Function:\prompt) {
-    $Function:__ghostty_original_prompt = $Function:prompt
-} else {
-    function __ghostty_original_prompt { "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) " }
+if (-not (Test-Path Function:\__ghostty_original_prompt)) {
+    if (Test-Path Function:\prompt) {
+        $Function:__ghostty_original_prompt = $Function:prompt
+    } else {
+        function __ghostty_original_prompt { "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) " }
+    }
 }
 
 # Track prompt state for OSC 133 sequencing.
@@ -53,7 +76,9 @@ function prompt {
     # A provider or PSDrive name can contain control characters even when a
     # Windows filesystem path cannot. Keep those bytes out of OSC payloads so
     # navigating to such a location cannot inject terminal commands.
-    $cwd = (Get-Location).Path -replace '\\', '/' -replace '\p{Cc}', ''
+    $location = Get-Location
+    $cwd = $location.ProviderPath -replace '\\', '/' -replace '\p{Cc}', ''
+    $cwd = [Uri]::EscapeDataString($cwd).Replace('%2F', '/').Replace('%3A', ':')
     # File URI: file://hostname/path
     $hostname = [System.Net.Dns]::GetHostName() -replace '\p{Cc}', ''
     [Console]::Write("$Script:__ghostty_escape]7;file://$hostname/$cwd`a")

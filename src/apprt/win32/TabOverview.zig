@@ -241,7 +241,7 @@ pub fn findTab(owner: *Window, id: u64) ?usize {
     return null;
 }
 
-fn matches(title: []const u16, query: []const u16) bool {
+pub fn matches(title: []const u16, query: []const u16) bool {
     if (query.len == 0) return true;
     if (query.len > title.len) return false;
     for (0..title.len - query.len + 1) |i| {
@@ -274,7 +274,8 @@ pub fn refresh(self: *TabOverview) void {
     self.count = 0;
     var selected: usize = 0;
     for (0..@min(owner.tab_count, max_tabs)) |i| {
-        const title = owner.tab_titles[i][0..owner.tab_title_lens[i]];
+        var caption_buf: [260]u16 = undefined;
+        const title = owner.displayCaption(i, &owner.tab_labels[i].caption, &caption_buf);
         if (!matches(title, query[0..query_len])) continue;
         var text: [288:0]u16 = undefined;
         var prefix_buf: [24]u8 = undefined;
@@ -473,8 +474,7 @@ test "tab overview native controls filtering stable selection DPI and teardown" 
         nodes[i][0] = .{ .leaf = surface };
         owner.tab_trees[i] = .{ .arena = undefined, .nodes = &nodes[i], .zoomed = null };
         owner.tab_active_surface[i] = surface;
-        @memcpy(owner.tab_titles[i][0..titles[i].len], titles[i]);
-        owner.tab_title_lens[i] = @intCast(titles[i].len);
+        @memcpy(owner.tab_labels[i].caption.text[0..titles[i].len], titles[i]);
     }
     // These are borrowed stack trees, not ref-counted live sessions. Never
     // call Window.deinit/close on this fixture.
@@ -498,8 +498,7 @@ test "tab overview native controls filtering stable selection DPI and teardown" 
     // same surface at its new index, not select the old numeric position.
     std.mem.swap(Tree, &owner.tab_trees[1], &owner.tab_trees[2]);
     std.mem.swap(*Surface, &owner.tab_active_surface[1], &owner.tab_active_surface[2]);
-    std.mem.swap([256]u16, &owner.tab_titles[1], &owner.tab_titles[2]);
-    std.mem.swap(u16, &owner.tab_title_lens[1], &owner.tab_title_lens[2]);
+    std.mem.swap(Window.TabLabel, &owner.tab_labels[1], &owner.tab_labels[2]);
     overview.activateSelection();
     try testing.expectEqual(@as(usize, 2), owner.active_tab);
     try testing.expect(!overview.active);
@@ -511,7 +510,7 @@ test "tab overview native controls filtering stable selection DPI and teardown" 
     _ = w32.SendMessageW(overview.list.?, lb_setcursel, 1, 0);
     const selected = overview.selectedID();
     // A title update must preserve selection by identity.
-    owner.tab_titles[1][0] = 'l';
+    owner.tab_labels[1].caption.text[0] = 'l';
     overview.refresh();
     try testing.expectEqual(selected, overview.selectedID());
     try testing.expect(overview.handleKey(overview.edit.?, w32.VK_DOWN));

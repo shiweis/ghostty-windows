@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory)][string]$ExePath,
     [Parameter(Mandatory)][string]$ResourcesPath,
     [Parameter(Mandatory)][string]$OutputDirectory,
-    [ValidateSet('opaque','transparent','light','close','close-splits','all')][string]$Case='all'
+    [ValidateSet('opaque','transparent','light','close','close-splits','startup','appearance','indicators','graphics','pane-drag','native-settings','pane-menu','all')][string]$Case='all'
 )
 $ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Drawing
@@ -66,6 +66,103 @@ public static class TabBarTestNative {
     public static void MiddleBelow(IntPtr top){double scale=GetDpiForWindow(Check(top))/96.0;Post(top,0x207,0,Coordinates(100,(int)Math.Ceiling(32*scale)));}
     public static void MiddleCloseRegion(IntPtr top,int index,int count){var rect=Client(top);double scale=GetDpiForWindow(Check(top))/96.0;double width=(rect.Width-Math.Round(36*scale))/count;Post(top,0x207,0,Coordinates((int)Math.Round((index+1)*width-16*scale),TabY(top)));}
     public static void TerminalMiddle(IntPtr child){long point=Coordinates(2,2);Post(child,0x207,0x10,point);Post(child,0x208,0,point);}
+    public static Rect PaneBounds(IntPtr h){Rect rect;if(!GetWindowRect(Check(h),out rect))throw new Exception("Missing test window bounds");return rect;}
+    public static IntPtr Grip(IntPtr pane){
+        var bounds=PaneBounds(pane);
+        foreach(var h in Find("GhosttyPaneDrag",IntPtr.Zero,true)){
+            var r=PaneBounds(h);
+            if(r.Top==bounds.Top && Math.Abs((r.Left+r.Right)-(bounds.Left+bounds.Right))<=2)return h;
+        }
+        return IntPtr.Zero;
+    }
+    public static void DragStart(IntPtr grip){var r=Client(grip);Post(grip,0x201,1,Coordinates(r.Width/2,(r.Bottom-r.Top)/2));}
+    [StructLayout(LayoutKind.Sequential)] struct GuiState { public uint size,flags; public IntPtr active,focus,capture,menu,move,caret; public Rect bounds; }
+    [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint thread,ref GuiState info);
+    static GuiState GuiFor(IntPtr pane){uint pid;uint thread=GetWindowThreadProcessId(Check(pane),out pid);var state=new GuiState{size=(uint)Marshal.SizeOf<GuiState>()};if(!GetGUIThreadInfo(thread,ref state))throw new Exception("GUI state unavailable");return state;}
+    [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetMenuString(IntPtr menu,uint item,StringBuilder text,int length,uint flags);
+    [DllImport("user32.dll")] static extern int GetMenuItemCount(IntPtr menu);
+    [DllImport("user32.dll")] static extern uint GetMenuState(IntPtr menu,uint item,uint flags);
+    const uint MN_GETHMENU=0x1e1,MN_SELECTITEM=0x1e5,MF_BYPOSITION=0x400,MF_HILITE=0x80;
+    static IntPtr MenuHandle(IntPtr popup){return new IntPtr(Message(popup,MN_GETHMENU,0,IntPtr.Zero));}
+    public static int MenuIndex(IntPtr popup,string title){
+        var menu=MenuHandle(popup);
+        for(uint i=0;i<GetMenuItemCount(menu);i++){
+            var text=new StringBuilder(128);
+            if(GetMenuString(menu,i,text,text.Capacity,MF_BYPOSITION)>0 && text.ToString()==title && (GetMenuState(menu,i,MF_BYPOSITION)&3)==0)return (int)i;
+        }
+        return -1;
+    }
+    public static void ChooseMenuItem(IntPtr popup,string title){
+        int index=MenuIndex(popup,title);
+        if(index<0)throw new Exception("Menu item unavailable: "+title);
+        var handle=MenuHandle(popup);
+        // First highlight by position, then dispatch Return to the native
+        // menu owner. Both HWNDs belong to this staged application.
+        Message(popup,MN_SELECTITEM,index,IntPtr.Zero);
+        if((GetMenuState(handle,(uint)index,MF_BYPOSITION)&MF_HILITE)==0)throw new Exception("Menu could not highlight "+title);
+        Key(GuiFor(popup).menu,0x0d);
+    }
+    public static IntPtr Captured(IntPtr pane){return GuiFor(pane).capture;}
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    public static bool Foreground(IntPtr top){return GetForegroundWindow()==Check(top);}
+    public static IntPtr Focus(IntPtr pane){return GuiFor(pane).focus;}
+    public static void DragEnd(IntPtr grip,IntPtr target,int x,int y){
+        var a=PaneBounds(grip);var b=PaneBounds(target);
+        long point=Coordinates(b.Left+b.Width*x/100-a.Left,b.Top+(b.Bottom-b.Top)*y/100-a.Top);
+        Post(grip,0x200,1,point);Post(grip,0x202,0,point);
+    }
+    [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr h,ref Point p);
+    public static void DragToTab(IntPtr grip,IntPtr top,int index,int count){
+        var p=new Point(TabX(top,index,count),TabY(top));var a=PaneBounds(grip);
+        if(!ClientToScreen(Check(top),ref p))throw new Exception("Tab is unavailable");
+        long point=Coordinates(p.X-a.Left,p.Y-a.Top);Post(grip,0x200,1,point);Post(grip,0x202,0,point);
+    }
+    public static void PositionPair(IntPtr first,IntPtr second){
+        SetThreadDpiAwarenessContext(new IntPtr(-4));
+        if(!SetWindowPos(Check(first),IntPtr.Zero,10,30,480,460,0x54)||
+           !SetWindowPos(Check(second),IntPtr.Zero,500,30,480,460,0x54))throw new Exception("Could not place the two test windows");
+    }
+    [DllImport("user32.dll")] static extern bool IsZoomed(IntPtr hwnd);
+    public static int PaneRed(IntPtr top,IntPtr pane){
+        Rect outer,child;
+        if(!GetWindowRect(Check(top),out outer)||!GetWindowRect(Check(pane),out child))
+            throw new Exception("GetWindowRect failed");
+        using(var bitmap=new Bitmap(outer.Width,outer.Bottom-outer.Top)){
+            using(var graphics=Graphics.FromImage(bitmap)){
+                var dc=graphics.GetHdc();
+                try{if(!PrintWindow(top,dc,2))throw new Exception("PrintWindow failed");}
+                finally{graphics.ReleaseHdc(dc);}
+            }
+            return bitmap.GetPixel((child.Left+child.Right)/2-outer.Left,(child.Top+child.Bottom)/2-outer.Top).R;
+        }
+    }
+    [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern IntPtr FindWindowEx(IntPtr parent,IntPtr after,string cls,string title);
+    public static IntPtr MessageWindow(){
+        var h=IntPtr.Zero;
+        while((h=FindWindowEx(new IntPtr(-3),h,"GhosttyMsg",null))!=IntPtr.Zero){
+            uint pid;GetWindowThreadProcessId(h,out pid);
+            if(pid==(uint)ProcessId)return h;
+        }
+        return IntPtr.Zero;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct MonitorInfo { public int size;public Rect monitor,work;public int flags; }
+    [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr hwnd,uint fallback);
+    [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern bool GetMonitorInfo(IntPtr monitor,ref MonitorInfo info);
+    public static bool CenteredOnEdge(IntPtr hwnd,string edge){
+        SetThreadDpiAwarenessContext(new IntPtr(-4));
+        var info=new MonitorInfo{size=Marshal.SizeOf<MonitorInfo>()};
+        Rect r;
+        if(!GetWindowRect(Check(hwnd),out r)||!GetMonitorInfo(MonitorFromWindow(hwnd,2),ref info))throw new Exception("Window geometry unavailable");
+        var work=info.work;
+        if(edge=="top"||edge=="bottom")
+            return (edge=="top"?r.Top==work.Top:r.Bottom==work.Bottom) && r.Bottom-r.Top==280 &&
+                Math.Abs(2*r.Width-work.Width)<=1 && Math.Abs(r.Left+r.Right-work.Left-work.Right)<=1;
+        return (edge=="left"?r.Left==work.Left:r.Right==work.Right) && r.Width==280 &&
+            Math.Abs(2*(r.Bottom-r.Top)-(work.Bottom-work.Top))<=1 && Math.Abs(r.Top+r.Bottom-work.Top-work.Bottom)<=1;
+    }
+    public static bool Maximized(IntPtr hwnd){return IsZoomed(Check(hwnd));}
+    public static bool Captioned(IntPtr hwnd){return (GetWindowLongPtr(Check(hwnd),-16).ToInt64() & 0xC00000) != 0;}
+    public static string Bounds(IntPtr hwnd){Rect r;if(!GetWindowRect(Check(hwnd),out r))throw new Exception("GetWindowRect failed");return string.Format("{0},{1},{2},{3}",r.Left,r.Top,r.Right,r.Bottom);}
     public static int Width(IntPtr hwnd){return Client(hwnd).Width;}
     public static void MiddleDuringDividerDrag(IntPtr top,int index,int count){
         var client=Client(top);
@@ -77,12 +174,34 @@ public static class TabBarTestNative {
         Post(top,0x208,1,tab);
         Post(top,0x202,0,tab);
     }
-    public static void Capture(IntPtr top,string path){
-        Rect rect;if(!GetWindowRect(Check(top),out rect))throw new Exception("GetWindowRect failed");
-        using(var bitmap=new Bitmap(rect.Width,rect.Bottom-rect.Top)){
-            using(var graphics=Graphics.FromImage(bitmap)){var dc=graphics.GetHdc();try{if(!PrintWindow(Check(top),dc,2))throw new Exception("PrintWindow failed");}finally{graphics.ReleaseHdc(dc);}}
-            bitmap.Save(path,ImageFormat.Png);
+    public static Point[] ImageMarkers(IntPtr top,IntPtr pane){
+        Rect outer,child;
+        if(!GetWindowRect(Check(top),out outer)||!GetWindowRect(Check(pane),out child))throw new Exception("Window geometry unavailable");
+        var points=new[]{new Point(-1,-1),new Point(-1,-1),new Point(-1,-1)};
+        using(var bitmap=new Bitmap(outer.Width,outer.Bottom-outer.Top)){
+            using(var g=Graphics.FromImage(bitmap)){
+                var dc=g.GetHdc();try{if(!PrintWindow(top,dc,2))throw new Exception("PrintWindow failed");}finally{g.ReleaseHdc(dc);}
+            }
+            for(int y=child.Top-outer.Top;y<child.Bottom-outer.Top;y+=3){
+                for(int x=child.Left-outer.Left;x<child.Right-outer.Left;x+=3){
+                    var c=bitmap.GetPixel(x,y);
+                    int i=c.R>220&&c.G<25&&c.B<25?0:c.G>220&&c.R<25&&c.B<25?1:c.B>220&&c.R<25&&c.G<25?2:-1;
+                    if(i>=0&&points[i].X<0)points[i]=new Point(x,y);
+                }
+            }
         }
+        return points;
+    }
+    public static Bitmap WindowBitmap(IntPtr top){
+        Rect rect;if(!GetWindowRect(Check(top),out rect))throw new Exception("GetWindowRect failed");
+        var bitmap=new Bitmap(rect.Width,rect.Bottom-rect.Top);
+        try{
+            using(var graphics=Graphics.FromImage(bitmap)){var dc=graphics.GetHdc();try{if(!PrintWindow(Check(top),dc,2))throw new Exception("PrintWindow failed");}finally{graphics.ReleaseHdc(dc);}}
+            return bitmap;
+        }catch{bitmap.Dispose();throw;}
+    }
+    public static void Capture(IntPtr top,string path){
+        using(var bitmap=WindowBitmap(top))bitmap.Save(path,ImageFormat.Png);
     }
 }
 '@
@@ -118,9 +237,12 @@ $keys=[Collections.Generic.List[string]]::new()
 function Save-State {
     # A reader can hold an older snapshot while the next one is published.
     $statePath=Join-Path $env:GHOSTTY_TAB_TEST_STATE ('{0}-{1:D10}.json' -f $PID,$keys.Count)
-    $json=@{Pid=$PID;Keys=$keys.ToArray()}|ConvertTo-Json -Depth 4
+    $json=@{Pid=$PID;Keys=$keys.ToArray();Columns=[Console]::WindowWidth;Rows=[Console]::WindowHeight;QuickTerminal=$env:GHOSTTY_QUICK_TERMINAL;SurfaceId=$env:GHOSTTY_SURFACE_ID}|ConvertTo-Json -Depth 4
     [IO.File]::WriteAllText("$statePath.tmp",$json)
     [IO.File]::Move("$statePath.tmp",$statePath)
+}
+function Kitty([string]$payload){
+    [Console]::Write([char]27 + '_G' + $payload + [char]27 + '\')
 }
 $titleSuffix=''
 if(Test-Path (Join-Path $env:GHOSTTY_TAB_TEST_STATE "prompt-$PID")){$titleSuffix='-prompt'}
@@ -129,6 +251,41 @@ New-Item -ItemType File -Force (Join-Path $env:GHOSTTY_TAB_TEST_STATE "live-$PID
 [Console]::Write("`e]2;tab-probe-$PID$titleSuffix`a`e[2J`e[Htab-probe-$PID`r`n")
 while($true){
     if(Test-Path (Join-Path $env:GHOSTTY_TAB_TEST_STATE "exit-$PID")){Remove-Item (Join-Path $env:GHOSTTY_TAB_TEST_STATE "live-$PID") -Force -ErrorAction SilentlyContinue;exit 0}
+    if($env:GHOSTTY_SETTINGS_TEST){
+        $history=Join-Path $env:GHOSTTY_TAB_TEST_STATE "history-$PID"
+        if(Test-Path -LiteralPath $history){
+            [Console]::Write([IO.File]::ReadAllText($history))
+            [Console]::Out.Flush()
+            Remove-Item -LiteralPath $history
+        }
+    }
+    if($env:GHOSTTY_GRAPHICS_TEST){
+        $request=Join-Path $env:GHOSTTY_TAB_TEST_STATE 'image-request'
+        if(Test-Path -LiteralPath $request){
+            $stage=[IO.File]::ReadAllText($request)
+            Remove-Item -LiteralPath $request
+            switch($stage){
+                'place' {
+                    [Console]::Write("`e[6;6H")
+                    Kitty 'a=T,i=1,p=1,f=24,s=1,v=1,c=5,r=3,C=1,q=2;/wAA'
+                    Kitty 'a=t,i=2,f=24,s=1,v=1,q=2;AP8A'
+                    Kitty 'a=p,i=2,p=1,P=1,Q=1,H=7,V=1,c=4,r=2,C=1,q=2'
+                }
+                'move' {
+                    [Console]::Write("`e[10;14H")
+                    Kitty 'a=p,i=1,p=1,c=5,r=3,C=1,q=2'
+                }
+                'frame' {
+                    Kitty 'a=f,i=1,f=24,s=1,v=1,z=180,q=2;AAD/'
+                    Kitty 'a=a,i=1,c=2,q=2'
+                }
+                'animate' {
+                    Kitty 'a=a,i=1,r=1,z=180,c=1,s=3,v=1,q=2'
+                }
+            }
+            [Console]::Out.Flush()
+        }
+    }
     if(Test-Path (Join-Path $env:GHOSTTY_TAB_TEST_STATE "prompt-$PID")){
         Remove-Item (Join-Path $env:GHOSTTY_TAB_TEST_STATE "prompt-$PID") -Force
         [Console]::Write("`e]133;A`a");[Console]::Write('prompt$ ');[Console]::Write("`e]133;B`a")
@@ -186,19 +343,31 @@ function Capture-Dialog($run,[string]$name){
     [TabBarTestNative]::Capture($dialogs[0],$path)
     $record.Captures+=@{Name=$name;Mode=$run.Name;Path=$path}
 }
-function Start-Run([double]$opacity,[string]$name,[bool]$confirm=$false,[string]$showTabBar='always'){
+function Start-Run([double]$opacity,[string]$name,[bool]$confirm=$false,[string]$showTabBar='always',[string[]]$extraConfig=@(),[switch]$KeepStartupBounds,[switch]$BackgroundLaunch){
     $run=@{Name=$name;State=(Join-Path $work $name);Config=(Join-Path $work ($name+'.ghostty'))};New-Item -ItemType Directory $run.State|Out-Null
     $background=if($name -eq 'light'){'#ffffff'}else{'#1e1e2e'}
     $foreground=if($name -eq 'light'){'#1e1e2e'}else{'#ffffff'}
     $configLines=@(('command = pwsh.exe -NoLogo -NoProfile -File "'+$fixture+'"'),('background-opacity = '+$opacity.ToString([Globalization.CultureInfo]::InvariantCulture)),('background = '+$background),('foreground = '+$foreground),'background-blur = false','font-family = Consolas','font-size = 14',('window-show-tab-bar = '+$showTabBar),'shell-integration = none',('confirm-close-surface = '+$confirm.ToString().ToLowerInvariant()),'cursor-style-blink = false','auto-update = off','keybind = f9=new_tab','keybind = f4=next_tab')
     if($name.StartsWith('close-')){$configLines+='keybind = f8=new_split:right'}
+    $configLines+=$extraConfig
     $configLines|Set-Content -Encoding utf8 $run.Config
     $start=[Diagnostics.ProcessStartInfo]::new();$start.FileName=$stagedExecutable;$start.WorkingDirectory=$work;$start.UseShellExecute=$false;$start.CreateNoWindow=$true;$start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true;$start.Environment['GHOSTTY_RESOURCES_DIR']=Join-Path $stagedShare 'ghostty';$start.Environment['GHOSTTY_TAB_TEST_STATE']=$run.State
+    [void]$start.Environment.Remove('GHOSTTY_QUICK_TERMINAL')
+    if($name -eq 'graphics'){$start.Environment['GHOSTTY_GRAPHICS_TEST']='1'}
+    if($name -eq 'settings-scrollbar'){$start.Environment['GHOSTTY_SETTINGS_TEST']='1'}
     $start.ArgumentList.Add('--config-default-files=false');$start.ArgumentList.Add('--config-file='+$run.Config)
     $run.Process=[Diagnostics.Process]::Start($start);$runs.Add($run);$run.Stdout=$run.Process.StandardOutput.ReadToEndAsync();$run.Stderr=$run.Process.StandardError.ReadToEndAsync();$script:current=$run;$record.Runs+=@{Mode=$name;Pid=$run.Process.Id;ConfiguredOpacity=$opacity;ConfirmCloseSurface=$confirm;TabBar=$showTabBar}
     [TabBarTestNative]::ProcessId=$run.Process.Id
+    if($BackgroundLaunch){
+        Wait-For $run 'background message loop' {$run.MessageWindow=[TabBarTestNative]::MessageWindow();return $run.MessageWindow -ne [IntPtr]::Zero}
+        [void][TabBarTestNative]::Message($run.MessageWindow,0,0,[IntPtr]::Zero)
+        Check (@([TabBarTestNative]::Find('GhosttyWindow',[IntPtr]::Zero,$false)).Count -eq 0) 'background launch creates no normal window' @{}
+        # Send the notification directly to this process after registration.
+        # An unregistered binding has no dispatch entry and cannot open a terminal.
+        [TabBarTestNative]::Post($run.MessageWindow,0x0312,1,0)
+    }
     Wait-For $run 'initial native window' {$tops=@([TabBarTestNative]::Find('GhosttyWindow',[IntPtr]::Zero,$true));if($tops.Count -eq 1){$run.Top=$tops[0];return @(Children $run).Count -eq 1};return $false}
-    [TabBarTestNative]::Position($run.Top)
+    if(-not $KeepStartupBounds){[TabBarTestNative]::Position($run.Top)}
     $run.Panes=@{}
     Wait-For $run 'initial terminal fixture' {
         $shell=Shell-Pid $run
@@ -269,6 +438,234 @@ function Stop-RunCleanly($run){
     if(-not $run.Process.HasExited -and -not $run.Process.WaitForExit(20000)){
         foreach($dialog in @(Dialogs $run)){[TabBarTestNative]::Post($dialog,0x0111,1,0)}
         if(-not $run.Process.WaitForExit(5000)){throw "$($run.Name): controlled children did not permit clean app exit"}
+    }
+}
+function Run-Graphics {
+    $run=Start-Run 1.0 'graphics'
+    $pane=@(Children $run)[0]
+    $request=Join-Path $run.State 'image-request'
+    # Publish complete commands; the child polls from its own ConPTY.
+    function Stage([string]$name){
+        [IO.File]::WriteAllText("$request.tmp",$name)
+        [IO.File]::Move("$request.tmp",$request)
+    }
+    Stage 'place'
+    Wait-For $run 'parent and relative child images rendered' {
+        $points=[TabBarTestNative]::ImageMarkers($run.Top,$pane)
+        return $points[0].X -ge 0 -and $points[1].X -gt $points[0].X
+    }
+    $before=[TabBarTestNative]::ImageMarkers($run.Top,$pane)
+    Stage 'move'
+    Wait-For $run 'child moves with its parent placement' {
+        $p=[TabBarTestNative]::ImageMarkers($run.Top,$pane)
+        return $p[0].X -gt $before[0].X+10 -and $p[0].Y -gt $before[0].Y+10 -and
+            [Math]::Abs(($p[1].X-$before[1].X)-($p[0].X-$before[0].X)) -le 3 -and
+            [Math]::Abs(($p[1].Y-$before[1].Y)-($p[0].Y-$before[0].Y)) -le 3
+    }
+    Stage 'frame'
+    Wait-For $run 'client-selected blue frame rendered' {
+        $p=[TabBarTestNative]::ImageMarkers($run.Top,$pane)
+        return $p[0].X -lt 0 -and $p[1].X -ge 0 -and $p[2].X -ge 0
+    }
+    Stage 'animate'
+    foreach($i in @(0,2,0,2)){
+        Wait-For $run "automatic animation displays frame color $i" {
+            return [TabBarTestNative]::ImageMarkers($run.Top,$pane)[$i].X -ge 0
+        }
+    }
+    $hostVersion=(Get-Item -LiteralPath (Join-Path $work 'OpenConsole.exe')).VersionInfo.FileVersion
+    $drivers=@(Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion)
+    Check $true 'ConPTY and WGL render animated and relative placements' @{OpenConsole=$hostVersion;DisplayDrivers=$drivers}
+    Stop-RunCleanly $run
+}
+function Run-Indicators {
+    $settings=@('keybind = f5=toggle_readonly','keybind = f2>f3=ignore','keybind = f1=activate_key_table:nav',
+        'keybind = nav/f6=deactivate_key_table','keybind = f7=reload_config')
+    $run=Start-Run 1.0 'indicators' -extraConfig $settings
+    $first=Shell-Pid $run
+    $pane=$run.Panes[$first]
+    function StatusLabels {
+        foreach($control in @([TabBarTestNative]::Find('Static',[IntPtr]::Zero,$true))){
+            [TabBarTestNative]::Text($control)
+        }
+    }
+    [TabBarTestNative]::Key($pane,0x71)
+    Wait-For $run 'sequence prefix shown' {'f2' -in @(StatusLabels)}
+    [TabBarTestNative]::Key($pane,0x72)
+    Wait-For $run 'completed sequence cleared' {'f2' -notin @(StatusLabels)}
+    [TabBarTestNative]::Key($pane,0x71)
+    Wait-For $run 'second prefix shown' {'f2' -in @(StatusLabels)}
+    [TabBarTestNative]::Key($pane,0x1B)
+    Wait-For $run 'cancelled sequence cleared' {'f2' -notin @(StatusLabels)}
+    [TabBarTestNative]::Key($pane,0x70)
+    Wait-For $run 'active table shown' {'Key table nav' -in @(StatusLabels)}
+    [TabBarTestNative]::Key($pane,0x75)
+    Wait-For $run 'popped table cleared' {'Key table nav' -notin @(StatusLabels)}
+    [TabBarTestNative]::Key($pane,0x74)
+    Wait-For $run 'read-only shown' {'Read-only' -in @(StatusLabels)}
+    [TabBarTestNative]::Key($pane,0x76)
+    Wait-For $run 'read-only survives reload' {'Read-only' -in @(StatusLabels)}
+    $second=Add-Pane $run $first
+    Wait-For $run 'status follows selected writable tab' {'Read-only' -notin @(StatusLabels)}
+    Select-Pid $run $first
+    Wait-For $run 'return restores read-only status' {'Read-only' -in @(StatusLabels)}
+    Request-Exit $run $first
+    Wait-For $run 'closing selected pane clears its status' {(Shell-Pid $run) -eq $second -and 'Read-only' -notin @(StatusLabels)}
+    Stop-RunCleanly $run
+}
+function Run-PaneDrag {
+    $settings=@('drag-handle = always','keybind = f8=new_split:right','keybind = f7=new_window','keybind = f6=reload_config')
+    $run=Start-Run 1.0 'pane-drag' -extraConfig $settings
+    $a=Shell-Pid $run
+    $left=$run.Panes[$a]
+    Wait-For $run 'always shows a grip for an unsplit terminal' { [TabBarTestNative]::Grip($left) -ne [IntPtr]::Zero }
+    $b=Add-Pane $run $a -Split
+    $right=$run.Panes[$b]
+    Wait-For $run 'two split handles' { [TabBarTestNative]::Grip($right) -ne [IntPtr]::Zero }
+    $grip=[TabBarTestNative]::Grip($right)
+    [TabBarTestNative]::DragStart($grip)
+    Wait-For $run 'grip captured before cancel' { [TabBarTestNative]::Captured($right) -eq $grip }
+    [TabBarTestNative]::Key($right,0x1B)
+    [TabBarTestNative]::DragEnd($grip,$left,30,5)
+    [TabBarTestNative]::Key($right,0x43)
+    Wait-For $run 'child receives c after canceled drop' { $s=State $run $b; $s -and (@($s.Keys)-join '') -eq 'c' }
+    Check (([TabBarTestNative]::PaneBounds($left)).Right -le ([TabBarTestNative]::PaneBounds($right)).Left -and (Shell-Pid $run) -eq $b) 'Escape preserves split layout and focus' @{}
+    [TabBarTestNative]::DragStart($grip)
+    [TabBarTestNative]::DragEnd($grip,$left,30,5)
+    Wait-For $run 'pane moves above the target in the same tab' { ([TabBarTestNative]::PaneBounds($right)).Bottom -le ([TabBarTestNative]::PaneBounds($left)).Top }
+
+    $c=Add-Pane $run $b
+    $other=$run.Panes[$c]
+    [TabBarTestNative]::TabClick($run.Top,0,2)
+    Wait-For $run 'split tab reselected' { @(Children $run).Count -eq 2 -and [TabBarTestNative]::Grip($right) -ne [IntPtr]::Zero }
+    $grip=[TabBarTestNative]::Grip($right)
+    [TabBarTestNative]::DragStart($grip)
+    [TabBarTestNative]::DragToTab($grip,$run.Top,1,2)
+    Wait-For $run 'pane joins inactive destination tab' { $panes=@(Children $run); return $panes.Count -eq 2 -and $right -in $panes -and $other -in $panes }
+    [TabBarTestNative]::Key($right,0x58)
+    Wait-For $run 'original child receives x after moving between tabs' { $s=State $run $b; $s -and (@($s.Keys)-join '') -eq 'cx' }
+
+    [TabBarTestNative]::Key($right,0x76)
+    Wait-For $run 'second native window has a new child' { @([TabBarTestNative]::Find('GhosttyWindow',[IntPtr]::Zero,$true)).Count -eq 2 -and @(Child-Pids $run).Count -eq 4 }
+    $second=@([TabBarTestNative]::Find('GhosttyWindow',[IntPtr]::Zero,$true) | Where-Object { $_ -ne $run.Top })[0]
+    $fourth=[TabBarTestNative]::Find('GhosttyTerminal',$second,$true)[0]
+    [TabBarTestNative]::PositionPair($run.Top,$second)
+    # Move the only pane of the second window. The empty tab and its
+    # container close only after the moved HWND is owned by the first window.
+    Wait-For $run 'both windows positioned' { [TabBarTestNative]::Grip($fourth) -ne [IntPtr]::Zero -and ([TabBarTestNative]::PaneBounds($second)).Left -gt ([TabBarTestNative]::PaneBounds($run.Top)).Left }
+    $grip=[TabBarTestNative]::Grip($fourth)
+    [TabBarTestNative]::DragStart($grip)
+    Wait-For $run 'cross-window drag has mouse capture' { [TabBarTestNative]::Captured($fourth) -eq $grip }
+    [TabBarTestNative]::DragEnd($grip,$right,90,50)
+    Wait-For $run 'cross-window transfer closes empty source window' { @([TabBarTestNative]::Find('GhosttyWindow',[IntPtr]::Zero,$true)).Count -eq 1 -and $fourth -in @(Children $run) }
+    $d=Shell-Pid $run
+    Check ($d -ne 0 -and $d -notin @($a,$b,$c) -and @(Child-Pids $run).Count -eq 4) 'cross-window move preserves all four children' @{Moved=$d}
+    [TabBarTestNative]::Key($fourth,0x59)
+    Wait-For $run 'same child receives y in its new window' { $s=State $run $d; $s -and (@($s.Keys)-join '') -eq 'y' }
+    $grip=[TabBarTestNative]::Grip($fourth)
+    [TabBarTestNative]::DragStart($grip)
+    Wait-For $run 'exiting pane has mouse capture' { [TabBarTestNative]::Captured($fourth) -eq $grip }
+    Request-Exit $run $d
+    Wait-For $run 'source exits during a drag' { $fourth -notin @(Children $run) -and $grip -notin @([TabBarTestNative]::Find('GhosttyPaneDrag',[IntPtr]::Zero,$false)) }
+    [TabBarTestNative]::Key($right,0x5A)
+    Wait-For $run 'surviving pane receives input after interrupted drag' { $s=State $run $b; $s -and (@($s.Keys)-join '') -eq 'cxz' }
+    Add-Content -LiteralPath $run.Config 'drag-handle = never'
+    [TabBarTestNative]::Key($right,0x75)
+    Wait-For $run 'never hides every grip' { @([TabBarTestNative]::Find('GhosttyPaneDrag',[IntPtr]::Zero,$true)).Count -eq 0 }
+    Add-Content -LiteralPath $run.Config 'drag-handle = auto'
+    [TabBarTestNative]::Key($right,0x75)
+    Wait-For $run 'auto restores split grips' { [TabBarTestNative]::Grip($right) -ne [IntPtr]::Zero }
+    [TabBarTestNative]::TabClick($run.Top,0,2)
+    Wait-For $run 'auto hides the unsplit tab grip' { @(Children $run).Count -eq 1 -and @([TabBarTestNative]::Find('GhosttyPaneDrag',[IntPtr]::Zero,$true)).Count -eq 0 }
+    Stop-RunCleanly $run
+}
+function Run-Appearance {
+    foreach ($opacity in @(1.0,0.8)) {
+        $mode=if($opacity -eq 1.0){'opaque'}else{'transparent'}
+        $settings=@('keybind = f8=new_split:right','keybind = f7=goto_split:previous',
+            'keybind = f6=reload_config','unfocused-split-fill = #ff0000','unfocused-split-opacity = 0.25')
+        $run=Start-Run $opacity "appearance-$mode" -extraConfig $settings
+        $first=Shell-Pid $run
+        $split=Add-Pane $run $first -Split
+        $left=$run.Panes[$first]
+        $right=$run.Panes[$split]
+        Wait-For $run "$mode left pane has configured red fill" {
+            $a=[TabBarTestNative]::PaneRed($run.Top,$left)
+            $b=[TabBarTestNative]::PaneRed($run.Top,$right)
+            return $b -ge 0 -and $a -gt ($b+90)
+        }
+        [TabBarTestNative]::Key($right,0x76)
+        Wait-For $run "$mode red fill follows focus" {
+            $a=[TabBarTestNative]::PaneRed($run.Top,$left)
+            $b=[TabBarTestNative]::PaneRed($run.Top,$right)
+            return $a -ge 0 -and $b -gt ($a+90)
+        }
+        Add-Content -LiteralPath $run.Config 'unfocused-split-opacity = 1'
+        [TabBarTestNative]::Key($left,0x75)
+        Wait-For $run "$mode reload removes the inactive pane tint" {
+            $a=[TabBarTestNative]::PaneRed($run.Top,$left)
+            $b=[TabBarTestNative]::PaneRed($run.Top,$right)
+            return $a -ge 0 -and $b -ge 0 -and [Math]::Abs($a-$b) -lt 20
+        }
+        Stop-RunCleanly $run
+    }
+}
+function Run-Startup {
+    foreach ($edge in @('top','bottom','left','right')) {
+        $settings=@('initial-window = false','keybind = clear',
+            'keybind = global:ctrl+alt+shift+f11=toggle_quick_terminal','keybind = f8=new_split:right',
+            'quick-terminal-animation-duration = 0','quick-terminal-autohide = false',
+            'quick-terminal-screen = main',"quick-terminal-position = $edge",'quick-terminal-size = 280px,50%')
+        $run=Start-Run 1.0 "startup-quick-$edge" -extraConfig $settings -KeepStartupBounds -BackgroundLaunch
+        Check ([TabBarTestNative]::CenteredOnEdge($run.Top,$edge)) "quick terminal centers on $edge edge" @{}
+        $first=Shell-Pid $run
+        Wait-For $run 'quick-terminal child receives its environment marker' { (State $run $first).QuickTerminal -eq '1' }
+        if($edge -eq 'top'){
+            $split=Add-Pane $run $first -Split
+            Wait-For $run 'new quick-terminal split receives its environment marker' { (State $run $split).QuickTerminal -eq '1' }
+            $ids=@((State $run $first).SurfaceId,(State $run $split).SurfaceId)
+            Check ($ids[0] -match '^0x[0-9a-f]{16}$' -and $ids[1] -match '^0x[0-9a-f]{16}$' -and $ids[0] -ne $ids[1]) 'quick-terminal children receive distinct surface IDs' @{}
+        }
+        Stop-RunCleanly $run
+    }
+    foreach ($preserve in @($false,$true)) {
+        $policy=if($preserve){'navigation'}else{'no-navigation'}
+        $settings=@('window-width = 66','window-height = 18','scrollbar = never',
+            'window-padding-x = 7','window-padding-y = 5','keybind = f8=new_split:right',
+            'keybind = f7=toggle_split_zoom','keybind = f6=goto_split:previous',
+            ('split-preserve-zoom = '+$policy))
+        $run=Start-Run 1.0 "startup-$policy" -extraConfig $settings -KeepStartupBounds
+        $first=Shell-Pid $run
+        $firstHwnd=$run.Panes[$first]
+        # Read the child PTY dimensions after the final native layout.
+        [TabBarTestNative]::Key($firstHwnd,0x58)
+        Wait-For $run 'configured child grid' {
+            $snapshot=State $run $first
+            return $snapshot -and $snapshot.Columns -eq 66 -and $snapshot.Rows -eq 18
+        }
+        Check ([string]::IsNullOrEmpty((State $run $first).QuickTerminal)) 'normal terminal child has no quick-terminal marker' @{}
+        Check (@([TabBarTestNative]::Find('GhosttyScrollbar',[IntPtr]::Zero,$true)).Count -eq 0) 'scrollbar=never hides all native scrollbars' @{}
+        [TabBarTestNative]::Position($run.Top)
+        $bounds=[TabBarTestNative]::Bounds($run.Top)
+        $tab=Add-Pane $run $first
+        Check ([TabBarTestNative]::Bounds($run.Top) -eq $bounds) 'new tab preserves resized window bounds' @{}
+        $split=Add-Pane $run $tab -Split
+        Check ([TabBarTestNative]::Bounds($run.Top) -eq $bounds) 'new split preserves resized window bounds' @{}
+        [TabBarTestNative]::Key($run.Panes[$split],0x76)
+        Wait-For $run 'active split zoomed' {@(Children $run).Count -eq 1 -and $run.Panes[$split] -in @(Children $run)}
+        [TabBarTestNative]::Key($run.Panes[$split],0x75)
+        $count=if($preserve){1}else{2}
+        Wait-For $run "split navigation $policy" {@(Children $run).Count -eq $count -and $run.Panes[$tab] -in @(Children $run)}
+        Stop-RunCleanly $run
+    }
+    foreach ($setting in @('maximize','fullscreen')) {
+        $run=Start-Run 1.0 "startup-$setting" -extraConfig @("$setting = true") -KeepStartupBounds
+        if($setting -eq 'maximize'){
+            Check ([TabBarTestNative]::Maximized($run.Top)) 'normal window starts maximized' @{}
+        }else{
+            Check (-not [TabBarTestNative]::Captioned($run.Top)) 'fullscreen starts without a caption' @{}
+        }
+        Stop-RunCleanly $run
     }
 }
 function Run-MiddleActive{
@@ -503,8 +900,23 @@ function Invoke-CloseScenarios{
     Run-RepresentativeExit
 }
 try{
-    $modes=if($Case -eq 'all'){@(@{Name='opaque';Opacity=1.0},@{Name='transparent';Opacity=0.8},@{Name='light';Opacity=1.0},@{Name='close';Opacity=1.0})}elseif($Case -eq 'close'){@(@{Name='close';Opacity=1.0})}elseif($Case -eq 'transparent'){@(@{Name='transparent';Opacity=0.8})}else{@(@{Name=$Case;Opacity=1.0})}
+    $modes=if($Case -eq 'all'){@(@{Name='opaque';Opacity=1.0},@{Name='transparent';Opacity=0.8},@{Name='light';Opacity=1.0},@{Name='close';Opacity=1.0},@{Name='startup';Opacity=1.0},@{Name='appearance';Opacity=1.0},@{Name='indicators';Opacity=1.0},@{Name='graphics';Opacity=1.0},@{Name='pane-drag';Opacity=1.0},@{Name='native-settings';Opacity=1.0},@{Name='pane-menu';Opacity=1.0})}elseif($Case -eq 'close'){@(@{Name='close';Opacity=1.0})}elseif($Case -eq 'transparent'){@(@{Name='transparent';Opacity=0.8})}else{@(@{Name=$Case;Opacity=1.0})}
     foreach($mode in $modes){
+        if($mode.Name -eq 'pane-menu'){
+            . (Join-Path $PSScriptRoot 'test_pane_menu.ps1')
+            Run-PaneMenu
+            continue
+        }
+        if($mode.Name -eq 'native-settings'){
+            . (Join-Path $PSScriptRoot 'test_native_settings.ps1')
+            Run-NativeSettings
+            continue
+        }
+        if($mode.Name -eq 'pane-drag'){Run-PaneDrag;continue}
+        if($mode.Name -eq 'graphics'){Run-Graphics;continue}
+        if($mode.Name -eq 'indicators'){Run-Indicators;continue}
+        if($mode.Name -eq 'appearance'){Run-Appearance;continue}
+        if($mode.Name -eq 'startup'){Run-Startup;continue}
         if($mode.Name -eq 'close-splits'){
             Run-DividerDragMiddle
             Run-RepresentativeExit

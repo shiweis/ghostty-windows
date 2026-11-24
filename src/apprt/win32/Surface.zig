@@ -16,6 +16,7 @@ const global = @import("../../global.zig");
 const App = @import("App.zig");
 const Window = @import("Window.zig");
 const w32 = @import("win32.zig");
+const Clipboard = @import("Clipboard.zig");
 const Scrollbar = @import("Scrollbar.zig").Scrollbar;
 
 const log = std.log.scoped(.win32);
@@ -59,6 +60,7 @@ transparency_supported: bool = false,
 /// Last title reported by the core for getTitle/copy-title consumers.
 title_len: usize = 0,
 title: [4096]u8 = std.mem.zeroes([4096]u8),
+title_override: ?[:0]const u8 = null,
 
 /// The core terminal surface. Initialized by init() after creating
 /// the window and WGL context. Manages fonts, renderer, PTY, and IO.
@@ -120,6 +122,7 @@ presented_size: std.atomic.Value(u64) = .init(0),
 /// Themed scrollbar (custom layered-popup overlay).
 /// Created lazily after the surface HWND exists.
 scrollbar: ?*Scrollbar = null,
+drag_handle: @import("PaneDrag.zig") = .{},
 
 /// The current mouse cursor. Cached so WM_SETCURSOR can restore it
 /// (DefWindowProc resets the cursor to the class cursor on every
@@ -171,6 +174,17 @@ search_selected: ?usize = null,
 /// delivery fails so the next call retries.
 last_reported_visible: ?bool = null,
 
+// The UI thread chooses the tint. The WGL thread samples it when presenting.
+inactive_split: bool = false,
+pane_status: @import("PaneStatus.zig") = .{},
+bell: @import("Bell.zig") = .{},
+has_desktop_notifications: bool = false,
+inactive_split_tint: [4]u8 = .{ 0, 0, 0, 0 },
+split_overlay: std.atomic.Value(u32) = .init(0),
+
+/// An inspector is owned by this pane and closed before its core shuts down.
+inspector: ?*@import("Inspector.zig") = null,
+
 /// Command palette popup HWND.
 palette_hwnd: ?w32.HWND = null,
 /// Edit control inside the command palette popup.
@@ -184,12 +198,10 @@ palette_font: ?*anyopaque = null,
 palette_paint_font: ?*anyopaque = null,
 /// Whether the command palette is currently visible.
 palette_active: bool = false,
-/// Currently selected item in the filtered palette list.
-palette_selected: u16 = 0,
-/// Number of items currently in the filtered list.
-palette_count: u16 = 0,
-/// Indices into palette_entries for the current filter.
-palette_filtered: [palette_entries.len + MAX_USER_PALETTE_ENTRIES]u16 = undefined,
+/// Owned command and surface snapshots while the palette is open.
+palette: ?Palette = null,
+/// Last working directory reported by the shell.
+working_directory: []const u8 = "",
 
 /// Reference count for SplitTree ownership. Starts at 0 because
 /// SplitTree.init() calls ref() to take initial ownership.
@@ -305,7 +317,7 @@ pub fn initWithOptions(
     }
 
     // Set up the pixel format for OpenGL
-    try self.setupPixelFormat();
+    try setupPixelFormat(self.hdc.?);
 
     // Create the WGL context
     self.hglrc = w32.wglCreateContext(self.hdc.?);
@@ -345,6 +357,7 @@ pub fn initWithOptions(
 
     // Seed initial theme colors from the app config.
     if (self.scrollbar) |sb| {
+        self.handleResize(self.width, self.height);
         sb.setTheme(
             app.config.background.toTerminalRGB(),
             app.config.foreground.toTerminalRGB(),
@@ -358,6 +371,7 @@ pub fn initWithOptions(
     // Create a config copy for this surface.
     var config = try apprt.surface.newConfig(app.core_app, &app.config, options.context);
     defer config.deinit();
+    self.configureSplitTint(&config);
 
     if (options.command) |command| {
         config.command = try command.clone(config.arenaAlloc());
@@ -381,6 +395,7 @@ pub fn initWithOptions(
     // (triggered by ShowWindow, wglCreateContext, etc.) must be ignored.
     self.core_surface_ready = true;
     self.core_surface_initialized = true;
+    app.requestPaletteRefresh();
 }
 /// The presenter runs on the renderer thread. Once it returns, the thread
 /// can safely release the context and start the native-window transition.
@@ -571,6 +586,10 @@ pub fn backgroundOpacityOverride(self: *const Surface) ?f64 {
 }
 
 pub fn deinit(self: *Surface) void {
+    self.withdrawDesktopNotifications();
+    self.bell.closeAudio();
+    self.drag_handle.deinit();
+    if (self.inspector) |inspector| inspector.close();
     self.cancelOpaquePresentationFallback();
     log.debug("surface deinit: start addr={x}", .{@intFromPtr(self)});
 
@@ -580,6 +599,7 @@ pub fn deinit(self: *Surface) void {
         log.debug("surface deinit: core_surface.deinit done", .{});
 
         self.app.core_app.deleteSurface(self);
+        self.app.requestPaletteRefresh();
         log.debug("surface deinit: deleteSurface done", .{});
 
         if (self.core_surface.deinit_leaked) {
@@ -625,6 +645,12 @@ pub fn deinit(self: *Surface) void {
 /// both the normal deinit path and the leak path (wedged surface thread),
 /// where everything the renderer/IO threads can reach must stay alive.
 fn deinitGui(self: *Surface) void {
+    self.pane_status.deinit(self.app.core_app.alloc);
+    self.clearPalette();
+    if (self.title_override) |v| self.app.core_app.alloc.free(v);
+    self.title_override = null;
+    if (self.working_directory.len != 0) self.app.core_app.alloc.free(self.working_directory);
+    self.working_directory = "";
     // Destroy the themed scrollbar before the surface HWND is gone.
     if (self.scrollbar) |sb| {
         sb.destroy();
@@ -684,7 +710,10 @@ pub fn reparentNativeWindows(self: *Surface, parent: w32.HWND) !void {
     const previous_parent = w32.SetParent(hwnd, parent) orelse return error.Win32Error;
     errdefer _ = w32.SetParent(hwnd, previous_parent);
 
-    const popups = [_]?w32.HWND{ self.search_hwnd, self.palette_hwnd, self.link_preview_hwnd };
+    const popups = [_]?w32.HWND{
+        self.search_hwnd,                           self.palette_hwnd,                                        self.link_preview_hwnd, self.drag_handle.hwnd,
+        if (self.scrollbar) |sb| sb.hwnd else null, if (self.inspector) |inspector| inspector.hwnd else null,
+    };
     var previous_owners: [popups.len]isize = @splat(0);
     errdefer for (popups, previous_owners) |popup, owner| {
         if (owner != 0) _ = w32.SetWindowLongPtrW(popup.?, w32.GWLP_HWNDPARENT, owner);
@@ -709,6 +738,7 @@ pub fn popupDestroyed(self: *Surface, hwnd: w32.HWND) void {
         if (self.search_font) |font| _ = w32.DeleteObject(font);
         self.search_font = null;
     } else if (self.palette_hwnd == hwnd) {
+        self.clearPalette();
         self.palette_hwnd = null;
         self.palette_edit = null;
         self.palette_active = false;
@@ -736,7 +766,7 @@ pub fn recreateGLContext(self: *Surface) !void {
 }
 
 /// Set up a pixel format suitable for OpenGL rendering.
-fn setupPixelFormat(self: *Surface) !void {
+pub fn setupPixelFormat(hdc: w32.HDC) !void {
     const pfd = w32.PIXELFORMATDESCRIPTOR{
         .nSize = @sizeOf(w32.PIXELFORMATDESCRIPTOR),
         .nVersion = 1,
@@ -766,10 +796,10 @@ fn setupPixelFormat(self: *Surface) !void {
         .dwDamageMask = 0,
     };
 
-    const format = w32.ChoosePixelFormat(self.hdc.?, &pfd);
+    const format = w32.ChoosePixelFormat(hdc, &pfd);
     if (format == 0) return error.Win32Error;
 
-    if (w32.SetPixelFormat(self.hdc.?, format, &pfd) == 0)
+    if (w32.SetPixelFormat(hdc, format, &pfd) == 0)
         return error.Win32Error;
 }
 
@@ -797,6 +827,137 @@ fn updateClientSize(self: *Surface) void {
 // -----------------------------------------------------------------------
 // Methods called by the core Surface.zig (rt_surface.*)
 // -----------------------------------------------------------------------
+
+pub fn ringBell(self: *Surface) void {
+    if (!self.core_surface_ready) return;
+    self.bell.ringing = true;
+    self.updateBellIndicators();
+    const settings = self.core_surface.config.bell;
+    if (settings.features.attention) self.parent_window.requestBellAttention();
+    self.bell.ring(settings);
+}
+
+fn clearBell(self: *Surface) void {
+    if (!self.bell.ringing) return;
+    self.bell.ringing = false;
+    self.updateBellIndicators();
+}
+
+pub fn updateBellIndicators(self: *Surface) void {
+    const features = self.core_surface.config.bell.features;
+    const title = self.bell.ringing and features.title;
+    if (self.bell.title_visible != title) {
+        self.bell.title_visible = title;
+        self.app.requestPaletteRefresh();
+        self.parent_window.surfaceBellChanged(self);
+    }
+    const width: u32 = if (self.bell.ringing and features.border) @intFromFloat(@max(1, @round(3 * self.scale))) else 0;
+    if (self.bell.border_width.swap(width, .monotonic) != width and self.core_surface_ready)
+        self.core_surface.renderer_thread.draw_now.notify() catch {};
+}
+
+test "native bell dispatch honors pane settings and clears visual alerts on key input and focus" {
+    const t = std.testing;
+    const alloc = t.allocator;
+    const CoreApp = @import("../../App.zig");
+    var core_app: CoreApp = undefined;
+    try core_app.init(alloc);
+    defer core_app.deinit();
+    var app: App = .{ .core_app = &core_app, .config = try configpkg.Config.default(alloc), .hinstance = undefined };
+    defer app.config.deinit();
+    const wide = std.unicode.utf8ToUtf16LeStringLiteral;
+    // A hidden test-owned HWND observes real WM_SETTEXT calls without flashing
+    // a taskbar button, playing the system sound or sending desktop input.
+    const hwnd = w32.CreateWindowExW(0, wide("STATIC"), wide(""), 0, 0, 0, 200, 100, null, null, null, null) orelse return error.Win32Error;
+    defer _ = w32.DestroyWindow(hwnd);
+    var win: Window = .{ .app = &app, .hwnd = hwnd, .tab_count = 1 };
+    const panes = try alloc.alloc(Surface, 2);
+    defer alloc.free(panes);
+    const Tree = @import("../../datastruct/split_tree.zig").SplitTree(Surface);
+    var nodes = [_]Tree.Node{
+        .{ .split = .{ .layout = .horizontal, .ratio = 0.5, .left = @fromBackingInt(1), .right = @fromBackingInt(2) } },
+        .{ .leaf = &panes[0] },
+        .{ .leaf = &panes[1] },
+    };
+    win.tab_trees[0] = .{ .arena = undefined, .nodes = &nodes, .zoomed = null };
+    win.tab_active_surface[0] = &panes[0];
+    for (panes) |*pane| {
+        pane.* = .{ .app = &app, .parent_window = &win, .core_surface_ready = true, .scale = 1.5 };
+        pane.core_surface.rt_surface = pane;
+        pane.core_surface.app = &core_app;
+        pane.core_surface.focused = true;
+        pane.core_surface.renderer_focus_delivered = true;
+        pane.core_surface.config.bell = try @import("Bell.zig").Settings.init(alloc, &app.config);
+        pane.core_surface.config.bell.features = .{ .attention = false, .title = false };
+        pane.core_surface.renderer_thread.draw_now = try global.xev.Async.init();
+    }
+    defer for (panes) |*pane| pane.core_surface.renderer_thread.draw_now.deinit();
+    const first = &panes[0];
+    const second = &panes[1];
+    const target: apprt.Target = .{ .surface = &second.core_surface };
+    win.setTabTitle(0, "Sessions");
+    _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(&win)));
+    // A muted pane leaves every outward channel quiet. Enable attention on
+    // its hidden owner only, and simulate the app receiving focus again.
+    try t.expect(try app.performAction(.{ .surface = &first.core_surface }, .ring_bell, {}));
+    try t.expect(!first.bell.title_visible and first.bell.device == null and !win.bell_attention);
+    try t.expectEqual(@as(u32, 0), first.bell.border_width.load(.monotonic));
+    first.core_surface.config.bell.features.attention = true;
+    try t.expect(try app.performAction(.{ .surface = &first.core_surface }, .ring_bell, {}));
+    try t.expect(win.bell_attention);
+    _ = Window.windowWndProc(hwnd, w32.WM_ACTIVATEAPP, 1, 0);
+    try t.expect(!win.bell_attention);
+    first.handleFocus(true);
+    // The app defaults do not override the inactive pane's enabled features.
+    second.core_surface.config.bell.features.border = true;
+    second.core_surface.config.bell.features.title = true;
+    try t.expect(try app.performAction(target, .ring_bell, {}));
+    try t.expectEqual(@as(u32, 5), second.bell.border_width.load(.monotonic));
+    try t.expect(!first.bell.ringing);
+    var caption: [260]u16 = undefined;
+    var len: usize = @intCast(w32.GetWindowTextW(hwnd, &caption, caption.len));
+    try t.expectEqualSlices(u16, wide("🔔 Sessions"), caption[0..len]);
+    try t.expectEqualSlices(u16, wide("Sessions"), win.tab_labels[0].caption.slice());
+    second.handleKeyEvent(w32.VK_PROCESSKEY, 0, .release);
+    try t.expect(second.bell.ringing);
+    second.handleKeyEvent(w32.VK_PROCESSKEY, 0, .press);
+    try t.expect(!second.bell.ringing);
+    try t.expectEqual(@as(u32, 0), second.bell.border_width.load(.monotonic));
+    len = @intCast(w32.GetWindowTextW(hwnd, &caption, caption.len));
+    try t.expectEqualSlices(u16, wide("Sessions"), caption[0..len]);
+
+    // Command completion must dispatch exactly the same configured bell.
+    second.core_surface.config.bell.finish_mode = .always;
+    second.core_surface.config.bell.finish_after = .{ .duration = 1 };
+    second.core_surface.config.bell.finish_action = .{ .bell = true, .notify = false };
+    try t.expect(try app.performAction(target, .command_finished, .{ .duration = .{ .duration = 1 }, .exit_code = 0 }));
+    try t.expect(!second.bell.ringing);
+    try t.expect(try app.performAction(target, .command_finished, .{ .duration = .{ .duration = 2 }, .exit_code = 0 }));
+    try t.expect(second.bell.title_visible);
+    second.handleFocus(true);
+    try t.expect(!second.bell.ringing);
+
+    // Removing an enabled feature on reload clears its existing indicator.
+    try t.expect(try app.performAction(target, .ring_bell, {}));
+    second.core_surface.config.bell.features = .{ .title = false, .attention = false };
+    try t.expect(try app.performAction(target, .config_change, .{ .config = &app.config }));
+    try t.expect(!second.bell.title_visible);
+    try t.expectEqual(@as(u32, 0), second.bell.border_width.load(.monotonic));
+}
+
+pub fn configureSplitTint(self: *Surface, config: *const configpkg.Config) void {
+    const fill = config.@"unfocused-split-fill" orelse config.background;
+    const alpha: u8 = @intFromFloat(@round(255 * (1 - config.@"unfocused-split-opacity")));
+    self.inactive_split_tint = .{ fill.r, fill.g, fill.b, alpha };
+    self.setSplitInactive(self.inactive_split);
+}
+
+pub fn setSplitInactive(self: *Surface, inactive: bool) void {
+    self.inactive_split = inactive;
+    const color: u32 = if (inactive and self.inactive_split_tint[3] != 0) @bitCast(self.inactive_split_tint) else 0;
+    if (self.split_overlay.swap(color, .monotonic) != color and self.core_surface_ready)
+        self.core_surface.renderer_thread.draw_now.notify() catch {};
+}
 
 pub fn getContentScale(self: *const Surface) !apprt.ContentScale {
     return .{ .x = self.scale, .y = self.scale };
@@ -842,6 +1003,7 @@ pub fn setVisible(self: *Surface, visible: bool) void {
     // Hide the hovered-URL bubble when this surface is occluded so a stale
     // preview doesn't float over the newly-active tab.
     if (!visible) {
+        self.drag_handle.hide();
         if (self.link_preview_hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
     }
     if (!self.core_surface_ready) return;
@@ -940,87 +1102,8 @@ pub fn supportsClipboard(
 ) bool {
     _ = self;
     return switch (clipboard_type) {
-        .standard => true,
-        .selection, .primary => false,
+        .standard, .selection, .primary => true,
     };
-}
-
-/// Normalize the newline convention required by CF_UNICODETEXT before the
-/// shared paste encoder sees it. Windows clipboard producers conventionally
-/// use CRLF, while the non-bracketed encoder turns LF into CR. Passing CRLF
-/// through unchanged would therefore produce CRCR and submit an extra blank
-/// line for every pasted line. Preserve lone CR and LF bytes as supplied.
-fn normalizeWindowsClipboardNewlines(data: []u8) []u8 {
-    var read_idx: usize = 0;
-    var write_idx: usize = 0;
-
-    while (read_idx < data.len) {
-        if (data[read_idx] == '\r' and
-            read_idx + 1 < data.len and
-            data[read_idx + 1] == '\n')
-        {
-            data[write_idx] = '\n';
-            read_idx += 2;
-        } else {
-            data[write_idx] = data[read_idx];
-            read_idx += 1;
-        }
-        write_idx += 1;
-    }
-
-    return data[0..write_idx];
-}
-
-test "normalize Windows clipboard newlines" {
-    var data = "one\r\ntwo\r\n\r\nthree\rfour\n".*;
-    const normalized = normalizeWindowsClipboardNewlines(data[0..]);
-    try std.testing.expectEqualStrings("one\ntwo\n\nthree\rfour\n", normalized);
-}
-
-/// CF_UNICODETEXT is supplied by another process. A malformed producer may
-/// omit the terminator; only inspect complete UTF-16 units within GlobalSize.
-fn boundedWindowsClipboardText(data: []align(@alignOf(u16)) const u8) ?[]const u16 {
-    if (data.len < @sizeOf(u16) or data.len % @sizeOf(u16) != 0) return null;
-    const text = std.mem.bytesAsSlice(u16, data);
-    const end = std.mem.indexOfScalar(u16, text, 0) orelse return null;
-    return text[0..end];
-}
-
-test "Windows clipboard read bounds malformed and Unicode text" {
-    const testing = std.testing;
-    const unterminated = [_]u16{ 'a', 'b' };
-    const bytes = std.mem.sliceAsBytes(&unterminated);
-    try testing.expect(boundedWindowsClipboardText(bytes) == null);
-    try testing.expect(boundedWindowsClipboardText(bytes[0..3]) == null);
-    try testing.expect(boundedWindowsClipboardText(bytes[0..1]) == null);
-    try testing.expect(boundedWindowsClipboardText(bytes[0..0]) == null);
-    const empty = [_]u16{0};
-    try testing.expectEqual(@as(usize, 0), boundedWindowsClipboardText(std.mem.sliceAsBytes(&empty)).?.len);
-
-    const unicode = std.unicode.utf8ToUtf16LeStringLiteral("one\r\n\u{4e2d}\u{1f600}");
-    const text = boundedWindowsClipboardText(std.mem.sliceAsBytes(unicode[0 .. unicode.len + 1])).?;
-    const utf8 = try std.unicode.utf16LeToUtf8Alloc(testing.allocator, text);
-    defer testing.allocator.free(utf8);
-    try testing.expectEqualStrings("one\n\u{4e2d}\u{1f600}", normalizeWindowsClipboardNewlines(utf8));
-}
-
-/// Show a modal clipboard confirmation dialog on the owning window and
-/// return true if the user approved. Mirrors the macOS/GTK clipboard
-/// confirmation flow so the core's paste-protection and OSC 52
-/// authorization guards actually gate the operation on Windows.
-fn confirmClipboard(
-    self: *Surface,
-    comptime message: [:0]const u8,
-    comptime title: [:0]const u8,
-) bool {
-    const result = w32.MessageBoxW(
-        self.parent_window.hwnd,
-        std.unicode.utf8ToUtf16LeStringLiteral(message),
-        std.unicode.utf8ToUtf16LeStringLiteral(title),
-        // Default to Cancel so an accidental Enter does not approve.
-        w32.MB_OKCANCEL | w32.MB_ICONWARNING | w32.MB_DEFBUTTON2,
-    );
-    return result == w32.IDOK;
 }
 
 pub fn clipboardRequest(
@@ -1028,124 +1111,35 @@ pub fn clipboardRequest(
     clipboard_type: apprt.Clipboard,
     state: apprt.ClipboardRequest,
 ) !apprt.ClipboardReadResult {
-    // Only the standard clipboard is supported on Win32.
-    if (clipboard_type != .standard) return .unsupported;
-
-    // Kitty writes carry their committed representations in the request, so
-    // they only need to pass through the core's authorization flow.
     if (state == .kitty_write) {
-        // CF_UNICODETEXT cannot preserve other MIME types or embedded NULs.
-        // Reject the entire transaction before changing the clipboard rather
-        // than acknowledge DONE after silently discarding representations.
-        if (!supportsKittyClipboardWrite(state.kitty_write.contents)) return .unsupported;
-        return self.completeClipboardRequestWithConfirmation(
-            state,
-            &.{},
-            &.{},
-        );
+        if (!clipboardSupportsContents(clipboard_type, state.kitty_write.contents)) return .unsupported;
+        return self.completeClipboardRequestWithConfirmation(state, &.{}, &.{});
     }
 
-    // Paste events request a target listing without reading clipboard data.
-    // Win32 exposes files and Unicode text as a text/plain representation.
-    if (state == .list) {
-        if (w32.OpenClipboard(self.hwnd) == 0) {
-            log.warn("OpenClipboard failed", .{});
-            return .unavailable;
-        }
-        defer _ = w32.CloseClipboard();
-
-        if (w32.GetClipboardData(w32.CF_HDROP) == null and
-            w32.GetClipboardData(w32.CF_UNICODETEXT) == null)
-        {
-            return .unavailable;
-        }
-
-        return self.completeClipboardRequestWithConfirmation(
-            state,
-            &.{},
-            &.{"text/plain"},
-        );
-    }
-
-    const alloc = self.app.core_app.alloc;
-
-    // Read the clipboard into an owned UTF-8 string in a tight scope so the
-    // system clipboard is CLOSED before any modal confirmation dialog — the
-    // dialog can be up for an unbounded time and would otherwise block every
-    // other process's clipboard access.
-    const utf8z: [:0]const u8 = blk: {
-        if (w32.OpenClipboard(self.hwnd) == 0) {
-            log.warn("OpenClipboard failed", .{});
-            return .unavailable;
-        }
-        defer _ = w32.CloseClipboard();
-
-        // Files copied in Explorer land on the clipboard as CF_HDROP with no
-        // text format at all, so a plain CF_UNICODETEXT read pastes nothing.
-        // Paste them as space-separated, quoted paths — the same rendering
-        // WM_DROPFILES already produces, and the parity match for macOS,
-        // which pastes shell-escaped paths for file pasteboards.
-        //
-        // CF_HDROP wins when a source offers both formats: its text is
-        // normally the same paths unquoted, and the quoted form is the one
-        // that actually works when the paste lands on a shell command line.
-        if (w32.GetClipboardData(w32.CF_HDROP)) |hdrop_handle| hdrop: {
-            // Pass the handle straight to DragQueryFileW, which locks it
-            // internally — exactly as handleDropFiles does with the HDROP
-            // from WM_DROPFILES. Do NOT GlobalLock and pass the resulting
-            // pointer: clipboard data is moveable, so the handle and the
-            // locked address are different values. And never DragFinish it;
-            // the clipboard owns this handle, not us.
-            const paths = (try hdropPathsToUtf8(alloc, @ptrCast(hdrop_handle))) orelse
-                break :hdrop;
-            defer alloc.free(paths);
-            break :blk try alloc.dupeSentinel(u8, paths, 0);
-        }
-
-        const hglobal = w32.GetClipboardData(w32.CF_UNICODETEXT) orelse
-            return .unavailable;
-        const byte_size = w32.GlobalSize(hglobal);
-        if (byte_size == 0) return .unavailable;
-        const ptr16 = w32.GlobalLock(hglobal) orelse {
-            log.warn("GlobalLock failed", .{});
-            return .unavailable;
-        };
-        defer _ = w32.GlobalUnlock(hglobal);
-
-        const text = boundedWindowsClipboardText(@alignCast(ptr16[0..byte_size])) orelse
-            return .unavailable;
-
-        const utf8 = std.unicode.utf16LeToUtf8Alloc(alloc, text) catch |err| {
-            log.warn("utf16LeToUtf8Alloc failed: {}", .{err});
-            return .unavailable;
-        };
-        defer alloc.free(utf8);
-        break :blk try alloc.dupeSentinel(
-            u8,
-            normalizeWindowsClipboardNewlines(utf8),
-            0,
-        );
+    const app = self.app.core_app;
+    const id = self.core_surface.id;
+    var arena: std.heap.ArenaAllocator = .init(app.alloc);
+    defer arena.deinit();
+    const result = (switch (clipboard_type) {
+        .standard => Clipboard.read(arena.allocator(), self.hwnd, state, hdropPathsToUtf8),
+        .selection, .primary => self.app.selection_clipboard.read(arena.allocator(), state),
+    }) catch |err| switch (err) {
+        error.ClipboardUnavailable => return .unavailable,
+        else => return err,
     };
-    defer alloc.free(utf8z);
-
-    return self.completeClipboardRequestWithConfirmation(
+    const cs = app.findSurfaceByID(id) orelse {
+        if (state == .kitty_read) state.kitty_read.destroy();
+        return .started;
+    };
+    if (state != .list and result.contents.items.len == 0 and
+        !(state == .kitty_read and state.kitty_read.list)) return .unavailable;
+    return cs.rt_surface.completeClipboardRequestWithConfirmation(
         state,
-        &.{.{ .mime = "text/plain", .data = utf8z }},
-        &.{"text/plain"},
+        result.contents.items,
+        result.available.items,
     );
 }
 
-fn supportsKittyClipboardWrite(contents: []const apprt.ClipboardContent) bool {
-    for (contents) |content| {
-        if (!std.mem.eql(u8, content.mime, "text/plain")) return false;
-        if (std.mem.indexOfScalar(u8, content.data, 0) != null) return false;
-    }
-    return true;
-}
-
-/// Complete a structured clipboard request and run the native authorization
-/// prompt when the core requires it. The modal dialog can destroy the surface,
-/// so all post-dialog access re-resolves the core surface by id.
 fn completeClipboardRequestWithConfirmation(
     self: *Surface,
     state: apprt.ClipboardRequest,
@@ -1154,45 +1148,23 @@ fn completeClipboardRequestWithConfirmation(
 ) apprt.ClipboardReadResult {
     const core_app = self.app.core_app;
     const surface_id = self.core_surface.id;
-
-    // Complete with confirmed=false so the core runs its safety checks. If it
-    // flags the paste as unsafe (paste-protection) or the OSC 52 read as
-    // unauthorized (clipboard-read = ask), prompt and only re-complete with
-    // confirmed=true on approval. Passing confirmed=true up front — as this
-    // used to — silently disabled both guards on Windows.
     self.core_surface.completeClipboardRequest(state, .{
         .contents = contents,
         .available = available,
     }) catch |err| {
-        // confirmClipboard takes comptime strings (utf8ToUtf16LeStringLiteral),
-        // so each error path calls it with its own literals. `self` may be
-        // freed while the modal dialog pumps messages, so re-resolve the
-        // surface by id before re-completing.
-        const approved = switch (err) {
-            error.UnsafePaste => self.confirmClipboard(
-                "The text being pasted contains characters that could run " ++
-                    "commands unexpectedly (for example, newlines).\n\nPaste anyway?",
-                "Ghostty \u{2014} Potentially Unsafe Paste",
-            ),
-            error.UnauthorizedPaste => switch (state) {
-                .kitty_write, .osc_52_write => self.confirmClipboard(
-                    "An application is requesting to write to the system clipboard.\n\nAllow this?",
-                    "Ghostty \u{2014} Authorize Clipboard Access",
-                ),
-                else => self.confirmClipboard(
-                    "An application is requesting access to read the clipboard.\n\nAllow this?",
-                    "Ghostty \u{2014} Authorize Clipboard Access",
-                ),
-            },
+        switch (err) {
+            error.UnsafePaste, error.UnauthorizedPaste => {},
             else => {
                 log.err("completeClipboardRequest error: {}", .{err});
                 return .started;
             },
+        }
+        const result = switch (state) {
+            .kitty_write => |req| Clipboard.confirm(core_app.alloc, self.parent_window.hwnd, state, req.contents),
+            else => Clipboard.confirm(core_app.alloc, self.parent_window.hwnd, state, contents),
         };
-
+        // The modal dialog pumps messages, including child exits.
         const cs = core_app.findSurfaceByID(surface_id) orelse {
-            // Kitty requests own arenas that the apprt must release even if
-            // their surface disappeared while the modal dialog was open.
             switch (state) {
                 .kitty_read => |kitty| kitty.destroy(),
                 .kitty_write => |kitty| kitty.destroy(),
@@ -1200,20 +1172,19 @@ fn completeClipboardRequestWithConfirmation(
             }
             return .started;
         };
-
-        if (approved) {
+        if (result.button == .allow) {
+            if (state == .osc_52_read and result.remember) cs.config.clipboard_read = .allow;
             cs.completeClipboardRequest(state, .{
                 .contents = contents,
                 .available = available,
                 .confirmed = true,
-            }) catch |e| {
-                log.err("completeClipboardRequest (confirmed) error: {}", .{e});
-            };
+                .remember = result.remember,
+            }) catch |e| log.err("completeClipboardRequest (confirmed) error: {}", .{e});
         } else {
             cs.denyClipboardRequest(state);
+            if (state == .osc_52_read and result.remember) cs.config.clipboard_read = .deny;
         }
     };
-
     return .started;
 }
 
@@ -1223,160 +1194,107 @@ pub fn setClipboard(
     contents: []const apprt.ClipboardContent,
     confirm: bool,
 ) !void {
-    // Only the standard clipboard is supported on Win32.
-    if (clipboard_type != .standard) return error.UnsupportedClipboard;
+    return self.setClipboardWithNative(clipboard_type, contents, confirm, Clipboard);
+}
 
-    // The confirm dialog below pumps messages and can free `self` (child
-    // exit → surface close). Capture the App (stable for the process) and
-    // avoid dereferencing `self` after the prompt.
+fn clipboardSupportsContents(location: apprt.Clipboard, contents: []const apprt.ClipboardContent) bool {
+    return switch (location) {
+        .standard => Clipboard.supported(contents),
+        .selection, .primary => Clipboard.Selection.supported(contents),
+    };
+}
+
+fn setClipboardWithNative(
+    self: *Surface,
+    clipboard_type: apprt.Clipboard,
+    contents: []const apprt.ClipboardContent,
+    confirm: bool,
+    comptime native: type,
+) !void {
+    if (!clipboardSupportsContents(clipboard_type, contents)) return error.UnsupportedClipboardFormat;
     const app = self.app;
-
-    // When the core requests confirmation (e.g. an OSC 52 clipboard write
-    // with clipboard-write = ask), prompt before writing. Previously the
-    // flag was discarded, so remote apps could write the clipboard silently.
+    const core_app = app.core_app;
     if (confirm) {
-        if (!self.confirmClipboard(
-            "An application is requesting to write to the system clipboard.\n\nAllow this?",
-            "Ghostty \u{2014} Authorize Clipboard Access",
-        )) return;
+        const id = self.core_surface.id;
+        const result = native.confirm(core_app.alloc, self.parent_window.hwnd, .{
+            .osc_52_write = clipboard_type,
+        }, contents);
+        const cs = core_app.findSurfaceByID(id) orelse return;
+        if (result.remember and result.button != .cancel) {
+            cs.config.clipboard_write = if (result.button == .allow) .allow else .deny;
+        }
+        if (result.button != .allow) return;
     }
-
-    // Find the text/plain content.
-    const text = blk: {
-        for (contents) |c| {
-            if (std.mem.eql(u8, c.mime, "text/plain")) break :blk c.data;
-        }
-        return error.UnsupportedClipboardFormat;
-    };
-    if (std.mem.indexOfScalar(u8, text, 0) != null) return error.InvalidClipboardText;
-
-    const alloc = app.core_app.alloc;
-    // A null owner followed by EmptyClipboard makes SetClipboardData fail.
-    // The App's message window survives surface destruction during a modal
-    // confirmation and gives the write a valid, stable clipboard owner.
-    const owner = app.msg_hwnd orelse return error.ClipboardUnavailable;
-
-    // Convert UTF-8 to UTF-16LE.  Add 1 for the null terminator.
-    const utf16 = try std.unicode.utf8ToUtf16LeAlloc(alloc, text);
-    defer alloc.free(utf16);
-
-    // Size in bytes including the null terminator (u16 → 2 bytes each).
-    const byte_size = (utf16.len + 1) * @sizeOf(u16);
-
-    // Allocate a moveable global memory block.
-    const hglobal = w32.GlobalAlloc(w32.GMEM_MOVEABLE, byte_size) orelse {
-        log.warn("GlobalAlloc failed for clipboard write", .{});
-        return error.OutOfMemory;
-    };
-
-    const dst_bytes = w32.GlobalLock(hglobal) orelse {
-        log.warn("GlobalLock failed for clipboard write", .{});
-        _ = w32.GlobalFree(hglobal);
-        return error.ClipboardWriteFailed;
-    };
-
-    // Copy the UTF-16LE data (including null terminator) into the block.
-    const dst16: [*]u16 = @ptrCast(@alignCast(dst_bytes));
-    @memcpy(dst16[0..utf16.len], utf16);
-    dst16[utf16.len] = 0; // null terminator
-
-    _ = w32.GlobalUnlock(hglobal);
-
-    try publishTextClipboard(w32, owner, hglobal);
-}
-
-/// Transfer an allocated text handle to the system. On failure the caller's
-/// allocation is freed and the error reaches the protocol completion, which
-/// must send EIO instead of reporting a successful Kitty clipboard commit.
-fn publishTextClipboard(comptime native: type, owner: w32.HWND, hglobal: *anyopaque) !void {
-    errdefer _ = native.GlobalFree(hglobal);
-    if (native.OpenClipboard(owner) == 0) return error.ClipboardUnavailable;
-    defer _ = native.CloseClipboard();
-    if (native.EmptyClipboard() == 0) return error.ClipboardWriteFailed;
-    // SetClipboardData owns hglobal only on success.
-    if (native.SetClipboardData(w32.CF_UNICODETEXT, hglobal) == null)
-        return error.ClipboardWriteFailed;
-}
-
-test "Windows clipboard write ownership and failure propagation" {
-    // Exercise resource transfer and failures without reading or replacing
-    // the user's system clipboard, even on a shared working desktop.
-    const Native = struct {
-        var fail_at: u8 = 0;
-        var calls: u8 = 0;
-        var freed = false;
-        var closed = false;
-        var received_owner: ?w32.HWND = null;
-
-        fn OpenClipboard(owner: ?w32.HWND) i32 {
-            received_owner = owner;
-            calls += 1;
-            return if (fail_at == 1) 0 else 1;
-        }
-
-        fn CloseClipboard() i32 {
-            closed = true;
-            return 1;
-        }
-
-        fn EmptyClipboard() i32 {
-            calls += 1;
-            return if (fail_at == 2) 0 else 1;
-        }
-
-        fn SetClipboardData(format: u32, handle: *anyopaque) ?*anyopaque {
-            std.debug.assert(format == w32.CF_UNICODETEXT);
-            calls += 1;
-            return if (fail_at == 3) null else handle;
-        }
-
-        fn GlobalFree(_: *anyopaque) ?*anyopaque {
-            freed = true;
-            return null;
-        }
-    };
-    const owner: w32.HWND = @ptrFromInt(0x1000);
-    const handle: *anyopaque = @ptrFromInt(0x2000);
-    for (0..4) |failure| {
-        Native.fail_at = @intCast(failure);
-        Native.calls = 0;
-        Native.freed = false;
-        Native.closed = false;
-        Native.received_owner = null;
-        const result = publishTextClipboard(Native, owner, handle);
-        switch (failure) {
-            0 => try result,
-            1 => try std.testing.expectError(error.ClipboardUnavailable, result),
-            2, 3 => try std.testing.expectError(error.ClipboardWriteFailed, result),
-            else => unreachable,
-        }
-        try std.testing.expectEqual(owner, Native.received_owner.?);
-        try std.testing.expectEqual(if (failure == 0) 3 else @as(u8, @intCast(failure)), Native.calls);
-        try std.testing.expectEqual(failure != 0, Native.freed);
-        try std.testing.expectEqual(failure != 1, Native.closed);
+    switch (clipboard_type) {
+        .standard => try native.write(core_app.alloc, contents),
+        .selection, .primary => try app.selection_clipboard.write(core_app.alloc, contents),
     }
 }
 
 test "Windows clipboard rejects unsupported Kitty commits before native access" {
     const unsupported = [_][]const apprt.ClipboardContent{
         &.{.{ .mime = "image/png", .data = "png" }},
-        &.{ .{ .mime = "text/plain", .data = "text" }, .{ .mime = "text/html", .data = "<b>text</b>" } },
+        &.{ .{ .mime = "text/plain", .data = "text" }, .{ .mime = "invalid/name/extra", .data = "invalid" } },
         &.{.{ .mime = "text/plain", .data = "before\x00after" }},
     };
-    // These requests must not access an HWND, the App, or a core surface.
     var surface: Surface = .{ .app = undefined };
     for (unsupported) |contents| {
         var request: apprt.ClipboardRequest.KittyWrite = undefined;
         request.contents = contents;
         try std.testing.expectEqual(apprt.ClipboardReadResult.unsupported, try surface.clipboardRequest(.standard, .{ .kitty_write = &request }));
     }
-    try std.testing.expect(supportsKittyClipboardWrite(&.{}));
-    try std.testing.expect(supportsKittyClipboardWrite(&.{.{ .mime = "text/plain", .data = "Unicode: \u{4e2d}\u{1f600}" }}));
+    try std.testing.expect(Clipboard.supported(&.{}));
+    try std.testing.expect(Clipboard.supported(&.{
+        .{ .mime = "text/plain", .data = "text" }, .{ .mime = "text/html", .data = "<b>text</b>" },
+    }));
+}
+
+test "Windows clipboard closing requester during confirmation preserves clipboard and sibling" {
+    const testing = std.testing;
+    const Native = struct {
+        var core_app: *@import("../../App.zig") = undefined;
+        var requester: *Surface = undefined;
+        var wrote = false;
+
+        fn confirm(_: Allocator, _: ?w32.HWND, _: apprt.ClipboardRequest, _: anytype) Clipboard.Decision {
+            _ = core_app.surfaces.swapRemove(0);
+            testing.allocator.destroy(requester);
+            return .{ .button = .allow, .remember = true };
+        }
+        fn write(_: Allocator, _: []const apprt.ClipboardContent) !void {
+            wrote = true;
+        }
+    };
+    var core_app: @import("../../App.zig") = undefined;
+    core_app.alloc = testing.allocator;
+    core_app.surfaces = .empty;
+    defer core_app.surfaces.deinit(testing.allocator);
+    var app: App = undefined;
+    app.core_app = &core_app;
+    var window: Window = undefined;
+    window.hwnd = @ptrFromInt(0x1000);
+    const requester = try testing.allocator.create(Surface);
+    requester.* = .{ .app = &app, .parent_window = &window };
+    requester.core_surface.id = 1;
+    const sibling = try testing.allocator.create(Surface);
+    defer testing.allocator.destroy(sibling);
+    sibling.* = .{ .app = &app, .parent_window = &window };
+    sibling.core_surface.id = 2;
+    sibling.core_surface.config.clipboard_write = .ask;
+    try core_app.surfaces.appendSlice(testing.allocator, &.{ requester, sibling });
+    Native.core_app = &core_app;
+    Native.requester = requester;
+    Native.wrote = false;
+    try requester.setClipboardWithNative(.standard, &.{.{ .mime = "text/plain", .data = "test" }}, true, Native);
+    try testing.expect(!Native.wrote);
+    try testing.expectEqual(sibling, core_app.surfaces.items[0]);
+    try testing.expectEqual(.ask, sibling.core_surface.config.clipboard_write);
 }
 
 pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
-    _ = self;
-    const env = try global.environMap();
+    var env = try global.environMap();
+    errdefer env.deinit();
+    if (self.parent_window.is_quick_terminal) try env.put("GHOSTTY_QUICK_TERMINAL", "1");
 
     // TERM and COLORTERM are set by termio/Exec.zig with platform-aware
     // logic (checking for terminfo, resources_dir, etc.). Do not set them here.
@@ -1386,11 +1304,30 @@ pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
 
 /// Set the window title. Called from performAction(.set_title).
 pub fn setTitle(self: *Surface, title: [:0]const u8) void {
-    const len = @min(title.len, self.title.len - 1);
+    var len = @min(title.len, self.title.len - 1);
+    while (len > 0 and len < title.len and title[len] & 0xc0 == 0x80) len -= 1;
     @memcpy(self.title[0..len], title[0..len]);
     self.title[len] = 0;
     self.title_len = len;
-    self.parent_window.onTabTitleChanged(self, title);
+    self.app.requestPaletteRefresh();
+    self.parent_window.surfaceTitleChanged(self);
+}
+
+pub fn effectiveTitle(self: *const Surface) ?[:0]const u8 {
+    return self.title_override orelse self.getTitle();
+}
+
+pub fn titleClipboardContent(self: *const Surface) ?apprt.ClipboardContent {
+    return .{ .mime = "text/plain", .data = self.effectiveTitle() orelse return null };
+}
+
+pub fn setTitleOverride(self: *Surface, title: []const u8) !void {
+    const alloc = self.app.core_app.alloc;
+    const next = if (title.len == 0) null else try alloc.dupeSentinel(u8, title, 0);
+    if (self.title_override) |old| alloc.free(old);
+    self.title_override = next;
+    self.parent_window.surfaceTitleChanged(self);
+    self.app.requestPaletteRefresh();
 }
 
 /// Toggle fullscreen mode. Delegates to the parent Window.
@@ -1764,96 +1701,108 @@ pub fn handleSearchKey(self: *Surface, vk: u16) bool {
 // Command Palette
 // -----------------------------------------------------------------------
 
-/// A command palette entry: display name + the binding action to execute.
-const PaletteEntry = struct {
-    name: []const u8,
-    action: input.Binding.Action,
-};
-
-/// Cap on user-configured command-palette-entry commands shown in the
-/// palette (bounds the fixed-size palette_filtered index array).
-pub const MAX_USER_PALETTE_ENTRIES = 64;
-
-/// Palette indexes >= palette_entries.len refer to user-configured
-/// command-palette-entry commands from the config, in order.
-fn paletteEntryName(self: *const Surface, idx: u16) []const u8 {
-    if (idx < palette_entries.len) return palette_entries[idx].name;
-    const user = self.app.config.@"command-palette-entry".value.items;
-    const uidx = idx - palette_entries.len;
-    if (uidx >= user.len) return "";
-    return user[uidx].title;
-}
-
-fn paletteEntryAction(self: *const Surface, idx: u16) ?input.Binding.Action {
-    if (idx < palette_entries.len) return palette_entries[idx].action;
-    const user = self.app.config.@"command-palette-entry".value.items;
-    const uidx = idx - palette_entries.len;
-    if (uidx >= user.len) return null;
-    return user[uidx].action;
-}
-
-/// Child window ID for the palette edit control.
 pub const PALETTE_EDIT_ID: u16 = 200;
+const PALETTE_LIST_TOP: f32 = 40;
+const PALETTE_ITEM_HEIGHT: f32 = 42;
 
-/// Layout constants for the palette list (unscaled, multiply by self.scale).
-pub const PALETTE_LIST_TOP: f32 = 40.0;
-pub const PALETTE_ITEM_HEIGHT: f32 = 28.0;
+const Palette = struct {
+    arena: std.heap.ArenaAllocator,
+    entries: []Entry,
+    filtered: std.ArrayList(usize),
+    selected: ?usize = null,
 
-/// Static list of commands shown in the palette.
-const palette_entries = [_]PaletteEntry{
-    .{ .name = "New Window", .action = .new_window },
-    .{ .name = "New Tab", .action = .new_tab },
-    .{ .name = "Tab Overview", .action = .toggle_tab_overview },
-    .{ .name = "Close Surface", .action = .close_surface },
-    .{ .name = "Close Tab", .action = .{ .close_tab = .this } },
-    .{ .name = "Close Window", .action = .close_window },
-    .{ .name = "Previous Tab", .action = .previous_tab },
-    .{ .name = "Next Tab", .action = .next_tab },
-    .{ .name = "Last Tab", .action = .last_tab },
-    .{ .name = "Split Right", .action = .{ .new_split = .right } },
-    .{ .name = "Split Down", .action = .{ .new_split = .down } },
-    .{ .name = "Split Left", .action = .{ .new_split = .left } },
-    .{ .name = "Split Up", .action = .{ .new_split = .up } },
-    .{ .name = "Focus Split Right", .action = .{ .goto_split = .right } },
-    .{ .name = "Focus Split Down", .action = .{ .goto_split = .down } },
-    .{ .name = "Focus Split Left", .action = .{ .goto_split = .left } },
-    .{ .name = "Focus Split Up", .action = .{ .goto_split = .up } },
-    .{ .name = "Focus Previous Split", .action = .{ .goto_split = .previous } },
-    .{ .name = "Focus Next Split", .action = .{ .goto_split = .next } },
-    .{ .name = "Toggle Split Zoom", .action = .toggle_split_zoom },
-    .{ .name = "Equalize Splits", .action = .equalize_splits },
-    .{ .name = "Toggle Fullscreen", .action = .toggle_fullscreen },
-    .{ .name = "Toggle Maximize", .action = .toggle_maximize },
-    .{ .name = "Toggle Window Decorations", .action = .toggle_window_decorations },
-    .{ .name = "Toggle Background Opacity", .action = .toggle_background_opacity },
-    .{ .name = "Toggle Quick Terminal", .action = .toggle_quick_terminal },
-    .{ .name = "Toggle Read-Only", .action = .toggle_readonly },
-    .{ .name = "Toggle Mouse Reporting", .action = .toggle_mouse_reporting },
-    .{ .name = "Reset Mouse Reporting", .action = .reset_mouse_reporting },
-    .{ .name = "Copy to Clipboard", .action = .{ .copy_to_clipboard = .mixed } },
-    .{ .name = "Paste from Clipboard", .action = .paste_from_clipboard },
-    .{ .name = "Copy URL to Clipboard", .action = .copy_url_to_clipboard },
-    .{ .name = "Copy Title to Clipboard", .action = .copy_title_to_clipboard },
-    .{ .name = "Select All", .action = .select_all },
-    .{ .name = "Find", .action = .start_search },
-    .{ .name = "Search Selection", .action = .search_selection },
-    .{ .name = "Increase Font Size", .action = .{ .increase_font_size = 1 } },
-    .{ .name = "Decrease Font Size", .action = .{ .decrease_font_size = 1 } },
-    .{ .name = "Reset Font Size", .action = .reset_font_size },
-    .{ .name = "Scroll Page Up", .action = .scroll_page_up },
-    .{ .name = "Scroll Page Down", .action = .scroll_page_down },
-    .{ .name = "Scroll to Top", .action = .scroll_to_top },
-    .{ .name = "Scroll to Bottom", .action = .scroll_to_bottom },
-    .{ .name = "Clear Screen", .action = .clear_screen },
-    .{ .name = "Reset Terminal", .action = .reset },
-    .{ .name = "Open Config", .action = .{ .open_config = .default } },
-    .{ .name = "Reload Config", .action = .reload_config },
-    .{ .name = "Switch to Configured Appearance", .action = .{ .set_window_theme = .config } },
-    .{ .name = "Switch to System Appearance", .action = .{ .set_window_theme = .system } },
-    .{ .name = "Switch to Light Appearance", .action = .{ .set_window_theme = .light } },
-    .{ .name = "Switch to Dark Appearance", .action = .{ .set_window_theme = .dark } },
-    .{ .name = "Quit", .action = .quit },
+    const Entry = struct {
+        title: []const u16,
+        description: []const u16,
+        target: union(enum) { command: input.Binding.Action, surface: u64 },
+
+        fn sameTarget(a: Entry, b: Entry) bool {
+            return switch (a.target) {
+                .surface => |id| b.target == .surface and b.target.surface == id,
+                .command => |action| b.target == .command and
+                    action.hash() == b.target.command.hash() and std.mem.eql(u16, a.title, b.title),
+            };
+        }
+    };
+
+    fn wide(alloc: Allocator, text: []const u8) ![]const u16 {
+        return std.unicode.utf8ToUtf16LeAlloc(alloc, text) catch |err| switch (err) {
+            error.InvalidUtf8 => std.unicode.utf8ToUtf16LeStringLiteral("�"),
+            else => |other| return other,
+        };
+    }
+
+    fn init(owner: *Surface) !Palette {
+        var arena = std.heap.ArenaAllocator.init(owner.app.core_app.alloc);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+        var entries: std.ArrayList(Entry) = .empty;
+        for (owner.core_surface.config.palette_entries) |entry| {
+            // These bindings are explicitly unsupported by the native runtime.
+            switch (entry.action) {
+                .toggle_secure_input, .show_gtk_inspector, .show_on_screen_keyboard, .undo, .redo => continue,
+                else => {},
+            }
+            try entries.append(alloc, .{
+                .title = try wide(alloc, entry.title),
+                .description = try wide(alloc, entry.description),
+                .target = .{ .command = try entry.action.clone(alloc) },
+            });
+        }
+        for (owner.app.core_app.surfaces.items) |surface| {
+            if (!surface.core_surface_ready or surface.parent_window.closing) continue;
+            const title = try std.fmt.allocPrint(alloc, "Focus: {s}{s}", .{
+                if (surface.bell.title_visible) "🔔 " else "",
+                surface.effectiveTitle() orelse "Untitled",
+            });
+            try entries.append(alloc, .{
+                .title = try wide(alloc, title),
+                .description = try wide(alloc, surface.working_directory),
+                .target = .{ .surface = surface.core_surface.id },
+            });
+        }
+        const filtered = try std.ArrayList(usize).initCapacity(alloc, entries.items.len);
+        return .{ .arena = arena, .entries = entries.items, .filtered = filtered };
+    }
+
+    fn filter(self: *Palette, query: []const u16, previous: ?Entry, preserve: bool) void {
+        self.filtered.clearRetainingCapacity();
+        self.selected = null;
+        const matches = @import("TabOverview.zig").matches;
+        for (self.entries, 0..) |entry, i| {
+            if (!matches(entry.title, query) and !matches(entry.description, query)) continue;
+            if (previous) |old| {
+                if (self.selected == null and entry.sameTarget(old)) self.selected = self.filtered.items.len;
+            }
+            self.filtered.appendAssumeCapacity(i);
+        }
+        if (!preserve and self.filtered.items.len != 0) self.selected = 0;
+    }
+
+    fn selection(self: *const Palette) ?Entry {
+        const row = self.selected orelse return null;
+        return self.entries[self.filtered.items[row]];
+    }
+
+    fn scrollOffset(self: *const Palette, visible: usize) usize {
+        return ((self.selected orelse 0) + 1) -| visible;
+    }
 };
+
+fn clearPalette(self: *Surface) void {
+    if (self.palette) |*palette| palette.arena.deinit();
+    self.palette = null;
+    if (self.palette_hwnd != null and self.app.active_palette == self.palette_hwnd) self.app.active_palette = null;
+}
+
+pub fn setWorkingDirectory(self: *Surface, path: []const u8) !void {
+    if (std.mem.eql(u8, self.working_directory, path)) return;
+    const alloc = self.app.core_app.alloc;
+    const copy = try alloc.dupe(u8, path);
+    alloc.free(self.working_directory);
+    self.working_directory = copy;
+    self.app.requestPaletteRefresh();
+}
 
 /// Toggle the command palette visibility.
 pub fn setCommandPaletteActive(self: *Surface, active: bool) void {
@@ -1862,11 +1811,12 @@ pub fn setCommandPaletteActive(self: *Surface, active: bool) void {
         if (self.search_active) {
             self.setSearchActive(false, &[_:0]u8{});
         }
-        self.palette_active = true;
         self.ensureCommandPalette();
         if (self.palette_hwnd) |popup| {
+            self.palette_active = true;
+            self.app.active_palette = popup;
             self.positionCommandPalette();
-            self.filterPaletteEntries("");
+            self.refreshPalette(false) catch |err| log.err("refresh palette failed err={}", .{err});
             _ = w32.ShowWindow(popup, w32.SW_SHOW);
             if (self.palette_edit) |edit| {
                 _ = w32.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral(""));
@@ -1875,6 +1825,7 @@ pub fn setCommandPaletteActive(self: *Surface, active: bool) void {
         }
     } else {
         self.palette_active = false;
+        self.clearPalette();
         if (self.palette_hwnd) |popup| {
             _ = w32.ShowWindow(popup, 0); // SW_HIDE
         }
@@ -1962,6 +1913,7 @@ fn ensureCommandPalette(self: *Surface) void {
 }
 
 pub fn updatePopupTheme(self: *Surface, dark: bool) void {
+    if (self.inspector) |inspector| inspector.updateTheme(dark);
     for ([_]?w32.HWND{ self.search_hwnd, self.search_edit, self.search_count_label, self.palette_hwnd, self.palette_edit }) |maybe| {
         const hwnd = maybe orelse continue;
         _ = w32.SetWindowTheme(hwnd, Window.controlTheme(dark), null);
@@ -1986,94 +1938,96 @@ fn positionCommandPalette(self: *Surface) void {
     }
 }
 
-/// Filter palette entries by a case-insensitive substring match.
-fn filterPaletteEntries(self: *Surface, filter: []const u8) void {
-    var count: u16 = 0;
-    for (palette_entries, 0..) |entry, i| {
-        if (filter.len == 0 or std.ascii.findIgnoreCase(entry.name, filter) != null) {
-            self.palette_filtered[count] = @intCast(i);
-            count += 1;
-        }
-    }
-    // User-configured command-palette-entry commands, appended after the
-    // built-in entries.
-    const user = self.app.config.@"command-palette-entry".value.items;
-    const user_len = @min(user.len, MAX_USER_PALETTE_ENTRIES);
-    for (user[0..user_len], 0..) |entry, i| {
-        if (filter.len == 0 or std.ascii.findIgnoreCase(entry.title, filter) != null) {
-            self.palette_filtered[count] = @intCast(palette_entries.len + i);
-            count += 1;
-        }
-    }
-    self.palette_count = count;
-    self.palette_selected = 0;
-    // Trigger repaint of the list area
-    if (self.palette_hwnd) |popup| {
-        _ = w32.InvalidateRect(popup, null, 1);
-    }
+/// Refreshes use the selected action or stable surface ID, so a closed
+/// pane cannot cause Enter to activate the next row in the list.
+pub fn refreshPalette(self: *Surface, preserve: bool) !void {
+    if (!self.palette_active) return;
+    var fresh = try Palette.init(self);
+    errdefer fresh.arena.deinit();
+    const previous = if (self.palette) |*old| old.selection() else null;
+    try self.applyPaletteQuery(&fresh, previous, preserve);
+    if (self.palette) |*old| old.arena.deinit();
+    self.palette = fresh;
+    if (self.palette_hwnd) |popup| _ = w32.InvalidateRect(popup, null, 1);
 }
 
-/// Handle text changes in the palette search edit (EN_CHANGE).
+fn applyPaletteQuery(self: *Surface, palette: *Palette, previous: ?Palette.Entry, preserve: bool) !void {
+    var buf: [256]u16 = undefined;
+    var stack = std.heap.BufferFirstAllocator.init(std.mem.sliceAsBytes(&buf), self.app.core_app.alloc);
+    const alloc = stack.allocator();
+    const edit = self.palette_edit orelse return palette.filter(&.{}, previous, preserve);
+    const len: usize = @intCast(w32.GetWindowTextLengthW(edit));
+    const wide = try alloc.alloc(u16, len + 1);
+    defer alloc.free(wide);
+    const n: usize = @intCast(w32.GetWindowTextW(edit, wide.ptr, @intCast(wide.len)));
+    palette.filter(wide[0..n], previous, preserve);
+}
+
 pub fn handlePaletteChange(self: *Surface) void {
-    const edit = self.palette_edit orelse return;
-
-    var wbuf: [256]u16 = undefined;
-    const wlen: usize = @intCast(w32.GetWindowTextW(edit, &wbuf, @intCast(wbuf.len)));
-
-    var utf8_buf: [512]u8 = undefined;
-    const utf8_len = std.unicode.utf16LeToUtf8(&utf8_buf, wbuf[0..wlen]) catch 0;
-
-    self.filterPaletteEntries(utf8_buf[0..utf8_len]);
+    const palette = if (self.palette) |*p| p else return;
+    self.applyPaletteQuery(palette, null, false) catch return;
+    if (self.palette_hwnd) |popup| _ = w32.InvalidateRect(popup, null, 1);
 }
 
-/// Handle key events in the command palette. Returns true if handled.
 pub fn handlePaletteKey(self: *Surface, vk: u16) bool {
     switch (vk) {
-        w32.VK_ESCAPE => {
-            self.setCommandPaletteActive(false);
-            return true;
-        },
-        w32.VK_RETURN => {
-            self.executePaletteSelection();
-            return true;
-        },
-        w32.VK_UP => {
-            if (self.palette_selected > 0) {
-                self.palette_selected -= 1;
-                if (self.palette_hwnd) |popup| {
-                    _ = w32.InvalidateRect(popup, null, 1);
-                }
-            }
-            return true;
-        },
-        w32.VK_DOWN => {
-            if (self.palette_count > 0 and self.palette_selected < self.palette_count - 1) {
-                self.palette_selected += 1;
-                if (self.palette_hwnd) |popup| {
-                    _ = w32.InvalidateRect(popup, null, 1);
-                }
-            }
-            return true;
+        w32.VK_ESCAPE => self.setCommandPaletteActive(false),
+        w32.VK_RETURN => self.executePaletteSelection(),
+        w32.VK_UP, w32.VK_DOWN => {
+            const palette = if (self.palette) |*p| p else return true;
+            if (palette.filtered.items.len == 0) return true;
+            palette.selected = if (palette.selected) |idx|
+                if (vk == w32.VK_UP) idx -| 1 else @min(idx + 1, palette.filtered.items.len - 1)
+            else
+                0;
+            if (self.palette_hwnd) |popup| _ = w32.InvalidateRect(popup, null, 1);
         },
         else => return false,
     }
+    return true;
 }
 
-/// Execute the currently selected palette entry.
+pub fn clickPalette(self: *Surface, hwnd: w32.HWND, y: i32) void {
+    const palette = if (self.palette) |*p| p else return;
+    const top: i32 = @intFromFloat(@round(PALETTE_LIST_TOP * self.scale));
+    const height: i32 = @intFromFloat(@round(PALETTE_ITEM_HEIGHT * self.scale));
+    var rect: w32.RECT = undefined;
+    if (w32.GetClientRect(hwnd, &rect) == 0 or y < top or rect.bottom <= top) return;
+    const visible: usize = @intCast(@divTrunc(rect.bottom - top, height));
+    const offset: usize = @intCast(@divTrunc(y - top, height));
+    const row = palette.scrollOffset(visible) + offset;
+    if (offset >= visible or row >= palette.filtered.items.len) return;
+    palette.selected = row;
+    self.executePaletteSelection();
+}
+
 pub fn executePaletteSelection(self: *Surface) void {
     if (!self.core_surface_ready) return;
-    if (self.palette_selected >= self.palette_count) return;
-
-    const entry_idx = self.palette_filtered[self.palette_selected];
-    const action = self.paletteEntryAction(entry_idx) orelse return;
-
-    // Close the palette first
+    if (self.app.palette_refresh_pending) self.refreshPalette(true) catch return;
+    const palette = if (self.palette) |*p| p else return;
+    const entry = palette.selection() orelse return;
+    // Detach the snapshot before hiding the popup. An action can reload
+    // configuration or close this very surface; its payload must outlive both.
+    const app = self.app;
+    var arena = palette.arena;
+    defer arena.deinit();
+    self.palette = null;
+    const source_id = self.core_surface.id;
     self.setCommandPaletteActive(false);
-
-    // Execute the action
-    _ = self.core_surface.performBindingAction(action) catch |err| {
-        log.err("palette action error: {}", .{err});
-    };
+    switch (entry.target) {
+        .command => |action| {
+            const source = app.findReadySurface(source_id) orelse return;
+            _ = source.core_surface.performBindingAction(action) catch |err| {
+                log.err("palette action error: {}", .{err});
+            };
+        },
+        .surface => |id| {
+            const dest = app.findReadySurface(id) orelse return;
+            _ = app.performAction(.{ .surface = &dest.core_surface }, .present_terminal, {}) catch |err| {
+                log.err("palette focus error: {}", .{err});
+            };
+        },
+    }
 }
 
 /// Paint the command palette list area.
@@ -2123,25 +2077,16 @@ pub fn paintPalette(self: *Surface, hwnd: w32.HWND) void {
     const max_visible = @divTrunc(client_rect.bottom - list_top, item_height);
     if (max_visible <= 0) return; // popup too small to render any items
 
-    // Calculate scroll offset to keep selected item visible
-    var scroll_offset: i32 = 0;
-    if (self.palette_selected >= max_visible) {
-        scroll_offset = self.palette_selected - @as(u16, @intCast(max_visible)) + 1;
-    }
-
-    var i: u16 = 0;
-    while (i < self.palette_count) : (i += 1) {
-        const visual_idx = @as(i32, i) - scroll_offset;
-        if (visual_idx < 0) continue;
-        if (visual_idx >= max_visible) break;
-
-        const y = list_top + visual_idx * item_height;
-        const entry_idx = self.palette_filtered[i];
-        const entry_name = self.paletteEntryName(entry_idx);
-        const entry_action = self.paletteEntryAction(entry_idx);
+    const palette = if (self.palette) |*p| p else return;
+    const visible: usize = @intCast(max_visible);
+    const start = palette.scrollOffset(visible);
+    const end = @min(start + visible, palette.filtered.items.len);
+    for (palette.filtered.items[start..end], start..) |entry_idx, i| {
+        const y = list_top + @as(i32, @intCast(i - start)) * item_height;
+        const entry = palette.entries[entry_idx];
 
         // Draw selection highlight
-        if (i == self.palette_selected) {
+        if (i == palette.selected) {
             _ = w32.SetDCBrushColor(hdc, colors.mix(36));
             const sel_rect = w32.RECT{
                 .left = 0,
@@ -2163,17 +2108,21 @@ pub fn paintPalette(self: *Surface, hwnd: w32.HWND) void {
             .right = client_rect.right - kb_area,
             .bottom = y + item_height,
         };
-        var wname_buf: [128]u16 = undefined;
-        // User-configured palette titles are arbitrary length; cap to the
-        // buffer (N UTF-8 bytes ≤ N UTF-16 units) on a codepoint boundary so
-        // a long title truncates instead of overflowing the stack buffer.
-        var name_len = @min(entry_name.len, wname_buf.len);
-        while (name_len > 0 and entry_name[name_len - 1] & 0xC0 == 0x80) name_len -= 1;
-        const wname_len = std.unicode.utf8ToUtf16Le(&wname_buf, entry_name[0..name_len]) catch 0;
-        _ = w32.DrawTextW(hdc, @ptrCast(&wname_buf), @intCast(wname_len), &name_rect, 0);
+        const flags = w32.DT_SINGLELINE | w32.DT_END_ELLIPSIS | w32.DT_NOPREFIX;
+        const trigger = switch (entry.target) {
+            .command => |action| self.core_surface.config.keybind.set.getTrigger(action),
+            .surface => null,
+        };
+        if (trigger == null) name_rect.right = client_rect.right - text_pad;
+        _ = w32.DrawTextW(hdc, entry.title.ptr, @intCast(entry.title.len), &name_rect, flags);
+        if (entry.description.len != 0) {
+            var desc_rect = name_rect;
+            desc_rect.top = y + @divTrunc(item_height, 2);
+            desc_rect.right = client_rect.right - text_pad;
+            _ = w32.SetTextColor(hdc, colors.mix(170));
+            _ = w32.DrawTextW(hdc, entry.description.ptr, @intCast(entry.description.len), &desc_rect, flags);
+        }
 
-        // Draw keybinding hint on the right
-        const trigger = if (entry_action) |a| self.app.config.keybind.set.getTrigger(a) else null;
         if (trigger) |t| {
             _ = w32.SetTextColor(hdc, colors.mix(170));
             var kb_buf: [64]u8 = undefined;
@@ -2189,6 +2138,141 @@ pub fn paintPalette(self: *Surface, hwnd: w32.HWND) void {
             _ = w32.DrawTextW(hdc, @ptrCast(&wkb_buf), @intCast(wkb_len), &kb_rect, 0x0002); // DT_RIGHT
         }
     }
+}
+
+test "command palette uses effective entries, reloads, and invokes a match beyond 64" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var core_app: @import("../../App.zig") = undefined;
+    try core_app.init(alloc);
+    defer core_app.deinit();
+    var app: App = .{ .core_app = &core_app, .config = try configpkg.Config.default(alloc), .hinstance = undefined };
+    defer app.config.deinit();
+    const surface = try alloc.create(Surface);
+    defer alloc.destroy(surface);
+    var win: Window = .{ .app = &app };
+    surface.* = .{ .app = &app, .parent_window = &win, .core_surface_ready = true, .palette_active = true };
+    surface.core_surface.id = 1;
+    try core_app.surfaces.append(alloc, surface);
+    defer core_app.surfaces.clearRetainingCapacity();
+    defer surface.clearPalette();
+    var effective = try configpkg.Config.default(alloc);
+    defer effective.deinit();
+    const DerivedConfig = @TypeOf(surface.core_surface.config);
+    surface.core_surface.config = try DerivedConfig.init(alloc, &effective);
+    defer surface.core_surface.config.deinit();
+    surface.core_surface.app = &core_app;
+    surface.core_surface.rt_app = &app;
+    surface.core_surface.rt_surface = surface;
+    const edit = w32.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("EDIT"), std.unicode.utf8ToUtf16LeStringLiteral(""), 0, 0, 0, 100, 20, null, null, null, null) orelse return error.Win32Error;
+    defer _ = w32.DestroyWindow(edit);
+    surface.palette_edit = edit;
+    try surface.refreshPalette(false);
+    try testing.expect(surface.palette.?.entries.len > 0);
+
+    const commands = &effective.@"command-palette-entry";
+    const cfg_alloc = effective.arenaAlloc();
+    try commands.parseCLI(cfg_alloc, "clear");
+    surface.core_surface.config.deinit();
+    surface.core_surface.config = try DerivedConfig.init(alloc, &effective);
+    try surface.refreshPalette(true);
+    try testing.expectEqual(1, surface.palette.?.entries.len);
+    try testing.expect(surface.palette.?.entries[0].target == .surface);
+    for (0..70) |i| {
+        const entry = try std.fmt.allocPrint(cfg_alloc, "title:Custom {d},action:set_window_theme:light", .{i});
+        try commands.parseCLI(cfg_alloc, entry);
+    }
+    try commands.parseCLI(cfg_alloc, "title:Last Entry,description:Beyond the limit,action:set_window_theme:dark");
+    surface.core_surface.config.deinit();
+    surface.core_surface.config = try DerivedConfig.init(alloc, &effective);
+    try surface.refreshPalette(true);
+    try surface.refreshPalette(true);
+    try testing.expectEqual(72, surface.palette.?.entries.len);
+    _ = w32.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("beyond"));
+    surface.handlePaletteChange();
+    try testing.expectEqual(1, surface.palette.?.filtered.items.len);
+    try testing.expect(surface.handlePaletteKey(w32.VK_RETURN));
+    try testing.expectEqual(.dark, app.window_theme_override);
+}
+
+test "command palette tracks live pane titles and directories, preserves identity, and reveals a hidden split" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const Tree = @import("../../datastruct/split_tree.zig").SplitTree(Surface);
+    var core_app: @import("../../App.zig") = undefined;
+    try core_app.init(alloc);
+    defer core_app.deinit();
+    var app: App = .{ .core_app = &core_app, .config = try configpkg.Config.default(alloc), .hinstance = undefined };
+    defer app.config.deinit();
+    const windows = try alloc.alloc(Window, 2);
+    defer alloc.free(windows);
+    for (windows) |*win| win.* = .{ .app = &app };
+    const surfaces = try alloc.alloc(Surface, 5);
+    defer alloc.free(surfaces);
+    for (surfaces, 0..) |*surface, i| {
+        surface.* = .{
+            .app = &app,
+            .parent_window = &windows[if (i < 2) @as(usize, 0) else 1],
+            .core_surface_ready = true,
+            .last_reported_visible = false,
+        };
+        surface.core_surface.config.palette_entries = &.{};
+        surface.core_surface.rt_surface = surface;
+        surface.core_surface.id = i + 10;
+        try core_app.surfaces.append(alloc, surface);
+    }
+    defer core_app.surfaces.clearRetainingCapacity();
+    const source = &surfaces[0];
+    const sibling = &surfaces[3];
+    const wanted = &surfaces[4];
+    const destination = &windows[1];
+    var nodes = [_]Tree.Node{
+        .{ .split = .{ .layout = .horizontal, .ratio = 0.5, .left = @fromBackingInt(@intCast(1)), .right = @fromBackingInt(@intCast(2)) } },
+        .{ .leaf = sibling },
+        .{ .leaf = wanted },
+    };
+    var other_tab = [_]Tree.Node{.{ .leaf = &surfaces[2] }};
+    destination.tab_count = 2;
+    destination.tab_trees[0] = .{ .arena = undefined, .nodes = &other_tab, .zoomed = null };
+    destination.tab_trees[1] = .{ .arena = undefined, .nodes = &nodes, .zoomed = @fromBackingInt(@intCast(1)) };
+    destination.tab_active_surface[0] = &surfaces[2];
+    destination.tab_active_surface[1] = sibling;
+    wanted.setTitle("Editor");
+    try testing.expect(try app.performAction(.{ .surface = &wanted.core_surface }, .pwd, .{ .pwd = "C:\\Project\\Résumé" }));
+    defer alloc.free(wanted.working_directory);
+    const edit = w32.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("EDIT"), std.unicode.utf8ToUtf16LeStringLiteral(""), 0, 0, 0, 100, 20, null, null, null, null) orelse return error.Win32Error;
+    defer _ = w32.DestroyWindow(edit);
+    source.palette_edit = edit;
+    source.palette_active = true;
+    defer source.clearPalette();
+    try source.refreshPalette(false);
+    try testing.expectEqual(5, source.palette.?.entries.len);
+    _ = w32.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("rÉSUMÉ"));
+    source.handlePaletteChange();
+    try testing.expectEqual(wanted.core_surface.id, source.palette.?.selection().?.target.surface);
+    try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("Focus: Editor"), source.palette.?.selection().?.title);
+
+    // Removing an unrelated row swaps indices in the core surface list.
+    core_app.deleteSurface(&surfaces[1]);
+    try source.refreshPalette(true);
+    try testing.expectEqual(wanted.core_surface.id, source.palette.?.selection().?.target.surface);
+    source.executePaletteSelection();
+    try testing.expectEqual(1, destination.active_tab);
+    try testing.expectEqual(wanted, destination.getActiveSurface());
+    try testing.expect(destination.tab_trees[1].zoomed == null);
+
+    // A closed result must never activate the survivor at the same position.
+    source.palette_active = true;
+    _ = w32.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("Focus:"));
+    try source.refreshPalette(false);
+    try testing.expect(source.handlePaletteKey(w32.VK_DOWN));
+    try testing.expectEqual(wanted.core_surface.id, source.palette.?.selection().?.target.surface);
+    core_app.deleteSurface(wanted);
+    try source.refreshPalette(true);
+    try testing.expectEqual(3, source.palette.?.filtered.items.len);
+    try testing.expect(source.palette.?.selection() == null);
+    source.executePaletteSelection();
+    try testing.expect(source.palette_active);
 }
 
 /// Format a keybinding trigger as a human-readable string (e.g. "Ctrl+Shift+T").
@@ -2406,6 +2490,7 @@ pub fn handleResize(self: *Surface, width: u32, height: u32) void {
 /// Handle WM_DPICHANGED.
 pub fn handleDpiChange(self: *Surface) void {
     self.updateDpiScale();
+    if (self.bell.ringing) self.updateBellIndicators();
 
     // Popup fonts were created at the previous DPI. Rebuild them at
     // the new scale so search-bar / palette text doesn't render
@@ -2488,6 +2573,7 @@ fn handleKeyEventWithNative(
     comptime native: type,
 ) void {
     if (!self.core_surface_ready) return;
+    if (action != .release) self.clearBell();
     const vk: u16 = @intCast(wparam & 0xFFFF);
 
     // When the IME is active, physical key presses arrive as VK_PROCESSKEY.
@@ -2659,6 +2745,7 @@ fn handleKeyEventWithNative(
 /// textCallback is for clipboard paste; keyCallback is for keyboard/IME text.
 pub fn handleCharEvent(self: *Surface, wparam: usize) void {
     if (!self.core_surface_ready) return;
+    self.clearBell();
     const char_code: u16 = @intCast(wparam & 0xFFFF);
 
     // Skip control characters that are handled via WM_KEYDOWN
@@ -2718,6 +2805,7 @@ pub fn handleMouseButton(
     lparam: isize,
 ) void {
     if (!self.core_surface_ready) return;
+    if (action == .press) self.clearBell();
     const x: f32 = @floatFromInt(@as(i16, @truncate(@as(isize, lparam & 0xFFFF))));
     const y: f32 = @floatFromInt(@as(i16, @truncate(@as(isize, (lparam >> 16) & 0xFFFF))));
 
@@ -2772,6 +2860,8 @@ pub fn handleMouseButton(
 /// core's binding actions, mirroring the macOS surface menu.
 fn showContextMenu(self: *Surface, lparam: isize) void {
     const hwnd = self.hwnd orelse return;
+    const app = self.app;
+    const surface_id = self.core_surface.id;
 
     // The press handler took mouse capture; release it and clear the mask
     // before the modal menu loop, otherwise the pending button-up is
@@ -2795,6 +2885,9 @@ fn showContextMenu(self: *Surface, lparam: isize) void {
     const CTX_SPLIT_RIGHT: usize = 4;
     const CTX_SPLIT_DOWN: usize = 5;
     const CTX_RESET: usize = 6;
+    const CTX_CLOSE_SPLIT: usize = 7;
+    const CTX_SPLIT_LEFT: usize = 8;
+    const CTX_SPLIT_UP: usize = 9;
 
     const menu = w32.CreatePopupMenu() orelse return;
     defer _ = w32.DestroyMenu(menu);
@@ -2806,7 +2899,11 @@ fn showContextMenu(self: *Surface, lparam: isize) void {
     _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_SELECT_ALL, std.unicode.utf8ToUtf16LeStringLiteral("Select All"));
     _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
     _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_SPLIT_RIGHT, std.unicode.utf8ToUtf16LeStringLiteral("Split Right"));
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_SPLIT_LEFT, std.unicode.utf8ToUtf16LeStringLiteral("Split Left"));
     _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_SPLIT_DOWN, std.unicode.utf8ToUtf16LeStringLiteral("Split Down"));
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_SPLIT_UP, std.unicode.utf8ToUtf16LeStringLiteral("Split Up"));
+    _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
+    _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_CLOSE_SPLIT, std.unicode.utf8ToUtf16LeStringLiteral("Close Split"));
     _ = w32.AppendMenuW(menu, w32.MF_SEPARATOR, 0, null);
     _ = w32.AppendMenuW(menu, w32.MF_STRING, CTX_RESET, std.unicode.utf8ToUtf16LeStringLiteral("Reset Terminal"));
 
@@ -2830,12 +2927,17 @@ fn showContextMenu(self: *Surface, lparam: isize) void {
         CTX_PASTE => .paste_from_clipboard,
         CTX_SELECT_ALL => .select_all,
         CTX_SPLIT_RIGHT => .{ .new_split = .right },
+        CTX_SPLIT_LEFT => .{ .new_split = .left },
         CTX_SPLIT_DOWN => .{ .new_split = .down },
+        CTX_SPLIT_UP => .{ .new_split = .up },
+        CTX_CLOSE_SPLIT => .close_surface,
         CTX_RESET => .reset,
         else => null,
     };
     if (binding) |b| {
-        _ = self.core_surface.performBindingAction(b) catch |err| {
+        // TrackPopupMenuEx pumps the app's queue, including child exits.
+        const surface = app.findReadySurface(surface_id) orelse return;
+        _ = surface.core_surface.performBindingAction(b) catch |err| {
             log.err("context menu action failed err={}", .{err});
         };
     }
@@ -3524,8 +3626,18 @@ pub fn signalFrameDrawn(self: *Surface, width: u32, height: u32) void {
 }
 
 /// Handle WM_SETFOCUS / WM_KILLFOCUS.
+fn withdrawDesktopNotifications(self: *Surface) void {
+    if (!self.has_desktop_notifications) return;
+    self.has_desktop_notifications = false;
+    self.app.clearDesktopNotifications(self.core_surface.id);
+}
+
 pub fn handleFocus(self: *Surface, focused: bool) void {
     if (!self.core_surface_ready) return;
+    if (focused) {
+        self.clearBell();
+        self.withdrawDesktopNotifications();
+    }
     // Drop any buffered high surrogate and pending dead key on focus loss —
     // otherwise they would combine with the next character when focus returns.
     if (!focused) {

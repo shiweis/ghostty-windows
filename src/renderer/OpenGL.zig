@@ -51,8 +51,17 @@ windows_presentation: if (is_wgl) ?WindowsPresentation else void = if (is_wgl) n
 windows_composition_unavailable: bool = false,
 windows_hwnd: if (is_wgl) ?std.os.windows.HWND else void = if (is_wgl) null else {},
 windows_surface: if (is_wgl) ?*apprt.Surface else void = if (is_wgl) null else {},
-
+presented_overlay: if (is_wgl) u32 else void = if (is_wgl) 0 else {},
+presented_bell_width: if (is_wgl) u32 else void = if (is_wgl) 0 else {},
 context_loaded: bool = false,
+
+pub fn presentationChanged(self: *const OpenGL) bool {
+    return if (comptime is_wgl)
+        self.windows_surface.?.split_overlay.load(.monotonic) != self.presented_overlay or
+            self.windows_surface.?.bell.border_width.load(.monotonic) != self.presented_bell_width
+    else
+        false;
+}
 
 pub fn init(
     alloc: Allocator,
@@ -196,6 +205,13 @@ fn prepareContext(getProcAddress: anytype) !void {
     const minor = gl.glad.versionMinor(@intCast(version));
     errdefer gl.glad.unload();
     log.info("loaded OpenGL {}.{}", .{ major, minor });
+    if (comptime is_wgl) {
+        const get_string = gl.glad.context.GetString.?;
+        const renderer = get_string(gl.c.GL_RENDERER);
+        const driver = get_string(gl.c.GL_VERSION);
+        if (renderer != null and driver != null)
+            log.info("WGL renderer={s} driver={s}", .{ std.mem.span(renderer), std.mem.span(driver) });
+    }
 
     // Need to check version before trying to enable it
     if (major < MIN_VERSION_MAJOR or
@@ -363,12 +379,16 @@ pub fn present(
         }
 
         const presentation = &self.windows_presentation.?;
-        try presentation.present(target, self.blending);
+        const overlay = surface.split_overlay.load(.monotonic);
+        const border = surface.bell.border_width.load(.monotonic);
+        try presentation.present(target, self.blending, @bitCast(overlay), border);
         if (!presentation.compositionSupported()) {
             const hdc = w32.wglGetCurrentDC() orelse return error.NoCurrentContext;
             if (w32.SwapBuffers(hdc) == 0) return error.SwapBuffersFailed;
         }
         surface.signalFrameDrawn(@intCast(target.width), @intCast(target.height));
+        self.presented_overlay = overlay;
+        self.presented_bell_width = border;
         return;
     }
     // We only export DMABUFs when the apprt can present them.

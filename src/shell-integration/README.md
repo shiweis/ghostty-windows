@@ -113,6 +113,12 @@ the command-start marker before accepting the line. The script does nothing
 when `GHOSTTY_SHELL_FEATURES` is absent; sourcing it in unrelated shells is
 not a substitute for Ghostty's integration setup.
 
+The `path` feature appends `GHOSTTY_BIN_DIR` to the process PATH once. When
+`ssh-env` or `ssh-terminfo` is enabled, the integration wraps `ssh` with
+`ghostty +ssh` and passes the configured forwarding and terminfo options.
+`ghostty-ssh.ps1` waits for the Windows GUI-subsystem executable so the
+terminal and PowerShell pipelines receive the SSH session's output and exit code.
+
 Construct ESC with `[char]27`: Windows PowerShell 5.1 treats a backtick-e as
 literal `e`, unlike PowerShell 7. Test the actual emitted control bytes under
 both engines from the repository root:

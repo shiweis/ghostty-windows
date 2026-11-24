@@ -17,7 +17,9 @@ foreach ($name in $binaries) {
 }
 $required = @(
     'share\terminfo\ghostty.terminfo', 'share\licenses\conpty\LICENSE.txt',
-    'share\ghostty\shell-integration\powershell\ghostty-shell-integration.ps1'
+    'share\ghostty\shell-integration\powershell\ghostty-shell-integration.ps1',
+    'share\ghostty\shell-integration\powershell\ghostty-ssh.ps1',
+    'share\ghostty\shell-integration\powershell\ssh.ps1'
 )
 if ($Portable) { $required += @('README.txt', 'LICENSE') }
 foreach ($relativePath in $required) {

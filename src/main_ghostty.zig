@@ -66,6 +66,7 @@ pub fn main(minimal: std.process.Init.Minimal) !MainReturn {
 
     // Execute our action if we have one
     if (global.action()) |action| {
+        if (comptime builtin.os.tag == .windows) attachParentConsole();
         std.log.info("executing CLI action={}", .{action});
         std.process.exit(action.run(alloc) catch |err| err: {
             std.log.err("CLI action failed error={}", .{err});
@@ -112,6 +113,28 @@ pub fn main(minimal: std.process.Init.Minimal) !MainReturn {
 
     // Run the GUI event loop
     try app_runtime.run();
+}
+
+/// A Windows GUI-subsystem executable starts detached. CLI actions such as
+/// +ssh need the invoking terminal, including any pipes or files the shell
+/// supplied for individual streams.
+fn attachParentConsole() void {
+    const kernel32 = struct {
+        extern "kernel32" fn AttachConsole(process_id: u32) callconv(.winapi) i32;
+        extern "kernel32" fn GetStdHandle(id: i32) callconv(.winapi) ?*anyopaque;
+        extern "kernel32" fn SetStdHandle(id: i32, handle: *anyopaque) callconv(.winapi) i32;
+        extern "kernel32" fn GetFileType(handle: *anyopaque) callconv(.winapi) u32;
+    };
+    const streams = [_]i32{ -10, -11, -12 }; // STD_INPUT/OUTPUT/ERROR_HANDLE
+    var inherited: [streams.len]?*anyopaque = @splat(null);
+    for (streams, &inherited) |id, *saved| {
+        const handle = kernel32.GetStdHandle(id) orelse continue;
+        if (kernel32.GetFileType(handle) != 0) saved.* = handle;
+    }
+    if (kernel32.AttachConsole(std.math.maxInt(u32)) == 0) return;
+    for (streams, inherited) |id, handle| {
+        if (handle) |h| _ = kernel32.SetStdHandle(id, h);
+    }
 }
 
 // The function std.log will call.

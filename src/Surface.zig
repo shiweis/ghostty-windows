@@ -334,6 +334,8 @@ const DerivedConfig = struct {
     /// For docs for these, see the associated config they are derived from.
     original_font_size: f32,
     keybind: configpkg.Keybinds,
+    bell: if (native_win32) @import("apprt/win32/Bell.zig").Settings else void,
+    palette_entries: if (native_win32) []const input.Command else void,
     abnormal_command_exit_runtime_ms: u32,
     clipboard_read: configpkg.ClipboardAccess,
     clipboard_write: configpkg.ClipboardAccess,
@@ -386,6 +388,9 @@ const DerivedConfig = struct {
         highlight: input.Link.Highlight,
     };
 
+    /// The Win32 palette reads the same effective surface configuration as keybindings.
+    const native_win32 = @import("build_config.zig").app_runtime == .win32;
+
     pub fn init(alloc_gpa: Allocator, config: *const configpkg.Config) !DerivedConfig {
         var arena = ArenaAllocator.init(alloc_gpa);
         errdefer arena.deinit();
@@ -415,6 +420,12 @@ const DerivedConfig = struct {
         return .{
             .original_font_size = config.@"font-size",
             .keybind = try config.keybind.clone(alloc),
+            .bell = if (comptime native_win32) try @import("apprt/win32/Bell.zig").Settings.init(alloc, config) else {},
+            .palette_entries = if (comptime native_win32) entries: {
+                const entries = try alloc.dupe(input.Command, config.@"command-palette-entry".value.items);
+                for (entries) |*command| command.* = try command.clone(alloc);
+                break :entries entries;
+            } else {},
             .abnormal_command_exit_runtime_ms = config.@"abnormal-command-exit-runtime",
             .clipboard_read = config.@"clipboard-read",
             .clipboard_write = config.@"clipboard-write",
@@ -1212,7 +1223,7 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 return;
             }
 
-            _ = try self.startClipboardRequest(.standard, .{ .osc_52_read = clipboard });
+            _ = try self.startClipboardRequest(clipboard, .{ .osc_52_read = clipboard });
         },
 
         .kitty_clipboard_read => |req| try self.kittyClipboardRead(req),
@@ -2510,8 +2521,10 @@ fn clipboardWrite(self: *const Surface, data: []const u8, loc: apprt.Clipboard) 
     // characters outside the base64 alphabet is discarded entirely
     // (never partially decoded), while a missing-padding tail is
     // tolerated since OSC 52 has no way to report errors.
-    var buf = try self.alloc.allocSentinel(u8, simd.base64.maxLen(data), 0);
-    defer self.alloc.free(buf);
+    // A native clipboard permission dialog may close this surface.
+    const alloc = self.alloc;
+    var buf = try alloc.allocSentinel(u8, simd.base64.maxLen(data), 0);
+    defer alloc.free(buf);
     const decoded = simd.base64.decodeStrict(data, buf, .optional) catch {
         log.info("application sent invalid base64 data for OSC 52", .{});
         return;

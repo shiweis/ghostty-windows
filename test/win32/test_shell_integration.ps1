@@ -95,7 +95,7 @@ try {
         [char]7 + [char]27 + ']52;c;SGVsbG8=' + [char]7 + [char]0x7f + [char]0x9b
     # DEL and C1 controls are valid Windows filename characters. Cover the
     # title's leaf as well as the drive-qualified working directory.
-    $directoryName = 'ghostty-shell-' + [guid]::NewGuid().ToString('N') + '-' +
+    $directoryName = 'ghostty shell #100%-' + [guid]::NewGuid().ToString('N') + '-' +
         $unicodeName + [char]0x7f + [char]0x9b
     $hostileRoot = Join-Path $env:TEMP $directoryName
     $originalLocation = Get-Location
@@ -103,7 +103,7 @@ try {
         New-Item -ItemType Directory -Path $hostileRoot | Out-Null
         New-PSDrive -Name $driveName -PSProvider FileSystem -Root $hostileRoot | Out-Null
         Set-Location -LiteralPath ($driveName + ':\')
-        $hostileCwd = (Get-Location).Path -replace '\\', '/' -replace '\p{Cc}', ''
+        $hostileCwd = [Uri]::EscapeDataString(((Get-Location).ProviderPath -replace '\\', '/' -replace '\p{Cc}', '')).Replace('%2F', '/').Replace('%3A', ':')
         $hostileLeaf = $directoryName -replace '\p{Cc}', ''
         $GhosttyFeatures = @('title')
         $Script:__ghostty_prompt_state = 'initial'
@@ -123,7 +123,7 @@ try {
 
 $esc = [string][char]27
 $bel = [string][char]7
-$cwd = (Get-Location).Path -replace '\\', '/'
+$cwd = [Uri]::EscapeDataString(((Get-Location).ProviderPath -replace '\\', '/')).Replace('%2F', '/').Replace('%3A', ':')
 $hostname = [System.Net.Dns]::GetHostName()
 $leaf = Split-Path -Leaf (Get-Location)
 Assert-True ($firstPrompt -eq 'ghostty-test> ' -and $secondPrompt -eq $firstPrompt) 'original prompt text is preserved'
@@ -146,4 +146,86 @@ Assert-True (-not $hostileOutput.Contains($esc + ']52;')) 'provider location can
 Assert-True ($hostileOutput.Contains($esc + "]7;file://$hostname/$hostileCwd" + $bel)) 'provider directory reports strip C0 and C1 controls'
 Assert-True ($hostileOutput.Contains($esc + "]2;$hostileLeaf" + $bel)) 'directory titles strip DEL and C1 controls'
 Assert-True ($hostileOutput.Contains($unicodeName)) 'directory reports preserve Unicode names'
+
+# Compile a native argv recorder before the app build. Comparing its direct
+# and wrapped invocations also checks each engine's native argument passing.
+$scratch = Join-Path $env:TEMP ('ghostty shell features ' + [guid]::NewGuid().ToString('N'))
+$originalPath = $env:PATH
+$originalBin = $env:GHOSTTY_BIN_DIR
+$originalRecord = $env:GHOSTTY_TEST_SSH_RECORD
+try {
+    New-Item -ItemType Directory -Path $scratch | Out-Null
+    $source = Join-Path $scratch 'Arguments.cs'
+    $probe = Join-Path $scratch 'ghostty.exe'
+    $reference = Join-Path $scratch 'ssh-reference.exe'
+    [IO.File]::WriteAllText($source, @'
+using System;
+using System.IO;
+using System.Text;
+class Arguments {
+    static int Main(string[] args) {
+        var path = Environment.GetEnvironmentVariable("GHOSTTY_TEST_SSH_RECORD");
+        File.WriteAllLines(path, Array.ConvertAll(args, a =>
+            Convert.ToBase64String(Encoding.UTF8.GetBytes(a))));
+        if (Array.IndexOf(args, "read-stdin") >= 0)
+            Console.WriteLine(Console.ReadLine());
+        return 37;
+    }
+}
+'@)
+    $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
+    & $csc /nologo /target:winexe "/out:$probe" $source
+    if ($LASTEXITCODE -ne 0) { throw 'Compiling the GUI-subsystem Ghostty stand-in failed.' }
+    & $csc /nologo /target:exe "/out:$reference" $source
+    if ($LASTEXITCODE -ne 0) { throw 'Compiling the native argument recorder failed.' }
+    $env:GHOSTTY_BIN_DIR = $scratch
+    $env:GHOSTTY_TEST_SSH_RECORD = Join-Path $scratch 'argv'
+    $nativeArgs = @('-o', 'UserKnownHostsFile=C:\known hosts', 'test-host',
+        'echo "remote command"', 'path with spaces\', 'a\"b', '|&$', [string][char]0x6d4b, '')
+    & $reference @nativeArgs
+    $nativeRecord = [IO.File]::ReadAllLines($env:GHOSTTY_TEST_SSH_RECORD)
+
+    foreach ($features in 'title', 'ssh-env', 'ssh-terminfo,path', 'ssh-env,ssh-terminfo,path') {
+        & {
+            $env:PATH = $originalPath
+            $env:GHOSTTY_SHELL_FEATURES = $features
+            function ssh { 'original ssh' }
+            . $IntegrationPath
+            . $IntegrationPath
+            if ($GhosttyFeatures -contains 'path') {
+                Assert-True ($env:PATH -ceq ($originalPath + ';' + $scratch)) "$features appends the binary directory once"
+                $env:PATH = $originalPath + ';' + $scratch.ToUpperInvariant() + '\'
+                $equivalent = $env:PATH
+                . $IntegrationPath
+                Assert-True ($env:PATH -ceq $equivalent) "$features recognizes an equivalent Windows PATH entry"
+            } else {
+                Assert-True ($env:PATH -ceq $originalPath) "$features leaves PATH alone"
+            }
+
+            if ($features -eq 'title') {
+                Assert-True ((ssh) -eq 'original ssh') 'disabling both SSH features preserves existing ssh resolution'
+                return
+            }
+            ssh @nativeArgs
+            $sshSucceeded = $?
+            Assert-True (-not $sshSucceeded) "$features preserves the native SSH failure status"
+            Assert-True ($LASTEXITCODE -eq 37) "$features preserves the native SSH exit status"
+            $options = @('+ssh')
+            if ($GhosttyFeatures -notcontains 'ssh-env') { $options += '--forward-env=false' }
+            if ($GhosttyFeatures -notcontains 'ssh-terminfo') { $options += '--terminfo=false' }
+            $options += '--'
+            $expected = @($options | ForEach-Object { [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($_)) })
+            $actual = [IO.File]::ReadAllLines($env:GHOSTTY_TEST_SSH_RECORD)
+            Assert-True (($actual -join '|') -ceq (($expected + $nativeRecord) -join '|')) "$features forwards native SSH arguments and the matching feature flags"
+            Assert-True (('through stdin' | ssh read-stdin) -ceq 'through stdin') "$features preserves pipeline input"
+        }
+    }
+} finally {
+    $env:PATH = $originalPath
+    $env:GHOSTTY_BIN_DIR = $originalBin
+    $env:GHOSTTY_SHELL_FEATURES = $originalFeatures
+    $env:GHOSTTY_TEST_SSH_RECORD = $originalRecord
+    $global:LASTEXITCODE = $originalExitCode
+    if (Test-Path -LiteralPath $scratch) { Remove-Item -LiteralPath $scratch -Recurse -Force }
+}
 Write-Output "PowerShell $($PSVersionTable.PSVersion) shell integration checks passed"

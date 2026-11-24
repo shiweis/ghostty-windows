@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const global = @import("../global.zig");
 const ShellEscapeWriter = @import("shell.zig").ShellEscapeWriter;
@@ -23,16 +24,14 @@ pub const Error = error{NoEditorConfigured};
 pub fn getConfigEditCommand(alloc: std.mem.Allocator, path: []const u8, options: Options) (Error || std.Io.Writer.Error || std.mem.Allocator.Error)![:0]const u8 {
     const editor: []const u8 = editor: {
         // VISUAL vs. EDITOR: https://unix.stackexchange.com/questions/4859/visual-vs-editor-what-s-the-difference
-        v: {
-            if (global.environ().containsUnempty(alloc, "VISUAL") catch break :v) {
-                break :editor global.environ().getAlloc(alloc, "VISUAL") catch break :v;
-            }
-        }
-
-        e: {
-            if (global.environ().containsUnempty(alloc, "EDITOR") catch break :e) {
-                break :editor global.environ().getAlloc(alloc, "EDITOR") catch break :e;
-            }
+        for ([_][]const u8{ "VISUAL", "EDITOR" }) |name| {
+            const value = global.environ().getAlloc(alloc, name) catch continue;
+            const editor_name = if (comptime builtin.os.tag == .windows)
+                std.mem.trim(u8, value, " \t")
+            else
+                value;
+            if (editor_name.len != 0) break :editor value;
+            alloc.free(value);
         }
 
         switch (options.default_editor) {
@@ -51,6 +50,13 @@ pub fn getConfigEditCommand(alloc: std.mem.Allocator, path: []const u8, options:
         }
     };
     defer alloc.free(editor);
+
+    if (comptime builtin.os.tag == .windows) {
+        // A Windows config file path cannot contain a double quote and ends
+        // with a filename. Keep the user's editor arguments in their native
+        // quoting syntax and pass the config path as one final argument.
+        return alloc.printSentinel("{s} \"{s}\"", .{ std.mem.trim(u8, editor, " \t"), path }, 0);
+    }
 
     var buffer: std.Io.Writer.Allocating = .init(alloc);
     defer buffer.deinit();

@@ -8,6 +8,7 @@ pub fn build(b: *std.Build) !void {
     const freetype = b.option(bool, "freetype", "Use Freetype") orelse false;
     const backend_opengl3 = b.option(bool, "backend-opengl3", "OpenGL3 backend") orelse false;
     const backend_metal = b.option(bool, "backend-metal", "Metal backend") orelse false;
+    const backend_win32 = b.option(bool, "backend-win32", "Win32 backend") orelse false;
     const backend_osx = b.option(bool, "backend-osx", "OSX backend") orelse false;
 
     // Build options
@@ -155,6 +156,12 @@ pub fn build(b: *std.Build) !void {
                 "",
                 .{ .include_extensions = &.{"imgui_impl_osx.h"} },
             );
+        }
+        if (backend_win32) {
+            lib.root_module.addCSourceFile(.{
+                .file = upstream.path("backends/imgui_impl_win32.cpp"),
+                .flags = all_flags.items,
+            });
         }
         if (backend_opengl3) {
             lib.root_module.addCSourceFiles(.{

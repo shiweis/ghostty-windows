@@ -18,11 +18,20 @@ pub fn isLocal(hostname: []const u8) LocalHostnameValidationError!bool {
     switch (builtin.target.os.tag) {
         .windows => {
             const windows = @import("windows.zig");
-            var buf: [256:0]u8 = undefined;
-            var nSize: windows.DWORD = buf.len;
-            if (windows.exp.kernel32.GetComputerNameA(&buf, &nSize) == windows.FALSE) return false;
-            const ourHostname = buf[0..nSize];
-            return std.mem.eql(u8, hostname, ourHostname);
+            if (std.ascii.eqlIgnoreCase("localhost", hostname)) return true;
+            // GetHostName (used by PowerShell) can return a DNS name longer
+            // than the legacy NetBIOS name. Compare local aliases directly,
+            // without doing DNS resolution on terminal-provided hostnames.
+            inline for (.{ .dns_hostname, .dns_fully_qualified, .netbios }) |kind| {
+                var wide: [256:0]u16 = undefined;
+                var size: windows.DWORD = wide.len;
+                if (windows.exp.kernel32.GetComputerNameExW(kind, &wide, &size) != windows.FALSE) {
+                    var utf8: [3 * wide.len]u8 = undefined;
+                    const len = std.unicode.utf16LeToUtf8(&utf8, wide[0..size]) catch return error.Unexpected;
+                    if (std.ascii.eqlIgnoreCase(hostname, utf8[0..len])) return true;
+                }
+            }
+            return false;
         },
         else => {
             var buf: [posix.HOST_NAME_MAX]u8 = undefined;

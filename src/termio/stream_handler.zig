@@ -1547,11 +1547,6 @@ pub const StreamHandler = struct {
             return;
         }
 
-        if (builtin.target.os.tag == .windows) {
-            log.warn("reportPwd unimplemented on windows", .{});
-            return;
-        }
-
         // Attempt to parse this file-style URI using options appropriate
         // for this OSC 7 context (e.g. kitty-shell-cwd expects the full,
         // unencoded path).
@@ -1571,16 +1566,19 @@ pub const StreamHandler = struct {
         }
 
         var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-        const host = osc7Host(uri, &host_buffer) catch |err| switch (err) {
-            error.UriMissingHost => {
-                log.warn("OSC 7 uri must contain a hostname: {}", .{err});
-                return;
-            },
-            error.NameTooLong => {
-                log.warn("failed to get full hostname for OSC 7 validation: {}", .{err});
-                return;
-            },
-        };
+        const host = if (builtin.target.os.tag == .windows and uri.host == null)
+            "localhost" // file:///C:/path is the standard local Windows file URI.
+        else
+            osc7Host(uri, &host_buffer) catch |err| switch (err) {
+                error.UriMissingHost => {
+                    log.warn("OSC 7 uri must contain a hostname: {}", .{err});
+                    return;
+                },
+                error.NameTooLong => {
+                    log.warn("failed to get full hostname for OSC 7 validation: {}", .{err});
+                    return;
+                },
+            };
 
         // OSC 7 is a little sketchy because anyone can send any value from
         // any host (such an SSH session). The best practice terminals follow
@@ -1604,7 +1602,11 @@ pub const StreamHandler = struct {
         var stack_alloc_buf: [1024]u8 = undefined;
         var stack_alloc: std.heap.BufferFirstAllocator = .init(&stack_alloc_buf, arena_alloc.allocator());
         defer arena_alloc.deinit();
-        const path = try uri.path.toRawMaybeAlloc(stack_alloc.allocator());
+        const raw_path = try uri.path.toRawMaybeAlloc(stack_alloc.allocator());
+        const path = if (builtin.target.os.tag == .windows)
+            (try osc7WindowsPath(stack_alloc.allocator(), raw_path)) orelse return
+        else
+            raw_path;
 
         log.debug("terminal pwd: {s}", .{path});
         try self.terminal.setPwd(path);
@@ -2047,6 +2049,33 @@ test "app stream: cancelled or aborted APC commands have no effects" {
                 }
             }
         }
+    }
+}
+
+/// Convert a local drive's file URI path to a native child-process directory.
+/// A remote terminal must not be able to make a future child open a UNC share
+/// or a Win32 device path by embedding it under a local URI authority.
+fn osc7WindowsPath(alloc: std.mem.Allocator, raw: []const u8) !?[]const u8 {
+    if (raw.len < 4 or raw[0] != '/' or !std.ascii.isAlphabetic(raw[1]) or
+        raw[2] != ':' or raw[3] != '/') return null;
+    if (!std.unicode.utf8ValidateSlice(raw)) return null;
+    for (raw) |c| if (std.ascii.isControl(c)) return null;
+    const path = try alloc.dupe(u8, raw[1..]);
+    std.mem.replaceScalar(u8, path, '/', '\\');
+    return path;
+}
+
+test "window lifecycle parity OSC 7 maps local Windows drive paths" {
+    const testing = std.testing;
+    const path = (try osc7WindowsPath(testing.allocator, "/D:/test #1/東京")).?;
+    defer testing.allocator.free(path);
+    try testing.expectEqualStrings("D:\\test #1\\東京", path);
+    for ([_][]const u8{ "/D:relative", "/tmp", "//server/share", "/\\\\?\\C:\\dir", "/C:/a\x00b" }) |raw| {
+        try testing.expectEqual(null, try osc7WindowsPath(testing.allocator, raw));
+    }
+    if (builtin.target.os.tag == .windows) {
+        try testing.expect(try internal_os.hostname.isLocal("LOCALHOST"));
+        try testing.expect(!try internal_os.hostname.isLocal("remote.invalid"));
     }
 }
 

@@ -8,8 +8,6 @@
 //! to ensure all our various types and logic remain in sync.
 
 const std = @import("std");
-const builtin = @import("builtin");
-const build_options = @import("terminal_options");
 const testing = std.testing;
 const ComptimeIntSet = @import("../datastruct/main.zig").ComptimeIntSet;
 const checkGhosttyVtHMacroExists = @import("../lib/enum.zig").checkGhosttyVtHMacroExists;
@@ -420,13 +418,7 @@ const entries: []const ModeEntry = &.{
     // paste sends an unsolicited OSC 5522 targets listing with a
     // one-time password instead of pasting the text.
     // See https://sw.kovidgoyal.net/kitty/clipboard/
-    .{
-        .name = "kitty_paste_events",
-        .value = 5522,
-        // macOS, GTK, and libghostty-vt can serve the follow-up Kitty
-        // clipboard read. The Win32 clipboard backend is text-only.
-        .disabled = build_options.artifact != .lib and builtin.target.os.tag == .windows,
-    },
+    .{ .name = "kitty_paste_events", .value = 5522 },
     .{ .name = "win32_input", .value = 9001 },
 };
 

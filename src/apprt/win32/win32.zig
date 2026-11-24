@@ -176,6 +176,8 @@ pub const XBUTTON2: usize = 0x0002; // "Forward"
 pub const WM_MOUSEWHEEL: u32 = 0x020A;
 pub const WM_MOUSEHWHEEL: u32 = 0x020E;
 pub const WM_SETCURSOR: u32 = 0x0020;
+pub const WM_CANCELMODE: u32 = 0x001F;
+pub const WM_CAPTURECHANGED: u32 = 0x0215;
 pub const WM_DPICHANGED: u32 = 0x02E0;
 
 // WM_SETCURSOR hit-test values
@@ -493,6 +495,17 @@ pub extern "user32" fn AdjustWindowRectEx(
 pub extern "user32" fn GetDpiForWindow(
     hWnd: HWND,
 ) callconv(.winapi) u32;
+
+pub extern "user32" fn GetCapture() callconv(.winapi) ?HWND;
+pub extern "user32" fn WindowFromPoint(point: POINT) callconv(.winapi) ?HWND;
+
+pub const MDT_EFFECTIVE_DPI = 0;
+pub extern "shcore" fn GetDpiForMonitor(
+    monitor: HMONITOR,
+    dpi_type: c_int,
+    dpi_x: *u32,
+    dpi_y: *u32,
+) callconv(.winapi) HRESULT;
 
 pub extern "user32" fn MessageBeep(
     uType: u32,
@@ -845,6 +858,20 @@ pub extern "kernel32" fn CompareStringOrdinal(
 pub const SS_CENTER: u32 = 0x0001;
 pub const SS_RIGHT: u32 = 0x0002;
 pub const SS_CENTERIMAGE: u32 = 0x0200;
+pub const SS_NOPREFIX: u32 = 0x0080;
+
+pub const CHOOSECOLORW = extern struct {
+    size: u32 = @sizeOf(CHOOSECOLORW),
+    owner: ?HWND,
+    instance: ?HINSTANCE = null,
+    result: u32,
+    custom_colors: *[16]u32,
+    flags: u32 = 0x1 | 0x2, // CC_RGBINIT | CC_FULLOPEN
+    data: isize = 0,
+    hook: ?*anyopaque = null,
+    template: ?[*:0]const u16 = null,
+};
+pub extern "comdlg32" fn ChooseColorW(options: *CHOOSECOLORW) callconv(.winapi) i32;
 
 // Edit control notification codes (high word of wParam in WM_COMMAND)
 pub const EN_CHANGE: u16 = 0x0300;
@@ -935,6 +962,7 @@ pub const MB_OKCANCEL: u32 = 0x00000001;
 pub const MB_YESNO: u32 = 0x00000004;
 pub const MB_ICONWARNING: u32 = 0x00000030;
 pub const MB_DEFBUTTON2: u32 = 0x00000100;
+pub const MB_TASKMODAL: u32 = 0x00002000;
 pub const IDOK: i32 = 1;
 pub const IDCANCEL: i32 = 2;
 pub const IDYES: i32 = 6;
@@ -1240,6 +1268,7 @@ pub const DT_VCENTER: u32 = 4;
 pub const DT_SINGLELINE: u32 = 32;
 pub const DT_END_ELLIPSIS: u32 = 0x8000;
 pub const DT_NOPREFIX: u32 = 0x800;
+pub const DT_CALCRECT: u32 = 0x400;
 
 pub extern "gdi32" fn ChoosePixelFormat(
     hdc: HDC,
@@ -1384,6 +1413,7 @@ pub extern "kernel32" fn QueryPerformanceFrequency(
 // Thread input and foreground focus API
 // -----------------------------------------------------------------------
 
+pub const WM_ACTIVATEAPP: u32 = 0x001C;
 pub const WM_ACTIVATE: u32 = 0x0006;
 pub const WA_INACTIVE: u16 = 0;
 

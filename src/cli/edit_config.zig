@@ -83,19 +83,6 @@ fn runInner(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
     const path = try configpkg.preferredDefaultFilePath(alloc);
     defer alloc.free(path);
 
-    // We don't currently support Windows because we use the exec syscall.
-    if (comptime builtin.target.os.tag == .windows) {
-        try stderr.print(
-            \\The `ghostty +edit-config` command is not supported on Windows.
-            \\Please edit the configuration file manually at the following path:
-            \\
-            \\
-        ,
-            .{},
-        );
-        return 1;
-    }
-
     const command = internal_os.getConfigEditCommand(alloc, path, .{ .default_editor = .failure }) catch |err| {
         switch (err) {
             error.NoEditorConfigured => {
@@ -129,6 +116,31 @@ fn runInner(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
         }
     };
     defer alloc.free(command);
+
+    if (comptime builtin.os.tag == .windows) {
+        // Windows has no execve. Wait for the native editor on the calling
+        // console so interactive editors and their exit codes work normally.
+        const wide = try std.unicode.wtf8ToWtf16LeAllocZ(alloc, command);
+        defer alloc.free(wide);
+        var it = try std.process.Args.Iterator.Windows.init(alloc, wide);
+        defer it.deinit();
+        var editor_args: std.ArrayList([]const u8) = .empty;
+        defer editor_args.deinit(alloc);
+        while (it.next()) |arg| try editor_args.append(alloc, arg);
+        var child = std.process.spawn(global.io(), .{
+            .argv = editor_args.items,
+            .stdin = .inherit,
+            .stdout = .inherit,
+            .stderr = .inherit,
+        }) catch |err| {
+            try stderr.print("Unable to start the editor ({t}).\nCommand: {s}\n", .{ err, command });
+            return 1;
+        };
+        return switch (try child.wait(global.io())) {
+            .exited => |code| code,
+            else => 1,
+        };
+    }
 
     // Run/replace process (using execve)
     const argv = [_:null]?[*:0]const u8{

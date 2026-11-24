@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const w32 = @import("win32.zig");
 const terminal = @import("../../terminal/main.zig");
 const Surface = @import("Surface.zig");
+const Config = @import("../../config.zig").Config;
 const testing = std.testing;
 
 const log = std.log.scoped(.win32_scrollbar);
@@ -165,6 +166,7 @@ pub const Scrollbar = struct {
 
     /// Current mode; re-read on WM_SETTINGCHANGE.
     mode: Mode = .overlay,
+    policy: Config.Scrollbar = .system,
 
     /// Cached theme colors. Updated via setTheme.
     bg: terminal.color.RGB = .{ .r = 0, .g = 0, .b = 0 },
@@ -199,6 +201,9 @@ pub const Scrollbar = struct {
             .surface = surface,
             .owner = owner,
             .hwnd = undefined,
+            .scale = surface.scale,
+            .mode = readMode(),
+            .policy = surface.app.config.scrollbar,
         };
 
         // WS_EX_LAYERED — DWM-composited above OpenGL.
@@ -229,10 +234,6 @@ pub const Scrollbar = struct {
 
         self.hwnd = hwnd;
 
-        // Read the OS mode before the first repositionAndResize so that
-        // the correct width is used from the very first layout pass.
-        self.mode = readMode();
-
         // Position and size the popup against the owner's current client
         // area. Without this, the popup stays at the (0,0,1,1) placeholder
         // until the first WM_SIZE fires on the owner — making the scrollbar
@@ -256,6 +257,7 @@ pub const Scrollbar = struct {
             self.state.len != state.len;
         self.state = state;
         self.first_update = false;
+        if (self.policy == .never) return;
 
         if (was_first) {
             switch (self.mode) {
@@ -297,6 +299,7 @@ pub const Scrollbar = struct {
     /// Reposition and resize the popup to stay glued to the surface.
     /// Returns the new scrollbar width.
     pub fn repositionAndResize(self: *Scrollbar) i32 {
+        if (self.policy == .never) return 0;
         var rect: w32.RECT = undefined;
         if (w32.GetClientRect(self.owner, &rect) == 0) return 0;
 
@@ -314,7 +317,7 @@ pub const Scrollbar = struct {
             top_right.y,
             width,
             client_h,
-            w32.SWP_NOACTIVATE | w32.SWP_NOZORDER | w32.SWP_SHOWWINDOW,
+            w32.SWP_NOACTIVATE | w32.SWP_NOZORDER | (if (w32.IsWindowVisible_(self.owner) != 0) w32.SWP_SHOWWINDOW else w32.SWP_HIDEWINDOW),
         );
 
         self.repaint();
@@ -329,7 +332,7 @@ pub const Scrollbar = struct {
 
     /// Show or hide the popup when the owner surface is shown/hidden.
     pub fn setOwnerVisible(self: *Scrollbar, visible: bool) void {
-        _ = w32.ShowWindow(self.hwnd, if (visible) w32.SW_SHOWNOACTIVATE else w32.SW_HIDE);
+        _ = w32.ShowWindow(self.hwnd, if (visible and self.policy == .system) w32.SW_SHOWNOACTIVATE else w32.SW_HIDE);
     }
 
     /// Update cached theme colors and repaint if they changed.
@@ -355,6 +358,7 @@ pub const Scrollbar = struct {
     }
 
     fn repaint(self: *Scrollbar) void {
+        if (self.policy == .never) return;
         var client: w32.RECT = undefined;
         if (w32.GetClientRect(self.hwnd, &client) == 0) return;
         const w = client.right - client.left;
@@ -540,32 +544,36 @@ pub const Scrollbar = struct {
         }
     }
 
-    /// Called on WM_SETTINGCHANGE. Returns true if a mode change
-    /// requires the terminal grid to be re-flowed.
-    pub fn onSettingsChange(self: *Scrollbar) bool {
-        const new_mode = readMode();
-        if (new_mode == self.mode) return false;
+    pub fn configure(self: *Scrollbar, policy: Config.Scrollbar) void {
+        self.applyPolicy(policy, if (policy == .system) readMode() else self.mode);
+    }
 
+    fn applyPolicy(self: *Scrollbar, policy: Config.Scrollbar, new_mode: Mode) void {
+        if (policy == self.policy and new_mode == self.mode) return;
+        self.policy = policy;
         self.mode = new_mode;
+        _ = w32.KillTimer(self.hwnd, FADE_TIMER_ID);
+        _ = w32.KillTimer(self.hwnd, IDLE_TIMER_ID);
+        if (self.dragging and w32.GetCapture() == self.hwnd) _ = w32.ReleaseCapture();
+        self.dragging = false;
+        self.hover = false;
 
-        // Apply the initial state for the new mode.
-        switch (new_mode) {
-            .overlay => {
-                self.visibility = .hidden;
-                self.fade = 0;
-                self.setTransparent();
-                self.repaint();
-            },
-            .always_visible => {
-                self.visibility = .shown;
-                self.fade = 255;
-                self.clearTransparent();
-                self.repaint();
-            },
+        if (policy == .system and new_mode == .always_visible) {
+            self.visibility = .shown;
+            self.fade = 255;
+            self.clearTransparent();
+        } else {
+            self.visibility = .hidden;
+            self.fade = 0;
+            self.setTransparent();
+            if (policy == .never) self.setOwnerVisible(false);
         }
 
-        // Mode changed — caller must reflow the grid (trigger WM_SIZE).
-        return true;
+        // Read the full HWND client size. The cached surface width already
+        // excludes the old gutter, so reusing it would shrink the grid.
+        var client: w32.RECT = undefined;
+        if (w32.GetClientRect(self.owner, &client) != 0)
+            self.surface.handleResize(@intCast(client.right), @intCast(client.bottom));
     }
 
     /// Update the DPI scale factor.
@@ -676,6 +684,7 @@ fn scrollbarWndProc(
     const ud = w32.GetWindowLongPtrW(hwnd, w32.GWLP_USERDATA);
     const self_opt: ?*Scrollbar = if (ud == 0) null else @ptrFromInt(@as(usize, @bitCast(ud)));
     const self = self_opt orelse return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+    if (self.policy == .never) return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
 
     switch (msg) {
         w32.WM_MOUSEACTIVATE => return w32.MA_NOACTIVATE,
@@ -721,6 +730,33 @@ fn scrollbarWndProc(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "scrollbar policy reload restores the full client grid and preserves the scroll position" {
+    const class = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+    const owner = w32.CreateWindowExW(0, class, class, w32.WS_POPUP, 0, 0, 320, 200, null, null, null, null) orelse return error.Win32Error;
+    defer _ = w32.DestroyWindow(owner);
+    const popup = w32.CreateWindowExW(0, class, class, w32.WS_POPUP, 0, 0, 1, 1, owner, null, null, null) orelse return error.Win32Error;
+    defer _ = w32.DestroyWindow(popup);
+    var surface: Surface = .{ .app = undefined, .hwnd = owner };
+    var bar: Scrollbar = .{ .alloc = testing.allocator, .surface = &surface, .owner = owner, .hwnd = popup, .scale = 1.5 };
+    surface.scrollbar = &bar;
+    bar.update(.{ .total = 400, .offset = 20, .len = 30 });
+    bar.applyPolicy(.system, .always_visible);
+    try testing.expectEqual(299, surface.width);
+    bar.configure(.never);
+    try testing.expectEqual(320, surface.width);
+    bar.setOwnerVisible(true);
+    try testing.expectEqual(0, w32.IsWindowVisible_(popup));
+    bar.update(.{ .total = 500, .offset = 120, .len = 30 });
+    try testing.expectEqual(0, bar.repositionAndResize());
+    bar.applyPolicy(.system, .overlay);
+    try testing.expectEqual(320, surface.width);
+    try testing.expectEqual(120, bar.state.offset);
+    try testing.expectEqual(Visibility.hidden, bar.visibility);
+    bar.applyPolicy(.system, .always_visible);
+    try testing.expectEqual(299, surface.width);
+    try testing.expectEqual(Visibility.shown, bar.visibility);
+}
 
 test "thumbRect: thumb at top when offset is 0" {
     const r = thumbRect(1000, 0, 50, 400, 20);

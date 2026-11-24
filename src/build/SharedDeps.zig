@@ -617,6 +617,7 @@ pub fn add(
         .freetype = true,
         .@"backend-metal" = target.result.os.tag.isDarwin(),
         .@"backend-osx" = target.result.os.tag == .macos,
+        .@"backend-win32" = self.config.app_runtime == .win32 and target.result.os.tag == .windows,
         // OpenGL3 backend should only be built on non-Apple targets.
         // Apple platforms use Metal (and macOS may also use the OSX backend).
         .@"backend-opengl3" = !target.result.os.tag.isDarwin(),
@@ -709,8 +710,12 @@ pub fn add(
             .win32 => {
                 // Link Windows system libraries for Win32 runtime
                 if (step.rootModuleTarget().os.tag == .windows) {
+                    if (step.kind == .@"test") step.root_module.addCSourceFile(.{
+                        .file = b.path("test/win32/clipboard_producer.cpp"),
+                        .flags = &.{ "-fno-exceptions", "-fno-rtti" },
+                    });
                     step.root_module.addCSourceFiles(.{
-                        .files = &.{"src/apprt/win32/composition.c"},
+                        .files = &.{ "src/apprt/win32/composition.c", "src/apprt/win32/clipboard.cpp", "src/apprt/win32/bell.cpp" },
                         .language = .cpp,
                         .flags = &.{ "-fno-exceptions", "-fno-rtti" },
                     });
@@ -722,10 +727,15 @@ pub fn add(
                     step.root_module.linkSystemLibrary("user32", .{});
                     step.root_module.linkSystemLibrary("dwrite", .{});
                     step.root_module.linkSystemLibrary("dwmapi", .{});
+                    step.root_module.linkSystemLibrary("shcore", .{});
                     step.root_module.linkSystemLibrary("imm32", .{});
                     step.root_module.linkSystemLibrary("shell32", .{});
                     step.root_module.linkSystemLibrary("wininet", .{});
                     step.root_module.linkSystemLibrary("comdlg32", .{});
+                    step.root_module.linkSystemLibrary("comctl32", .{});
+                    step.root_module.linkSystemLibrary("ole32", .{});
+                    step.root_module.linkSystemLibrary("windowscodecs", .{});
+                    step.root_module.linkSystemLibrary("winmm", .{});
                 }
             },
         }

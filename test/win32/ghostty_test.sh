@@ -12,11 +12,11 @@ set -uo pipefail
 # Most legacy cases use desktop-global keyboard/mouse injection. Refuse them
 # before launching or cleaning up anything on a developer's shared desktop.
 case "${1:-all}" in
-    list|resize|window_properties|program_window_resize|tab_overview|reply_feedback|mouse_reporting|visibility|toggle_opacity) ;;
+    list|resize|window_properties|program_window_resize|tab_overview|reply_feedback|mouse_reporting|visibility|window_lifecycle|scrollback_compression|toggle_opacity) ;;
     *)
         if [ "${GHOSTTY_TEST_ISOLATED_DESKTOP:-}" != "1" ]; then
             echo "Input tests require a dedicated desktop and GHOSTTY_TEST_ISOLATED_DESKTOP=1." >&2
-            echo "Safe cases: program_window_resize, tab_overview, reply_feedback, mouse_reporting, visibility, resize, window_properties, toggle_opacity." >&2
+            echo "Safe cases: program_window_resize, tab_overview, reply_feedback, mouse_reporting, visibility, window_lifecycle, scrollback_compression, resize, window_properties, toggle_opacity." >&2
             exit 2
         fi
         ;;
@@ -723,6 +723,17 @@ test_visibility() {
     local script
     script="$(wslpath -w "$SCRIPT_DIR/test_visibility.ps1")"
     if powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$script" -ExePath "$GHOSTTY_EXE"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+test_window_case() {
+    local name="$1" script
+    echo "▶ test_$name (test-owned HWND messages only)"
+    script="$(wslpath -w "$SCRIPT_DIR/test_$name.ps1")"
+    if powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$script" -ExePath "$GHOSTTY_EXE"; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
@@ -1759,6 +1770,8 @@ list_tests() {
     echo "  reply_feedback     — Echoed replies stop after an SSH-style disconnect (WSL)"
     echo "  mouse_reporting    — Stale SGR tracking resets at the WSL zsh prompt"
     echo "  visibility         — Hidden windows, zoom, minimize, and quick-terminal reports"
+    echo "  window_lifecycle   — Window navigation, directory inheritance, and application quit"
+    echo "  scrollback_compression — Compare history memory, search, and rendered colors with compression on and off"
     echo "  notifications      — Desktop notification via OSC 9"
     echo "  window_size_config — Custom window size from config"
     echo "  search             — Search bar open/close/input"
@@ -1798,6 +1811,7 @@ run_test() {
         reply_feedback)      test_reply_feedback ;;
         mouse_reporting)     test_mouse_reporting ;;
         visibility)          test_visibility ;;
+        window_lifecycle|scrollback_compression) test_window_case "$1" ;;
         notifications)       test_notifications ;;
         window_size_config)  test_window_size_config ;;
         search)              test_search ;;
@@ -1862,6 +1876,10 @@ case "${1:-all}" in
         test_mouse_reporting
         echo ""
         test_visibility
+        echo ""
+        test_window_case window_lifecycle
+        echo ""
+        test_window_case scrollback_compression
         echo ""
         test_notifications
         echo ""

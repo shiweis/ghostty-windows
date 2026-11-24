@@ -13,7 +13,7 @@ const w32 = @import("win32.zig");
 
 const log = std.log.scoped(.win32_quick_terminal);
 
-/// Animation timer ID (must not collide with QUIT_TIMER_ID=1 or notification=2).
+/// Message-window timer ID, separate from quit and notification timers.
 pub const ANIM_TIMER_ID: usize = 3;
 
 /// Animation tick interval in milliseconds (~60fps).
@@ -236,69 +236,129 @@ pub fn onConfigChange(self: *QuickTerminal, config: *const configpkg.Config) voi
 /// Compute the target (visible) and hidden (off-screen) rects based on
 /// the current monitor and config.
 fn calculateRects(self: *QuickTerminal) void {
-    const config = &self.app.config;
-    const position = config.@"quick-terminal-position";
-
-    // Get monitor work area.
     const monitor = self.getMonitor() orelse return;
+    self.calculateMonitorRects(w32, monitor);
+}
+
+fn calculateMonitorRects(self: *QuickTerminal, comptime native: type, monitor: w32.HMONITOR) void {
     var mi = w32.MONITORINFO{
         .cbSize = @sizeOf(w32.MONITORINFO),
         .rcMonitor = undefined,
         .rcWork = undefined,
         .dwFlags = 0,
     };
-    if (w32.GetMonitorInfoW(monitor, &mi) == 0) return;
+    if (native.GetMonitorInfoW(monitor, &mi) == 0) return;
 
-    const work = mi.rcWork;
-    const mw: u32 = @intCast(work.right - work.left);
-    const mh: u32 = @intCast(work.bottom - work.top);
+    var dpi_x: u32 = 96;
+    var dpi_y: u32 = 96;
+    if (native.GetDpiForMonitor(monitor, w32.MDT_EFFECTIVE_DPI, &dpi_x, &dpi_y) < 0) dpi_x = 96;
+    const config = &self.app.config;
+    const rects = placement(mi.rcWork, config.@"quick-terminal-position", config.@"quick-terminal-size", dpi_x);
+    self.target_rect = rects.visible;
+    self.hidden_rect = rects.hidden;
+}
 
-    // Use the config's calculate() method for size.
-    const size = config.@"quick-terminal-size".calculate(position, .{
-        .width = mw,
-        .height = mh,
-    });
+test "quick terminal switches work area and DPI with the selected monitor" {
+    const monitors = struct {
+        const primary: w32.HMONITOR = @ptrFromInt(1);
+        const second: w32.HMONITOR = @ptrFromInt(2);
+        fn GetMonitorInfoW(handle: w32.HMONITOR, info: *w32.MONITORINFO) i32 {
+            info.rcWork = if (handle == primary)
+                .{ .left = 0, .top = 0, .right = 1920, .bottom = 1040 }
+            else
+                .{ .left = -2560, .top = -200, .right = 0, .bottom = 1200 };
+            return 1;
+        }
+        fn GetDpiForMonitor(handle: w32.HMONITOR, _: c_int, x: *u32, y: *u32) i32 {
+            x.* = if (handle == primary) 96 else 144;
+            y.* = x.*;
+            return 0;
+        }
+    };
+    var app: App = undefined;
+    app.config.@"quick-terminal-position" = .top;
+    app.config.@"quick-terminal-size" = .{ .secondary = .{ .percentage = 50 } };
+    var quick: QuickTerminal = .{ .app = &app, .window = undefined };
+    quick.calculateMonitorRects(monitors, monitors.primary);
+    const primary: w32.RECT = .{ .left = 480, .top = 0, .right = 1440, .bottom = 400 };
+    try std.testing.expectEqual(primary, quick.target_rect);
+    quick.calculateMonitorRects(monitors, monitors.second);
+    try std.testing.expectEqual(w32.RECT{ .left = -1920, .top = -200, .right = -640, .bottom = 400 }, quick.target_rect);
+    try std.testing.expectEqual(w32.RECT{ .left = -1920, .top = -800, .right = -640, .bottom = -200 }, quick.hidden_rect);
+    quick.calculateMonitorRects(monitors, monitors.primary);
+    try std.testing.expectEqual(primary, quick.target_rect);
+}
 
-    // Apply DPI scaling to default pixel values (calculate() returns
-    // unscaled defaults like 400px).
-    const scale = self.window.scale;
-    var qw: i32 = if (config.@"quick-terminal-size".primary != null or config.@"quick-terminal-size".secondary != null)
-        @intCast(size.width)
-    else
-        @intFromFloat(@round(@as(f32, @floatFromInt(size.width)) * scale));
-    var qh: i32 = if (config.@"quick-terminal-size".primary != null or config.@"quick-terminal-size".secondary != null)
-        @intCast(size.height)
-    else
-        @intFromFloat(@round(@as(f32, @floatFromInt(size.height)) * scale));
-
-    // Clamp to work area.
-    if (qw > @as(i32, @intCast(mw))) qw = @intCast(mw);
-    if (qh > @as(i32, @intCast(mh))) qh = @intCast(mh);
-
-    switch (position) {
-        .top => {
-            self.target_rect = .{ .left = work.left, .top = work.top, .right = work.left + qw, .bottom = work.top + qh };
-            self.hidden_rect = .{ .left = work.left, .top = work.top - qh, .right = work.left + qw, .bottom = work.top };
-        },
-        .bottom => {
-            self.target_rect = .{ .left = work.left, .top = work.bottom - qh, .right = work.left + qw, .bottom = work.bottom };
-            self.hidden_rect = .{ .left = work.left, .top = work.bottom, .right = work.left + qw, .bottom = work.bottom + qh };
-        },
-        .left => {
-            self.target_rect = .{ .left = work.left, .top = work.top, .right = work.left + qw, .bottom = work.top + qh };
-            self.hidden_rect = .{ .left = work.left - qw, .top = work.top, .right = work.left, .bottom = work.top + qh };
-        },
-        .right => {
-            self.target_rect = .{ .left = work.right - qw, .top = work.top, .right = work.right, .bottom = work.top + qh };
-            self.hidden_rect = .{ .left = work.right, .top = work.top, .right = work.right + qw, .bottom = work.top + qh };
-        },
-        .center => {
-            const cx = work.left + @divTrunc(@as(i32, @intCast(mw)) - qw, 2);
-            const cy = work.top + @divTrunc(@as(i32, @intCast(mh)) - qh, 2);
-            self.target_rect = .{ .left = cx, .top = cy, .right = cx + qw, .bottom = cy + qh };
-            self.hidden_rect = .{ .left = cx, .top = work.top - qh, .right = cx + qw, .bottom = work.top };
-        },
+fn placement(
+    work: w32.RECT,
+    position: configpkg.Config.QuickTerminalPosition,
+    configured: configpkg.Config.QuickTerminalSize,
+    dpi: u32,
+) struct { visible: w32.RECT, hidden: w32.RECT } {
+    const width: u32 = @intCast(work.right - work.left);
+    const height: u32 = @intCast(work.bottom - work.top);
+    // User-specified pixels and monitor work areas are physical pixels.
+    // Only the built-in 400/800 defaults scale with the monitor.
+    var size = configured;
+    const base = (400 * dpi + 48) / 96;
+    if (size.primary == null) size.primary = .{ .pixels = if (position == .center) 2 * base else base };
+    if (position == .center and size.secondary == null) size.secondary = .{ .pixels = base };
+    for ([_]*?configpkg.Config.QuickTerminalSize.Size{ &size.primary, &size.secondary }) |field| {
+        if (field.*) |*v| switch (v.*) {
+            .percentage => |*pct| pct.* = @min(pct.*, 100),
+            .pixels => {},
+        };
     }
+    const dims = size.calculate(position, .{ .width = width, .height = height });
+    const w: i32 = @intCast(@min(width, dims.width));
+    const h: i32 = @intCast(@min(height, dims.height));
+    const x = switch (position) {
+        .left => work.left,
+        .right => work.right - w,
+        else => work.left + @divTrunc(work.right - work.left - w, 2),
+    };
+    const y = switch (position) {
+        .top => work.top,
+        .bottom => work.bottom - h,
+        else => work.top + @divTrunc(work.bottom - work.top - h, 2),
+    };
+    const hidden_x = switch (position) {
+        .left => work.left - w,
+        .right => work.right,
+        else => x,
+    };
+    const hidden_y = switch (position) {
+        .top, .center => work.top - h,
+        .bottom => work.bottom,
+        else => y,
+    };
+    return .{
+        .visible = .{ .left = x, .top = y, .right = x + w, .bottom = y + h },
+        .hidden = .{ .left = hidden_x, .top = hidden_y, .right = hidden_x + w, .bottom = hidden_y + h },
+    };
+}
+
+test "quick terminal centers partial edges on the selected monitor" {
+    const work: w32.RECT = .{ .left = -1600, .top = 40, .right = 0, .bottom = 1040 };
+    const size: configpkg.Config.QuickTerminalSize = .{ .primary = .{ .pixels = 300 }, .secondary = .{ .percentage = 50 } };
+    const cases = .{
+        .{ .top, -1200, 40, -1200, -260, 800, 300 },
+        .{ .bottom, -1200, 740, -1200, 1040, 800, 300 },
+        .{ .left, -1600, 290, -1900, 290, 300, 500 },
+        .{ .right, -300, 290, 0, 290, 300, 500 },
+    };
+    inline for (cases) |case| {
+        for ([_]u32{ 96, 144, 192 }) |dpi| {
+            const rect = placement(work, case[0], size, dpi);
+            try std.testing.expectEqual(w32.RECT{ .left = case[1], .top = case[2], .right = case[1] + case[5], .bottom = case[2] + case[6] }, rect.visible);
+            try std.testing.expectEqual(w32.RECT{ .left = case[3], .top = case[4], .right = case[3] + case[5], .bottom = case[4] + case[6] }, rect.hidden);
+        }
+    }
+    // An explicit secondary dimension still leaves a DPI-scaled default on the primary axis.
+    const partial = placement(work, .bottom, .{ .secondary = .{ .pixels = 600 } }, 144);
+    try std.testing.expectEqual(w32.RECT{ .left = -1100, .top = 440, .right = -500, .bottom = 1040 }, partial.visible);
+    const oversized = placement(work, .center, .{ .primary = .{ .percentage = 200 }, .secondary = .{ .pixels = 4000 } }, 96);
+    try std.testing.expectEqual(work, oversized.visible);
 }
 
 fn getMonitor(self: *QuickTerminal) ?w32.HMONITOR {

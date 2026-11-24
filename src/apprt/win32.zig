@@ -9,6 +9,13 @@ test {
     _ = App;
     _ = Surface;
     _ = @import("win32/Window.zig");
+    _ = @import("win32/Inspector.zig");
+    _ = @import("win32/Bell.zig");
+    _ = @import("win32/Notifications.zig");
+    _ = @import("../renderer/opengl/WindowsPresentation.zig");
+    _ = @import("win32/QuickTerminal.zig");
+    _ = @import("win32/PaneStatus.zig");
+    _ = @import("win32/Scrollbar.zig");
     _ = @import("win32/TabOverview.zig");
 }
 

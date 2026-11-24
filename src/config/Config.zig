@@ -2533,10 +2533,10 @@ keybind: Keybinds = .{},
 /// * `none` - Do not copy selected text automatically.
 ///
 /// * `primary` - Copy to the selection clipboard only. On Linux this is the
-///   primary selection that middle-click pastes. On macOS this is a separate
-///   pasteboard private to Ghostty that the `paste_from_selection` action
-///   (Paste Selection in the Edit menu) reads, so selecting text does not
-///   replace the contents of the system clipboard. (Available since: 1.4.0)
+///   primary selection that middle-click pastes. On Windows and macOS the
+///   selection clipboard is private to Ghostty. The `paste_from_selection`
+///   action reads it across panes and windows. On macOS, Paste Selection is
+///   also available in the Edit menu. (Available since: 1.4.0)
 ///
 /// * `clipboard` - Copy text to the system clipboard only. Before 1.4.0 this
 ///   value copied to the selection clipboard as well; use `both` for that.
@@ -2570,7 +2570,7 @@ keybind: Keybinds = .{},
 /// The action to take when the user middle-clicks on the terminal surface.
 ///
 /// Valid values:
-///   * `primary-paste` - Paste from the selection clipboard on Linux.
+///   * `primary-paste` - Paste from the selection clipboard on Linux and Windows.
 ///      Does nothing on macOS.
 ///   * `clipboard-paste` - Paste from the system clipboard.
 ///   * `ignore` - Do nothing, ignore the middle click.
@@ -3286,16 +3286,18 @@ keybind: Keybinds = .{},
 ///    for instance under the "Sound > Alert Sound" setting in GNOME,
 ///    or the "Accessibility > System Bell" settings in KDE Plasma.
 ///
-///    On macOS, this plays the system alert sound.
+///    On macOS and Windows, this plays the system alert sound.
 ///
 ///  * `audio`
 ///
-///    Play a custom sound. (Available since 1.3.0 on macOS)
+///    Play a custom sound. Windows uses the audio codecs installed on the system.
+///    Available since 1.3.0 on macOS.
 ///
 ///  * `attention` *(enabled by default)*
 ///
 ///    Request the user's attention when Ghostty is unfocused, until it has
-///    received focus again. On macOS, this will bounce the app icon in the
+///    received focus again. On Windows, this flashes the taskbar button.
+///    On macOS, this will bounce the app icon in the
 ///    dock once. On Linux, the behavior depends on the desktop environment
 ///    and/or the window manager/compositor:
 ///

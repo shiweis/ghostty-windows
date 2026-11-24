@@ -1830,6 +1830,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // every draw must actually render.
             const needs_redraw =
                 size_changed or
+                (@hasDecl(GraphicsAPI, "presentationChanged") and self.api.presentationChanged()) or
                 swap_chain_rebuilt or
                 self.cells_rebuilt or
                 self.images_rebuilt or

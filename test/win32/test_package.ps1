@@ -20,7 +20,9 @@ try {
     $files = @(
         'bin\ghostty.exe', 'bin\conpty.dll', 'bin\OpenConsole.exe',
         'share\terminfo\ghostty.terminfo', 'share\licenses\conpty\LICENSE.txt',
-        'share\ghostty\shell-integration\powershell\ghostty-shell-integration.ps1'
+        'share\ghostty\shell-integration\powershell\ghostty-shell-integration.ps1',
+        'share\ghostty\shell-integration\powershell\ghostty-ssh.ps1',
+        'share\ghostty\shell-integration\powershell\ssh.ps1'
     )
     foreach ($relative in $files) {
         $destination = Join-Path $testRoot $relative

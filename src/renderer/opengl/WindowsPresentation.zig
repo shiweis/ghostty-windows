@@ -24,6 +24,8 @@ const fragment_source: [:0]const u8 =
     "layout(location = 0) uniform sampler2D frameTexture;\n" ++
     "layout(location = 1) uniform int linearMode;\n" ++
     "layout(location = 2) uniform int flipY;\n" ++
+    "layout(location = 3) uniform vec4 paneTint;\n" ++
+    "layout(location = 4) uniform int bellBorder;\n" ++
     "out vec4 outputColor;\n" ++
     "vec3 srgbEncode(vec3 c) {\n" ++
     "    bvec3 low = lessThanEqual(c, vec3(0.0031308));\n" ++
@@ -35,13 +37,16 @@ const fragment_source: [:0]const u8 =
     "    ivec2 pixel = ivec2(gl_FragCoord.xy);\n" ++
     "    if (flipY != 0) pixel.y = textureSize(frameTexture, 0).y - 1 - pixel.y;\n" ++
     "    vec4 sampleColor = texelFetch(frameTexture, pixel, 0);\n" ++
-    "    if (sampleColor.a == 0.0) { outputColor = vec4(0.0); return; }\n" ++
-    "    if (linearMode != 0) {\n" ++
+    "    if (sampleColor.a == 0.0) { outputColor = vec4(0.0); }\n" ++
+    "    else if (linearMode != 0) {\n" ++
     "        vec3 straightLinear = clamp(sampleColor.rgb / sampleColor.a, 0.0, 1.0);\n" ++
     "        outputColor = vec4(srgbEncode(straightLinear) * sampleColor.a, sampleColor.a);\n" ++
     "    } else {\n" ++
     "        outputColor = sampleColor;\n" ++
     "    }\n" ++
+    "    outputColor = mix(outputColor, vec4(paneTint.rgb, 1.0), paneTint.a);\n" ++
+    "    ivec2 edge = min(pixel, textureSize(frameTexture, 0) - ivec2(1) - pixel);\n" ++
+    "    if (min(edge.x, edge.y) < bellBorder) outputColor = mix(outputColor, vec4(1.0, 0.8, 0.0, 1.0), 0.5);\n" ++
     "}\n";
 
 extern "c" fn ghostty_composition_create(
@@ -222,6 +227,8 @@ pub fn present(
     self: *Self,
     target: Target,
     blending: configpkg.Config.AlphaBlending,
+    overlay: [4]u8,
+    bell_border: u32,
 ) !void {
     if (target.width == 0 or target.height == 0) return;
     const texture = target.texture;
@@ -306,6 +313,10 @@ pub fn present(
         context.Uniform1i.?(0, 0);
         context.Uniform1i.?(1, @intFromBool(blending.isLinear()));
         context.Uniform1i.?(2, @intFromBool(is_composition));
+        const rgba: @Vector(4, f32) = @floatFromInt(@as(@Vector(4, u8), overlay));
+        const tint = rgba / @as(@Vector(4, f32), @splat(255));
+        context.Uniform4f.?(3, tint[0], tint[1], tint[2], tint[3]);
+        context.Uniform1i.?(4, @intCast(bell_border));
         context.DrawArrays.?(c.GL_TRIANGLES, 0, 3);
         try gl.errors.getError();
     }
@@ -316,5 +327,58 @@ pub fn present(
             return error.CompositionPresentFailed;
         }
         locked = false;
+    }
+}
+
+test "native bell draws and clears all four edges over a tinted pane" {
+    if (comptime @import("../../build_config.zig").app_runtime != .win32 or @import("builtin").os.tag != .windows)
+        return error.SkipZigTest;
+    const t = std.testing;
+    const w32 = @import("../../apprt/win32/win32.zig");
+    const wide = std.unicode.utf8ToUtf16LeStringLiteral;
+    const hwnd = w32.CreateWindowExW(0, wide("STATIC"), wide(""), 0, 0, 0, 16, 16, null, null, null, null) orelse return error.Win32Error;
+    defer _ = w32.DestroyWindow(hwnd);
+    const dc = w32.GetDC(hwnd) orelse return error.Win32Error;
+    defer _ = w32.ReleaseDC(hwnd, dc);
+    try @import("../../apprt/win32/Surface.zig").setupPixelFormat(dc);
+    const rc = w32.wglCreateContext(dc) orelse return error.Win32Error;
+    defer _ = w32.wglDeleteContext(rc);
+    if (w32.wglMakeCurrent(dc, rc) == 0) return error.Win32Error;
+    defer _ = w32.wglMakeCurrent(null, null);
+    const version: u32 = @intCast(try gl.glad.load(null));
+    defer gl.glad.unload();
+    const major = gl.glad.versionMajor(version);
+    if (major < 4 or (major == 4 and gl.glad.versionMinor(version) < 3)) return error.SkipZigTest;
+
+    // Draw into an offscreen target to read exact pixels without touching
+    // the desktop, including when the test window is completely obscured.
+    const size: usize = 12;
+    var source = try Target.init(.{ .width = size, .height = size });
+    defer source.deinit();
+    var output = try Target.init(.{ .width = size, .height = size });
+    defer output.deinit();
+    {
+        const bound = try source.framebuffer.bind(.draw);
+        defer bound.unbind();
+        gl.glad.context.ClearColor.?(0, 0, 0, 1);
+        gl.glad.context.Clear.?(gl.c.GL_COLOR_BUFFER_BIT);
+    }
+    var presentation = try Self.init(t.allocator, null);
+    defer presentation.deinit();
+    presentation.framebuffer = output.framebuffer;
+    defer presentation.framebuffer = null;
+    for ([_]u32{ 2, 0 }) |width| {
+        try presentation.present(source, .native, .{ 0, 0, 255, 255 }, width);
+        const rgba = try output.readPixelsAlloc(t.allocator);
+        defer t.allocator.free(rgba);
+        for (0..size) |y| for (0..size) |x| {
+            const pixel = rgba[(y * size + x) * 4 ..][0..4];
+            const edge = @min(x, y, size - 1 - x, size - 1 - y);
+            if (edge < width) {
+                try t.expect(pixel[0] >= 127 and pixel[0] <= 128);
+                try t.expect(pixel[1] >= 101 and pixel[1] <= 103);
+                try t.expect(pixel[2] >= 127 and pixel[2] <= 128);
+            } else try t.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, pixel);
+        };
     }
 }
