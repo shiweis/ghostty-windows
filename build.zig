@@ -562,9 +562,7 @@ pub fn build(b: *std.Build) !void {
             if (config.app_runtime == .win32 and config.target.result.os.tag == .windows) {
                 // Layered child HWNDs require the application's Windows
                 // compatibility manifest even when created by a unit test.
-                test_exe_ptr.*.root_module.addWin32ResourceFile(.{
-                    .file = b.path("dist/windows/ghostty.rc"),
-                });
+                config.addWindowsResources(test_exe_ptr.*.root_module);
             }
             _ = try deps.add(test_exe_ptr.*);
             try c_deps.add(b, .@"ghostty-h", test_exe_ptr.*.root_module, &config, .{

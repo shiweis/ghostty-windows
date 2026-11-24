@@ -4,6 +4,7 @@
 # Usage:
 #   ./dist/windows/package.sh              # fast, x86_64
 #   ./dist/windows/package.sh debug        # Debug build (Console subsystem)
+#   ./dist/windows/package.sh --candidate 1.4.0-rc.1  # local prerelease + commit
 #   ./dist/windows/package.sh --release    # exact, clean annotated win-vX.Y.Z
 #
 # Output: dist/windows/ghostty-windows-x64-<version>.zip
@@ -14,17 +15,54 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 OPTIMIZE=fast
 RELEASE=false
-for arg in "$@"; do
-    case "$arg" in
-        fast|debug|safe|small) OPTIMIZE="$arg" ;;
+CANDIDATE=""
+usage() {
+    echo 'Usage: bash dist/windows/package.sh [fast|debug|safe|small] [--release | --candidate X.Y.Z-PRERELEASE]' >&2
+    exit 2
+}
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        fast|debug|safe|small) OPTIMIZE="$1" ;;
         --release) RELEASE=true ;;
-        *) echo "Usage: bash dist/windows/package.sh [fast|debug|safe|small] [--release]" >&2; exit 2 ;;
+        --candidate)
+            if [ "$#" -lt 2 ] || [ -z "$2" ] || [ -n "$CANDIDATE" ]; then usage; fi
+            CANDIDATE="$2"
+            shift
+            ;;
+        *) usage ;;
     esac
+    shift
 done
 
 cd "$REPO_DIR"
 
+valid_candidate() {
+    local LC_ALL=C
+    local number='(0|[1-9][0-9]*)'
+    # A numeric prerelease identifier may contain zero or start with 1–9.
+    local identifier='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+    local metadata='([+][0-9A-Za-z-]+([.][0-9A-Za-z-]+)*)?'
+    local pattern="^${number}[.]${number}[.]${number}-${identifier}([.]${identifier})*${metadata}$"
+    [[ "$1" =~ $pattern ]]
+}
+
 RELEASE_VERSION=""
+CANDIDATE_VERSION=""
+VERSION_ARGS=()
+if [ -n "$CANDIDATE" ]; then
+    if [ "$RELEASE" = true ]; then usage; fi
+    if ! valid_candidate "$CANDIDATE"; then
+        echo "Invalid candidate prerelease version: $CANDIDATE" >&2
+        exit 2
+    fi
+    COMMIT="$(git rev-parse --short HEAD)"
+    if [[ "$CANDIDATE" == *+* ]]; then
+        CANDIDATE_VERSION="$CANDIDATE.$COMMIT"
+    else
+        CANDIDATE_VERSION="$CANDIDATE+$COMMIT"
+    fi
+    VERSION_ARGS+=("-Dversion-string=$CANDIDATE_VERSION")
+fi
 if [ "$RELEASE" = true ]; then
     if [ "$OPTIMIZE" != fast ]; then
         echo 'Release packages require fast optimization.' >&2
@@ -58,7 +96,7 @@ windows_path() {
 }
 
 echo "Building ghostty (optimize=$OPTIMIZE)..."
-bash "$SCRIPT_DIR/build.sh" -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize="$OPTIMIZE"
+bash "$SCRIPT_DIR/build.sh" -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize="$OPTIMIZE" "${VERSION_ARGS[@]}"
 
 for resource in bin/ghostty.exe bin/conpty.dll bin/OpenConsole.exe share/terminfo/ghostty.terminfo share/licenses/conpty/LICENSE.txt share/ghostty/shell-integration/powershell/ghostty-shell-integration.ps1; do
     if [ ! -f "zig-out/$resource" ]; then
@@ -83,6 +121,10 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]]; then
 fi
 if [ "$RELEASE" = true ] && [ "$VERSION" != "$RELEASE_VERSION" ]; then
     echo "ERROR: Executable version $VERSION does not match release tag $RELEASE_TAG." >&2
+    exit 1
+fi
+if [ -n "$CANDIDATE_VERSION" ] && [ "$VERSION" != "$CANDIDATE_VERSION" ]; then
+    echo "ERROR: Executable version $VERSION does not match requested candidate $CANDIDATE_VERSION." >&2
     exit 1
 fi
 echo "Version: $VERSION"

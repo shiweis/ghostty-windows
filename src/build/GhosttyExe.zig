@@ -59,9 +59,7 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
                 .console
             else
                 .windows;
-            exe.root_module.addWin32ResourceFile(.{
-                .file = b.path("dist/windows/ghostty.rc"),
-            });
+            cfg.addWindowsResources(exe.root_module);
         },
 
         else => {},

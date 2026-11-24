@@ -8,13 +8,10 @@ RT_MANIFEST 24 "ghostty.manifest"
 #define ID_ICON_GHOSTTY 1
 ID_ICON_GHOSTTY ICON "ghostty.ico"
 
-// Version info — shown in Explorer's Properties → Details and used by
-// signtool / installer tooling. The numbers here are baseline; the
-// actual build-time version comes from build_config.version, but the
-// PE resource needs static values at link time.
-//
-// Update FILEVERSION/PRODUCTVERSION when bumping for a release. The
-// commas in the comma-form are 16-bit fields: MAJOR,MINOR,PATCH,BUILD.
+// Zig supplies the numeric core of the selected build version. Keep the
+// four fallback values aligned with the Windows release for standalone RC use.
+#define GHOSTTY_STRINGIFY_RAW(value) #value
+#define GHOSTTY_STRINGIFY(value) GHOSTTY_STRINGIFY_RAW(value)
 //
 // VS_VERSION_INFO must resolve to numeric resource ID 1; winres.h
 // normally defines it, but this file is compiled without it, so the
@@ -22,8 +19,13 @@ ID_ICON_GHOSTTY ICON "ghostty.ico"
 // and Explorer never find.
 #define VS_VERSION_INFO 1
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION    1,4,1,0
-PRODUCTVERSION 1,4,1,0
+#ifdef GHOSTTY_RC_NUMERIC
+FILEVERSION    GHOSTTY_RC_NUMERIC
+PRODUCTVERSION GHOSTTY_RC_NUMERIC
+#else
+FILEVERSION    1,4,0,0
+PRODUCTVERSION 1,4,0,0
+#endif
 FILEFLAGSMASK  0x3F
 FILEFLAGS      0x0
 FILEOS         0x40004 // VOS_NT_WINDOWS32
@@ -37,12 +39,17 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Ghostty Windows"
             VALUE "FileDescription",  "Ghostty terminal emulator"
-            VALUE "FileVersion",      "1.4.1.0"
+#ifdef GHOSTTY_RC_DOTTED
+            VALUE "FileVersion",      GHOSTTY_STRINGIFY(GHOSTTY_RC_DOTTED)
+            VALUE "ProductVersion",   GHOSTTY_STRINGIFY(GHOSTTY_RC_DOTTED)
+#else
+            VALUE "FileVersion",      "1.4.0.0"
+            VALUE "ProductVersion",   "1.4.0.0"
+#endif
             VALUE "InternalName",     "ghostty"
             VALUE "LegalCopyright",   "Original work copyright Mitchell Hashimoto. Windows port additions copyright Shiwei Song. MIT License."
             VALUE "OriginalFilename", "ghostty.exe"
             VALUE "ProductName",      "Ghostty"
-            VALUE "ProductVersion",   "1.4.1.0"
         END
     END
     BLOCK "VarFileInfo"

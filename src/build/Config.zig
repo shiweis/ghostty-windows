@@ -750,6 +750,21 @@ const PatchElf = struct {
     }
 };
 
+/// Embed the manifest, icon, and PE version matching the compiled binary.
+pub fn addWindowsResources(self: *const Config, module: *std.Build.Module) void {
+    const b = module.owner;
+    const components = .{ self.version.major, self.version.minor, self.version.patch };
+    if (self.version.major > 0xffff or self.version.minor > 0xffff or self.version.patch > 0xffff)
+        @panic("Windows PE version components must be in the range 0 through 65535");
+    module.addWin32ResourceFile(.{
+        .file = b.path("dist/windows/ghostty.rc"),
+        .flags = &.{
+            b.fmt("/DGHOSTTY_RC_NUMERIC={d},{d},{d},0", components),
+            b.fmt("/DGHOSTTY_RC_DOTTED={d}.{d}.{d}.0", components),
+        },
+    });
+}
+
 /// Add a patchelf step for the supplied `artifact`, depending on the supplied
 /// `step`, if `patchelf` is present in the config. Returns the patchelf step
 /// so that other steps can depend on it too. patchelf rewrites the artifact
