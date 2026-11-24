@@ -3,12 +3,13 @@
 All notable changes to the Ghostty Windows fork. Each release line includes
 the underlying upstream commit when known.
 
-## Unreleased
+## win-v1.4.0 — 2026-11-24
 
-The Windows x64 candidate `1.4.0-rc.1+59003a9a6` targets `win-v1.4.0`
-and is based on upstream Ghostty `v1.4.0` (`83fb95624`, released
-2026-10-27). The extracted portable archive passed native UI, shell,
-editor and package checks. [Candidate verification](ROADMAP.md#candidate-verification)
+Ghostty for Windows 1.4.0 ships as a portable x64 ZIP. It is based on
+upstream Ghostty `v1.4.0` (`83fb95624`) and includes 456 subsequent
+upstream commits through `167acf0c4`. The Windows release adds rich
+clipboard support, live pane dragging, the native inspector and
+PowerShell SSH integration. [Windows verification](ROADMAP.md#candidate-verification)
 
 ### Upstream
 

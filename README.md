@@ -35,10 +35,11 @@ macOS/GTK feature parity.
 
 ### Ghostty 1.4 compatibility
 
-The x64 Windows candidate `1.4.0-rc.1+59003a9a6` passed the native
-and portable-package release checks. It is based on upstream `v1.4.0`
-(`83fb95624`, October 27, 2026) and includes 456 subsequent upstream
-commits through `167acf0c4` in the `1.4.1-dev` series.
+Ghostty for Windows 1.4.0 is available as a portable x64 ZIP.
+It is based on upstream `v1.4.0` (`83fb95624`, October 27, 2026)
+and includes 456 subsequent upstream commits through `167acf0c4` in
+the `1.4.1-dev` series.
+[Windows 1.4.0 release and download](https://github.com/shiweis/ghostty-windows/releases/tag/win-v1.4.0),
 [Candidate verification](ROADMAP.md#candidate-verification) and
 [upstream 1.4.0 release notes](https://ghostty.org/docs/install/release-notes/1-4-0)
 
